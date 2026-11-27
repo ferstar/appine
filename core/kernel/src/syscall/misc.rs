@@ -157,12 +157,14 @@ pub(super) fn futex(
             }
             let key = futex_key(cx, uaddr, private)?;
             let key2 = futex_key(cx, uaddr2, private)?;
-            let mut futexes = cx.shared.futexes();
-            if cmd == FUTEX_CMP_REQUEUE && u32::from_le_bytes(get(cx, uaddr)?) != val3 {
-                return Err(Errno::EAGAIN);
-            }
             // In REQUEUE the fourth argument is the number to requeue, not a timeout
-            let n = futexes.requeue(key, val, key2, timeout as u32);
+            let n = cx
+                .shared
+                .futexes()
+                .requeue_if(key, val, key2, timeout as u32, || {
+                    Ok(cmd != FUTEX_CMP_REQUEUE || u32::from_le_bytes(get(cx, uaddr)?) == val3)
+                })?
+                .ok_or(Errno::EAGAIN)?;
             Ok(n as u64)
         }
         // LOCK_PI's timeout is absolute on CLOCK_REALTIME, LOCK_PI2's on CLOCK_MONOTONIC unless
@@ -222,37 +224,37 @@ fn futex_wake_op(
     if encoded >> 28 & FUTEX_OP_OPARG_SHIFT != 0 {
         oparg = 1 << (oparg & 31);
     }
-    let mut futexes = cx.shared.futexes();
-    let mm = cx.mm();
-    let word = crate::futex::writable_word(&mm, uaddr2).ok_or(Errno::EFAULT)?;
-    // FUTEX_OP_SET, ADD, OR, ANDN, XOR
-    let apply = |old: i32| match op {
-        0 => Some(oparg),
-        1 => Some(old.wrapping_add(oparg)),
-        2 => Some(old | oparg),
-        3 => Some(old & !oparg),
-        4 => Some(old ^ oparg),
-        _ => None,
-    };
-    let old = word
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-            apply(v as i32).map(|n| n as u32)
-        })
-        .map_err(|_| Errno::ENOSYS)? as i32;
-    // FUTEX_OP_CMP_EQ, NE, LT, LE, GT, GE
-    let matched = match cmp {
-        0 => old == cmparg,
-        1 => old != cmparg,
-        2 => old < cmparg,
-        3 => old <= cmparg,
-        4 => old > cmparg,
-        5 => old >= cmparg,
-        _ => return Err(Errno::ENOSYS),
-    };
-    let mut woken = futexes.wake(key, wake_count(nr), u32::MAX);
-    if matched {
-        woken += futexes.wake(key2, wake_count(nr2), u32::MAX);
-    }
+    let woken = cx
+        .shared
+        .futexes()
+        .wake_op(key, wake_count(nr), key2, wake_count(nr2), || {
+            let mm = cx.mm();
+            let word = crate::futex::writable_word(&mm, uaddr2).ok_or(Errno::EFAULT)?;
+            // FUTEX_OP_SET, ADD, OR, ANDN, XOR
+            let apply = |old: i32| match op {
+                0 => Some(oparg),
+                1 => Some(old.wrapping_add(oparg)),
+                2 => Some(old | oparg),
+                3 => Some(old & !oparg),
+                4 => Some(old ^ oparg),
+                _ => None,
+            };
+            let old = word
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                    apply(v as i32).map(|n| n as u32)
+                })
+                .map_err(|_| Errno::ENOSYS)? as i32;
+            // FUTEX_OP_CMP_EQ, NE, LT, LE, GT, GE
+            match cmp {
+                0 => Ok(old == cmparg),
+                1 => Ok(old != cmparg),
+                2 => Ok(old < cmparg),
+                3 => Ok(old <= cmparg),
+                4 => Ok(old > cmparg),
+                5 => Ok(old >= cmparg),
+                _ => Err(Errno::ENOSYS),
+            }
+        })?;
     Ok(woken as u64)
 }
 
@@ -268,19 +270,21 @@ fn futex_wait(
 ) -> SysResult {
     let key = futex_key(cx, uaddr, private)?;
     let shared = cx.shared;
-    // No-BKL wakes (syscall::fast) also take the futex lock, so nothing is missed between
+    // No-BKL wakes (syscall::fast) also take the bucket lock, so nothing is missed between
     // checking the value and registering
-    let id = {
-        let mut futexes = shared.futexes();
-        if u32::from_le_bytes(get(cx, uaddr)?) != val {
-            return Err(Errno::EAGAIN);
-        }
-        futexes.enqueue(key, bitset, cx.task.event.clone())
+    let Some(waiter) =
+        shared
+            .futexes()
+            .enqueue_if(key, bitset, cx.task.event.clone(), || {
+                Ok(u32::from_le_bytes(get(cx, uaddr)?) == val)
+            })?
+    else {
+        return Err(Errno::EAGAIN);
     };
-    let waiting = Enqueued::new(shared, [id]);
+    let waiting = Enqueued::new(shared, [waiter]);
     crate::bug::trap(crate::bug::Trap::FutexWait, cx.tgid());
     loop {
-        if !shared.futexes().is_queued(id) {
+        if waiting.woken_index().is_some() {
             waiting.leave();
             return Ok(0);
         }
@@ -333,8 +337,7 @@ fn futex_lock_pi(
     let key = futex_key(cx, uaddr, private)?;
     let me = cx.pid_ns().vnr(cx.tid()).unwrap_or(0) as u32;
     let shared = cx.shared;
-    let id = {
-        let mut futexes = shared.futexes();
+    let waiter = shared.futexes().with_bucket(key, |bucket| {
         let mm = cx.mm();
         let word = crate::futex::writable_word(&mm, uaddr).ok_or(Errno::EFAULT)?;
         let mut cur = word.load(Ordering::SeqCst);
@@ -345,11 +348,11 @@ fn futex_lock_pi(
             }
             if owner == 0 {
                 let mut new = (cur & FUTEX_OWNER_DIED) | me;
-                if futexes.has_pi(key, None) {
+                if bucket.has_pi(key, None) {
                     new |= FUTEX_WAITERS;
                 }
                 match word.compare_exchange(cur, new, Ordering::SeqCst, Ordering::SeqCst) {
-                    Ok(_) => return Ok(0),
+                    Ok(_) => return Ok(None),
                     Err(v) => cur = v,
                 }
                 continue;
@@ -377,13 +380,16 @@ fn futex_lock_pi(
             tid: cx.tid(),
             addr: uaddr,
         };
-        futexes.enqueue_pi(key, cx.task.event.clone(), waiter)
+        Ok(Some(bucket.enqueue_pi(key, cx.task.event.clone(), waiter)))
+    })?;
+    let Some(waiter) = waiter else {
+        return Ok(0);
     };
-    let waiting = Enqueued::new(shared, [id]);
+    let waiting = Enqueued::new(shared, [waiter]);
     crate::bug::trap(crate::bug::Trap::FutexWait, cx.tgid());
     loop {
         // Dequeued: the lock was handed over
-        if !shared.futexes().is_queued(id) {
+        if waiting.woken_index().is_some() {
             waiting.leave();
             return Ok(0);
         }
@@ -410,29 +416,30 @@ fn futex_unlock_pi(cx: &mut Cx<'_>, uaddr: u64, private: bool) -> SysResult {
     use crate::futex::{FUTEX_TID_MASK, FUTEX_WAITERS};
     let key = futex_key(cx, uaddr, private)?;
     let me = cx.pid_ns().vnr(cx.tid()).unwrap_or(0) as u32;
-    let mut futexes = cx.shared.futexes();
-    let mm = cx.mm();
-    let word = crate::futex::writable_word(&mm, uaddr).ok_or(Errno::EFAULT)?;
-    let next = futexes.first_pi(key).and_then(|(id, w)| {
-        let tgid = cx.kr().tasks.get(&w.tid)?.tgid;
-        let tid = cx.kr().pid_ns_of(tgid).vnr(w.tid)?;
-        Some((id, FUTEX_WAITERS | tid as u32))
-    });
-    let mut cur = word.load(Ordering::SeqCst);
-    loop {
-        if cur & FUTEX_TID_MASK != me {
-            return Err(Errno::EPERM);
+    cx.shared.futexes().with_bucket(key, |bucket| {
+        let mm = cx.mm();
+        let word = crate::futex::writable_word(&mm, uaddr).ok_or(Errno::EFAULT)?;
+        let next = bucket.first_pi(key).and_then(|(id, w)| {
+            let tgid = cx.kr().tasks.get(&w.tid)?.tgid;
+            let tid = cx.kr().pid_ns_of(tgid).vnr(w.tid)?;
+            Some((id, FUTEX_WAITERS | tid as u32))
+        });
+        let mut cur = word.load(Ordering::SeqCst);
+        loop {
+            if cur & FUTEX_TID_MASK != me {
+                return Err(Errno::EPERM);
+            }
+            let new = next.map_or(0, |(_, v)| v);
+            match word.compare_exchange(cur, new, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(v) => cur = v,
+            }
         }
-        let new = next.map_or(0, |(_, v)| v);
-        match word.compare_exchange(cur, new, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => break,
-            Err(v) => cur = v,
+        if let Some((id, _)) = next {
+            bucket.hand_over(id);
         }
-    }
-    if let Some((id, _)) = next {
-        futexes.hand_over(id);
-    }
-    Ok(0)
+        Ok(0)
+    })
 }
 
 /// Flags of `struct futex_waitv`: a 32-bit futex, and valid only within this process (we do not
@@ -462,6 +469,7 @@ pub(super) fn futex_waitv(
     };
     // struct futex_waitv { u64 val; u64 uaddr; u32 flags; u32 __reserved; }
     let mut keys = Vec::with_capacity(nr as usize);
+    let mut raw_keys = Vec::with_capacity(nr as usize);
     for i in 0..nr as u64 {
         let w: [u8; 24] = get(cx, waiters + i * 24)?;
         let val = u64::from_le_bytes(w[..8].try_into().unwrap());
@@ -472,34 +480,30 @@ pub(super) fn futex_waitv(
         {
             return Err(Errno::EINVAL);
         }
-        keys.push((
-            futex_key(cx, uaddr, wflags & FUTEX_PRIVATE_FLAG != 0)?,
-            uaddr,
-            val,
-        ));
+        let key = futex_key(cx, uaddr, wflags & FUTEX_PRIVATE_FLAG != 0)?;
+        raw_keys.push(key);
+        keys.push((uaddr, val));
     }
-    // Holding the futex lock, so nobody can wake between checking the values and registering
+    // Holding every affected bucket lock in ascending order, so nobody can wake between checking
+    // the values and registering
     let shared = cx.shared;
-    let ids: Vec<u64> = {
-        let mut futexes = shared.futexes();
-        for &(_, uaddr, val) in &keys {
-            if u64::from(u32::from_le_bytes(get(cx, uaddr)?)) != val {
-                return Err(Errno::EAGAIN);
+    let Some(waiters) = shared
+        .futexes()
+        .enqueue_many_if(&raw_keys, &cx.task.event, || {
+            for &(uaddr, val) in &keys {
+                if u64::from(u32::from_le_bytes(get(cx, uaddr)?)) != val {
+                    return Ok(false);
+                }
             }
-        }
-        let event = &cx.task.event;
-        keys.iter()
-            .map(|&(key, ..)| futexes.enqueue(key, u32::MAX, event.clone()))
-            .collect()
+            Ok(true)
+        })?
+    else {
+        return Err(Errno::EAGAIN);
     };
-    let waiting = Enqueued::new(shared, ids);
+    let waiting = Enqueued::new(shared, waiters);
     crate::bug::trap(crate::bug::Trap::FutexWait, cx.tgid());
     let r = loop {
-        let woken = waiting
-            .ids()
-            .iter()
-            .position(|&id| !shared.futexes().is_queued(id));
-        if let Some(i) = woken {
+        if let Some(i) = waiting.woken_index() {
             break Ok(i as u64);
         }
         let err = if deadline.is_some_and(Expiry::passed) {

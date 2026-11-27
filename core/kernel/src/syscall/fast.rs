@@ -426,17 +426,18 @@ fn futex(
             })
         }
     };
-    let id = {
-        let mut futexes = shared.futexes();
-        // SAFETY: host points at 4-byte-aligned guest memory in this page; the thread is marked
-        // as running guest code, so the page is not released meanwhile
-        let now = unsafe { AtomicU32::from_ptr(host) }.load(Ordering::SeqCst);
-        if now != val {
-            return Some(Done::InGuest(Err(Errno::EAGAIN)));
-        }
-        futexes.enqueue(key, bitset, task.event.clone())
+    let Some(waiter) = shared
+        .futexes()
+        .enqueue_if::<()>(key, bitset, task.event.clone(), || {
+            // SAFETY: host points at 4-byte-aligned guest memory in this page; the thread is marked
+            // as running guest code, so the page is not released meanwhile
+            Ok(unsafe { AtomicU32::from_ptr(host) }.load(Ordering::SeqCst) == val)
+        })
+        .unwrap()
+    else {
+        return Some(Done::InGuest(Err(Errno::EAGAIN)));
     };
-    let waiting = Enqueued::new(shared, [id]);
+    let waiting = Enqueued::new(shared, [waiter]);
     crate::bug::trap(crate::bug::Trap::FutexWait, task.tgid);
     let woke = sleep(task, cpu, deadline);
     match waiting.leave() {
@@ -504,7 +505,6 @@ fn sleep_until(task: &Task, cpu: &Cpu, deadline: Expiry) -> Option<Done> {
 /// clock signals it too ([`crate::itimer::clock_jumped`]), and the locked path then looks at the
 /// deadline again.
 fn sleep(task: &Task, cpu: &Cpu, deadline: Option<Expiry>) -> bool {
-    const POLLIN: i16 = 1;
     task.sync.entry.enter(cpu.state(), true);
     task.sync.in_guest.store(false, Ordering::Release);
     task.sleeping.store(true, Ordering::SeqCst);
@@ -514,9 +514,8 @@ fn sleep(task: &Task, cpu: &Cpu, deadline: Option<Expiry>) -> bool {
             Some(d) => Some(d.remaining()),
             None => None,
         };
-        let mut fds = [(task.event.fd(), POLLIN, 0)];
-        match appine_hal::poll(&mut fds, timeout) {
-            Ok(0) => {}
+        match task.event.wait(timeout) {
+            Ok(false) => {}
             _ => break true,
         }
     };
@@ -808,7 +807,7 @@ mod tests {
 
                 // FUTEX_WAKE | FUTEX_PRIVATE_FLAG wakes a waiter queued with slow-path private key.
                 let ev = Arc::new(appine_hal::Event::new().unwrap());
-                let id = shared.futexes().enqueue(slow_private_key, u32::MAX, ev);
+                let w = shared.futexes().enqueue(slow_private_key, u32::MAX, ev);
                 let wake_res = run_fast(
                     &fast,
                     &shared,
@@ -825,7 +824,8 @@ mod tests {
                     ],
                 );
                 assert_eq!(wake_res, Some(1));
-                assert!(!shared.futexes().is_queued(id));
+                assert!(w.is_woken());
+                assert!(!shared.futexes().is_queued(&w));
             }
 
             // Non-private futex on a MAP_SHARED address must fall back to the BKL slow path.
@@ -845,8 +845,8 @@ mod tests {
             let priv_private_key = cx.mm().futex_key(private_addr, true).unwrap();
             let ev1 = Arc::new(appine_hal::Event::new().unwrap());
             let ev2 = Arc::new(appine_hal::Event::new().unwrap());
-            let id_shared = shared.futexes().enqueue(priv_shared_key, u32::MAX, ev1);
-            let id_private = shared.futexes().enqueue(priv_private_key, u32::MAX, ev2);
+            let w_shared = shared.futexes().enqueue(priv_shared_key, u32::MAX, ev1);
+            let w_private = shared.futexes().enqueue(priv_private_key, u32::MAX, ev2);
             let non_private_priv = run_fast(
                 &fast,
                 &shared,
@@ -856,9 +856,11 @@ mod tests {
                 [private_addr, u64::from(FUTEX_WAKE), 2, 0, 0, 0],
             );
             assert_eq!(non_private_priv, Some(1));
-            assert!(!shared.futexes().is_queued(id_shared));
-            assert!(shared.futexes().is_queued(id_private));
-            shared.futexes().remove(id_private);
+            assert!(w_shared.is_woken());
+            assert!(!shared.futexes().is_queued(&w_shared));
+            assert!(!w_private.is_woken());
+            assert!(shared.futexes().is_queued(&w_private));
+            assert!(!shared.futexes().remove(&w_private));
         }
         drop(cpu);
         drop(shared);

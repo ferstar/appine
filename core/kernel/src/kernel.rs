@@ -811,11 +811,24 @@ pub(crate) struct Shared {
     /// Incremented whenever the state threads recorded for no-BKL syscalls may be stale
     /// ([`Shared::fast_changed`], [`Kernel::fast_changed`]).
     fast: Arc<AtomicU64>,
-    /// The futex wait queue. No-BKL futexes (`syscall::fast`) take only this lock; it may also be
-    /// taken while holding the BKL, but not the other way round. Checking the futex value and
-    /// registering as a waiter happen in one hold of it, and waking takes it too, so no wake-up
-    /// is lost between the two.
-    futexes: Mutex<Futexes>,
+    /// The sharded futex wait queues. No-BKL futexes (`syscall::fast`) lock only the relevant
+    /// bucket; bucket locks may also be taken while holding the BKL, but never the reverse.
+    futexes: Futexes,
+}
+
+/// Borrowed handle to [`Shared::futexes`]. Implements `Drop` so callers written against the
+/// former `MutexGuard<'_, Futexes>` keep working unchanged.
+pub(crate) struct FutexesRef<'a>(&'a Futexes);
+
+impl Deref for FutexesRef<'_> {
+    type Target = Futexes;
+    fn deref(&self) -> &Futexes {
+        self.0
+    }
+}
+
+impl Drop for FutexesRef<'_> {
+    fn drop(&mut self) {}
 }
 
 impl Shared {
@@ -830,7 +843,7 @@ impl Shared {
             dns_answers: Arc::new(Mutex::new(Vec::new())),
             checks_idle: AtomicBool::new(false),
             fast,
-            futexes: Mutex::new(Futexes::default()),
+            futexes: Futexes::new(),
         }
     }
 
@@ -915,9 +928,9 @@ impl Shared {
         self.fast.load(Ordering::Acquire)
     }
 
-    /// The futex wait queue ([`Shared::futexes`]).
-    pub fn futexes(&self) -> MutexGuard<'_, Futexes> {
-        self.futexes.lock().unwrap_or_else(PoisonError::into_inner)
+    /// The sharded futex wait queues ([`Shared::futexes`]).
+    pub fn futexes(&self) -> FutexesRef<'_> {
+        FutexesRef(&self.futexes)
     }
 
     /// The thread is about to go on running guest code: wakes the timer thread if the periodic
@@ -1665,7 +1678,6 @@ pub(crate) fn block_for<'a>(
     interest: u32,
     objects: Option<&[wake::Object]>,
 ) -> (Bkl<'a>, Result<(), Errno>) {
-    const POLLIN: i16 = 1;
     crate::cell::assert_none_held();
     let listed = interest != 0;
     if listed {
@@ -1678,23 +1690,27 @@ pub(crate) fn block_for<'a>(
     }
     drop(k);
     let timeout = deadline.map(|d| d.saturating_duration_since(Instant::now()));
-    let mut fds: Vec<(i32, i16, i16)> = host.iter().map(|&(fd, ev, _)| (fd, ev, 0)).collect();
-    fds.push((event.fd(), POLLIN, 0));
-    let r = appine_hal::poll(&mut fds, timeout);
+    let (r, event_signaled) = if host.is_empty() {
+        match event.wait(timeout) {
+            Ok(signaled) => (Ok(()), signaled),
+            // A host signal interrupted the wait (a debugger, say): treat it as an ordinary wake-up
+            Err(e) if e == Errno::EINTR.0 => (Ok(()), true),
+            Err(e) => (Err(Errno(e)), true),
+        }
+    } else {
+        match event.poll_with(host, timeout) {
+            Ok((_, signaled)) => (Ok(()), signaled),
+            Err(e) if e == Errno::EINTR.0 => (Ok(()), true),
+            Err(e) => (Err(Errno(e)), true),
+        }
+    };
     let mut k = shared.lock();
-    event.clear();
+    if event_signaled || event.is_signaled() {
+        event.clear();
+    }
     if listed {
         k.waiters.retain(|(e, ..)| !Arc::ptr_eq(e, event));
     }
-    for (h, f) in host.iter_mut().zip(&fds) {
-        h.2 = f.2;
-    }
-    let r = match r {
-        Ok(_) => Ok(()),
-        // A host signal interrupted poll (a debugger, say): treat it as an ordinary wake-up
-        Err(e) if e == Errno::EINTR.0 => Ok(()),
-        Err(e) => Err(Errno(e)),
-    };
     (k, r)
 }
 

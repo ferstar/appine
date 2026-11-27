@@ -1,4 +1,4 @@
-//! Futex wait queues (the kernel/futex map). Keys follow Linux's `get_futex_key`: private
+//! Sharded futex wait queues (the kernel/futex map). Keys follow Linux's `get_futex_key`: private
 //! memory is keyed by address space and address, so a waiter is still found after the memory at
 //! its address has been replaced (a `MAP_FIXED` mmap, or munmap and mmap again); shared anonymous
 //! memory (shared mappings, System V shared memory) by its host address, so processes that share
@@ -6,22 +6,30 @@
 //! offset, because processes that each map the same file (the `/dev/shm` file of `sem_open`) see
 //! different host addresses. With `FUTEX_PRIVATE_FLAG` every futex is keyed as private memory.
 //!
-//! A waiter registers in the queue and then waits; a woken waiter is removed from the queue, and
-//! when it re-checks and finds itself no longer in the queue it knows it was woken by FUTEX_WAKE.
+//! Waiters are hashed across [`BUCKETS`] cache-line-aligned buckets so operations on distinct
+//! keys never contend. Multi-bucket operations (`requeue`, `wake_op`, `futex_waitv`) lock buckets
+//! in strictly ascending bucket-index order to prevent deadlock, and lock order is always BKL then
+//! bucket lock (never the reverse). Each waiter carries a shared [`WaiterSlot`] whose `woken` flag
+//! lets a woken thread skip re-locking its bucket in [`Enqueued::leave`] and whose `bucket` tracks
+//! moves by `FUTEX_REQUEUE`.
+//!
 //! A wake notifies only the threads it wakes (their events were recorded when they registered),
 //! and futex waiters listen on no wake channel or object ([`crate::kernel::Cx::wait_alone`]), so
 //! no change elsewhere wakes them: the JVM and the Go runtime have many threads parked on locks
 //! and condition variables, and waking all of them on every change elsewhere would be costly.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use appine_engine::prot;
 use appine_hal::Event;
 
-use crate::kernel::{Shared, Tid};
+use crate::kernel::{FutexesRef, Shared, Tid};
 use crate::mm::Mm;
 use crate::uaccess::UserSlice;
+
+/// Number of sharded futex wait-queue buckets (power of two).
+const BUCKETS: usize = 256;
 
 /// A futex key ([`crate::mm::Mm::futex_key`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,14 +44,60 @@ pub(crate) enum Key {
     File { dev: u64, ino: u64, offset: u64 },
 }
 
+/// Fast hash mapping a [`Key`] to one of [`BUCKETS`].
+fn bucket_index(key: Key) -> usize {
+    let h = match key {
+        Key::Private { mm, addr, shared } => {
+            mm.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                ^ (addr >> 2).wrapping_mul(0xbf58_476d_1ce4_e5b9)
+                ^ u64::from(shared)
+        }
+        Key::Host(addr) => ((addr as u64) >> 2).wrapping_mul(0xbf58_476d_1ce4_e5b9),
+        Key::File { dev, ino, offset } => {
+            dev.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                ^ ino.wrapping_mul(0xbf58_476d_1ce4_e5b9)
+                ^ (offset >> 2).wrapping_mul(0x94d0_49bb_1331_11eb)
+        }
+    };
+    let mixed = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    ((mixed ^ (mixed >> 27)) as usize) & (BUCKETS - 1)
+}
+
+/// Shared state between a queued [`Entry`] and the waiting thread's [`Waiter`] handle.
+struct WaiterSlot {
+    /// Set to `true` (Release) while holding the entry's bucket lock as the waker dequeues it,
+    /// allowing [`Enqueued::leave`] to return without re-locking any bucket.
+    woken: AtomicBool,
+    /// Current bucket index holding this waiter's entry; updated under both source and
+    /// destination bucket locks during `FUTEX_REQUEUE`.
+    bucket: AtomicUsize,
+}
+
+/// Handle to one registered futex waiter.
+#[derive(Clone)]
+pub(crate) struct Waiter {
+    id: u64,
+    slot: Arc<WaiterSlot>,
+}
+
+impl Waiter {
+    /// Lock-free check whether a waker has already dequeued this waiter.
+    #[inline]
+    pub fn is_woken(&self) -> bool {
+        self.slot.woken.load(Ordering::Acquire)
+    }
+}
+
 struct Entry {
     id: u64,
     key: Key,
     bitset: u32,
     /// The waiting thread's event ([`crate::task::Task::event`]).
     event: Arc<Event>,
-    /// A `FUTEX_LOCK_PI` waiter: its thread, which the lock is handed to ([`Futexes::first_pi`]).
-    /// Plain wakes and requeues leave such waiters alone.
+    /// Shared woken/bucket state with the waiting thread's [`Waiter`].
+    slot: Arc<WaiterSlot>,
+    /// A `FUTEX_LOCK_PI` waiter: its thread, which the lock is handed to
+    /// ([`BucketGuard::first_pi`]). Plain wakes and requeues leave such waiters alone.
     pi: Option<PiWaiter>,
 }
 
@@ -56,42 +110,38 @@ pub(crate) struct PiWaiter {
     pub addr: u64,
 }
 
-/// All futex waiters, in registration order (first come, first served on wake).
-#[derive(Default)]
-pub(crate) struct Futexes {
-    next_id: u64,
-    waiting: Vec<Entry>,
+#[repr(align(64))]
+struct Bucket {
+    entries: Mutex<Vec<Entry>>,
+    pi_count: AtomicUsize,
 }
 
-impl Futexes {
-    /// Registers a waiter and returns its id. `event` is the event to signal when it is woken; the
-    /// waiter must wait with [`crate::kernel::Cx::wait_alone`].
-    pub fn enqueue(&mut self, key: Key, bitset: u32, event: Arc<Event>) -> u64 {
-        self.push(key, bitset, event, None)
+impl Bucket {
+    fn new() -> Self {
+        Bucket {
+            entries: Mutex::new(Vec::new()),
+            pi_count: AtomicUsize::new(0),
+        }
     }
 
-    /// Registers a `FUTEX_LOCK_PI` waiter ([`Futexes::enqueue`]), which gets the lock when it is
-    /// woken ([`Futexes::first_pi`], [`Futexes::hand_over`]).
-    pub fn enqueue_pi(&mut self, key: Key, event: Arc<Event>, waiter: PiWaiter) -> u64 {
-        self.push(key, u32::MAX, event, Some(waiter))
+    fn lock(&self) -> MutexGuard<'_, Vec<Entry>> {
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
 
-    fn push(&mut self, key: Key, bitset: u32, event: Arc<Event>, pi: Option<PiWaiter>) -> u64 {
-        self.next_id += 1;
-        self.waiting.push(Entry {
-            id: self.next_id,
-            key,
-            bitset,
-            event,
-            pi,
-        });
-        self.next_id
-    }
+/// Guard over a single locked bucket for compound PI futex operations (`futex_lock_pi`,
+/// `futex_unlock_pi`).
+pub(crate) struct BucketGuard<'a> {
+    futexes: &'a Futexes,
+    index: usize,
+    entries: MutexGuard<'a, Vec<Entry>>,
+}
 
+impl BucketGuard<'_> {
     /// The first `FUTEX_LOCK_PI` waiter on `key` (Linux's top waiter; without priorities, the one
     /// that came first): its id and thread.
     pub fn first_pi(&self, key: Key) -> Option<(u64, PiWaiter)> {
-        self.waiting
+        self.entries
             .iter()
             .find(|e| e.key == key && e.pi.is_some())
             .and_then(|e| e.pi.map(|w| (e.id, w)))
@@ -99,79 +149,349 @@ impl Futexes {
 
     /// Whether `FUTEX_LOCK_PI` waiters other than `except` are queued on `key`.
     pub fn has_pi(&self, key: Key, except: Option<u64>) -> bool {
-        self.waiting
+        self.entries
             .iter()
             .any(|e| e.key == key && e.pi.is_some() && Some(e.id) != except)
     }
 
-    /// The first `FUTEX_LOCK_PI` waiter of each key that has some (for owners that exit): its id
-    /// and thread.
-    pub fn pi_heads(&self) -> Vec<(u64, PiWaiter)> {
-        let mut keys: Vec<Key> = Vec::new();
-        let mut heads = Vec::new();
-        for e in &self.waiting {
-            if let Some(w) = e.pi
-                && !keys.contains(&e.key)
-            {
-                keys.push(e.key);
-                heads.push((e.id, w));
-            }
-        }
-        heads
+    /// Registers a `FUTEX_LOCK_PI` waiter on `key`, which gets the lock when it is woken
+    /// ([`BucketGuard::first_pi`], [`BucketGuard::hand_over`]).
+    pub fn enqueue_pi(&mut self, key: Key, event: Arc<Event>, waiter: PiWaiter) -> Waiter {
+        debug_assert_eq!(bucket_index(key), self.index);
+        self.futexes.buckets[self.index]
+            .pi_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.futexes.pi_count.fetch_add(1, Ordering::Release);
+        self.futexes
+            .push_locked(&mut self.entries, self.index, key, u32::MAX, event, Some(waiter))
     }
 
-    /// Wakes waiter `id`, the new owner of the lock it waited for.
+    /// Wakes PI waiter `id`, the new owner of the lock it waited for.
     pub fn hand_over(&mut self, id: u64) {
-        if let Some(i) = self.waiting.iter().position(|e| e.id == id) {
-            let e = self.waiting.remove(i);
+        if let Some(i) = self.entries.iter().position(|e| e.id == id) {
+            let e = self.entries.remove(i);
+            if e.pi.is_some() {
+                self.futexes.buckets[self.index]
+                    .pi_count
+                    .fetch_sub(1, Ordering::Relaxed);
+                self.futexes.pi_count.fetch_sub(1, Ordering::Release);
+            }
+            e.slot.woken.store(true, Ordering::Release);
             crate::kernel::signal_later(&e.event);
         }
     }
+}
 
-    /// FUTEX_REQUEUE: wakes at most `n_wake` waiters on `key`, then moves at most `n_requeue` more
-    /// to `key2`. Returns the total woken and moved.
-    pub fn requeue(&mut self, key: Key, n_wake: u32, key2: Key, n_requeue: u32) -> u32 {
-        let woken = self.wake(key, n_wake, u32::MAX);
-        let mut moved = 0;
-        for e in self
-            .waiting
-            .iter_mut()
-            .filter(|e| e.key == key && e.pi.is_none())
-        {
-            if moved == n_requeue {
-                break;
-            }
-            e.key = key2;
-            moved += 1;
+/// All futex waiters, sharded across [`BUCKETS`] hash buckets (FIFO per key).
+pub(crate) struct Futexes {
+    next_id: AtomicU64,
+    /// Total queued `FUTEX_LOCK_PI` waiters across all buckets so [`pi_owners_exited`] skips
+    /// scanning buckets when none exist.
+    pi_count: AtomicUsize,
+    buckets: Box<[Bucket; BUCKETS]>,
+}
+
+impl Default for Futexes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Futexes {
+    pub fn new() -> Self {
+        let vec: Vec<Bucket> = (0..BUCKETS).map(|_| Bucket::new()).collect();
+        let buckets: Box<[Bucket; BUCKETS]> = vec
+            .into_boxed_slice()
+            .try_into()
+            .ok()
+            .expect("BUCKETS entries");
+        Futexes {
+            next_id: AtomicU64::new(0),
+            pi_count: AtomicUsize::new(0),
+            buckets,
         }
-        woken + moved
+    }
+
+    fn push_locked(
+        &self,
+        entries: &mut Vec<Entry>,
+        bucket: usize,
+        key: Key,
+        bitset: u32,
+        event: Arc<Event>,
+        pi: Option<PiWaiter>,
+    ) -> Waiter {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let slot = Arc::new(WaiterSlot {
+            woken: AtomicBool::new(false),
+            bucket: AtomicUsize::new(bucket),
+        });
+        entries.push(Entry {
+            id,
+            key,
+            bitset,
+            event,
+            slot: slot.clone(),
+            pi,
+        });
+        Waiter { id, slot }
+    }
+
+    /// Runs `f` while holding the bucket lock for `key`.
+    pub fn with_bucket<R>(&self, key: Key, f: impl FnOnce(&mut BucketGuard<'_>) -> R) -> R {
+        let index = bucket_index(key);
+        let entries = self.buckets[index].lock();
+        let mut guard = BucketGuard {
+            futexes: self,
+            index,
+            entries,
+        };
+        f(&mut guard)
+    }
+
+    /// Registers a waiter and returns its handle. `event` is the event to signal when it is
+    /// woken; the waiter must wait with [`crate::kernel::Cx::wait_alone`] or fast sleep.
+    #[cfg(test)]
+    pub fn enqueue(&self, key: Key, bitset: u32, event: Arc<Event>) -> Waiter {
+        let b = bucket_index(key);
+        let mut entries = self.buckets[b].lock();
+        self.push_locked(&mut entries, b, key, bitset, event, None)
+    }
+
+    /// Locks `key`'s bucket, runs `check()`, and enqueues a waiter iff `check()` returns
+    /// `Ok(true)`. Keeps the value check and enqueue atomic against concurrent wakes.
+    pub fn enqueue_if<E>(
+        &self,
+        key: Key,
+        bitset: u32,
+        event: Arc<Event>,
+        check: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<Option<Waiter>, E> {
+        let b = bucket_index(key);
+        let mut entries = self.buckets[b].lock();
+        if !check()? {
+            return Ok(None);
+        }
+        Ok(Some(self.push_locked(
+            &mut entries,
+            b,
+            key,
+            bitset,
+            event,
+            None,
+        )))
+    }
+
+    /// Locks every unique bucket needed by `keys` in strictly ascending index order, runs
+    /// `check()`, and enqueues all waiters atomically iff `check()` returns `Ok(true)`.
+    pub fn enqueue_many_if<E>(
+        &self,
+        keys: &[Key],
+        event: &Arc<Event>,
+        check: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<Option<Vec<Waiter>>, E> {
+        let mut indices: Vec<usize> = keys.iter().map(|&k| bucket_index(k)).collect();
+        indices.sort_unstable();
+        indices.dedup();
+        let mut guards: Vec<(usize, MutexGuard<'_, Vec<Entry>>)> = indices
+            .into_iter()
+            .map(|b| (b, self.buckets[b].lock()))
+            .collect();
+        if !check()? {
+            return Ok(None);
+        }
+        let mut waiters = Vec::with_capacity(keys.len());
+        for &key in keys {
+            let b = bucket_index(key);
+            let pos = guards
+                .binary_search_by_key(&b, |&(idx, _)| idx)
+                .expect("bucket locked");
+            let w = self.push_locked(&mut guards[pos].1, b, key, u32::MAX, event.clone(), None);
+            waiters.push(w);
+        }
+        Ok(Some(waiters))
     }
 
     /// Wakes at most `n` waiters on `key` with an intersecting bitset, and returns how many were
     /// woken.
-    pub fn wake(&mut self, key: Key, n: u32, bitset: u32) -> u32 {
-        let mut woken = 0;
-        self.waiting.retain(|e| {
-            if woken < n && e.key == key && e.bitset & bitset != 0 && e.pi.is_none() {
-                woken += 1;
-                crate::kernel::signal_later(&e.event);
-                false
-            } else {
-                true
+    pub fn wake(&self, key: Key, n: u32, bitset: u32) -> u32 {
+        let b = bucket_index(key);
+        let mut entries = self.buckets[b].lock();
+        wake_in_bucket(&mut entries, key, n, bitset)
+    }
+
+    /// FUTEX_REQUEUE: wakes at most `n_wake` waiters on `key`, then moves at most `n_requeue`
+    /// more to `key2`. Returns the total woken and moved.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn requeue(&self, key: Key, n_wake: u32, key2: Key, n_requeue: u32) -> u32 {
+        self.requeue_if::<()>(key, n_wake, key2, n_requeue, || Ok(true))
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Locks the buckets for `key` and `key2` in canonical ascending order, runs `check()`, and
+    /// if `Ok(true)` wakes up to `n_wake` waiters on `key` and moves up to `n_requeue` more to
+    /// `key2`. Returns `Ok(None)` when `check()` returns `Ok(false)`.
+    pub fn requeue_if<E>(
+        &self,
+        key: Key,
+        n_wake: u32,
+        key2: Key,
+        n_requeue: u32,
+        check: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<Option<u32>, E> {
+        let b1 = bucket_index(key);
+        let b2 = bucket_index(key2);
+        if b1 == b2 {
+            let mut entries = self.buckets[b1].lock();
+            if !check()? {
+                return Ok(None);
             }
-        });
-        woken
+            let woken = wake_in_bucket(&mut entries, key, n_wake, u32::MAX);
+            let mut moved = Vec::new();
+            let mut i = 0;
+            while i < entries.len() && (moved.len() as u32) < n_requeue {
+                if entries[i].key == key && entries[i].pi.is_none() {
+                    let mut e = entries.remove(i);
+                    e.key = key2;
+                    moved.push(e);
+                } else {
+                    i += 1;
+                }
+            }
+            let n_moved = moved.len() as u32;
+            entries.extend(moved);
+            return Ok(Some(woken + n_moved));
+        }
+        // Canonical lock order: min(b1, b2) -> max(b1, b2) prevents deadlock.
+        let (first, second) = if b1 < b2 { (b1, b2) } else { (b2, b1) };
+        let mut g_first = self.buckets[first].lock();
+        let mut g_second = self.buckets[second].lock();
+        if !check()? {
+            return Ok(None);
+        }
+        let (src, dst) = if b1 < b2 {
+            (&mut *g_first, &mut *g_second)
+        } else {
+            (&mut *g_second, &mut *g_first)
+        };
+        let woken = wake_in_bucket(src, key, n_wake, u32::MAX);
+        let mut n_moved = 0u32;
+        let mut i = 0;
+        while i < src.len() && n_moved < n_requeue {
+            if src[i].key == key && src[i].pi.is_none() {
+                let mut e = src.remove(i);
+                e.key = key2;
+                e.slot.bucket.store(b2, Ordering::Release);
+                dst.push(e);
+                n_moved += 1;
+            } else {
+                i += 1;
+            }
+        }
+        Ok(Some(woken + n_moved))
     }
 
-    /// Whether the waiter is still queued (if not, it has already been woken).
-    pub fn is_queued(&self, id: u64) -> bool {
-        self.waiting.iter().any(|e| e.id == id)
+    /// `FUTEX_WAKE_OP`: locks `key` and `key2`'s buckets in canonical order, runs `op()` (which
+    /// performs the atomic word update and returns whether the comparison matched), wakes up to
+    /// `n1` waiters on `key`, and if `op()` returned `Ok(true)`, wakes up to `n2` on `key2`.
+    pub fn wake_op<E>(
+        &self,
+        key: Key,
+        n1: u32,
+        key2: Key,
+        n2: u32,
+        op: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<u32, E> {
+        let b1 = bucket_index(key);
+        let b2 = bucket_index(key2);
+        if b1 == b2 {
+            let mut entries = self.buckets[b1].lock();
+            let matched = op()?;
+            let mut woken = wake_in_bucket(&mut entries, key, n1, u32::MAX);
+            if matched {
+                woken += wake_in_bucket(&mut entries, key2, n2, u32::MAX);
+            }
+            return Ok(woken);
+        }
+        let (first, second) = if b1 < b2 { (b1, b2) } else { (b2, b1) };
+        let mut g_first = self.buckets[first].lock();
+        let mut g_second = self.buckets[second].lock();
+        let matched = op()?;
+        let (e1, e2) = if b1 < b2 {
+            (&mut *g_first, &mut *g_second)
+        } else {
+            (&mut *g_second, &mut *g_first)
+        };
+        let mut woken = wake_in_bucket(e1, key, n1, u32::MAX);
+        if matched {
+            woken += wake_in_bucket(e2, key2, n2, u32::MAX);
+        }
+        Ok(woken)
     }
 
-    /// Removes a waiter (timed out, interrupted by a signal).
-    pub fn remove(&mut self, id: u64) {
-        self.waiting.retain(|e| e.id != id);
+    /// Whether `waiter` is still queued (if not, it has been woken or removed).
+    #[cfg(test)]
+    pub fn is_queued(&self, waiter: &Waiter) -> bool {
+        if waiter.is_woken() {
+            return false;
+        }
+        loop {
+            let b = waiter.slot.bucket.load(Ordering::Acquire);
+            let entries = self.buckets[b].lock();
+            if waiter.is_woken() {
+                return false;
+            }
+            if waiter.slot.bucket.load(Ordering::Acquire) != b {
+                continue;
+            }
+            return entries.iter().any(|e| e.id == waiter.id);
+        }
     }
+
+    /// Removes a waiter (timed out, interrupted by a signal, or unwinding). Returns `true` if a
+    /// waker had already dequeued this waiter (so the wake is not lost), or `false` if this call
+    /// removed it from its bucket.
+    pub fn remove(&self, waiter: &Waiter) -> bool {
+        loop {
+            if waiter.is_woken() {
+                return true;
+            }
+            let b = waiter.slot.bucket.load(Ordering::Acquire);
+            let mut entries = self.buckets[b].lock();
+            if waiter.is_woken() {
+                return true;
+            }
+            if waiter.slot.bucket.load(Ordering::Acquire) != b {
+                // Concurrent `requeue` moved this waiter to another bucket; retry there.
+                continue;
+            }
+            if let Some(pos) = entries.iter().position(|e| e.id == waiter.id) {
+                let e = entries.remove(pos);
+                if e.pi.is_some() {
+                    self.buckets[b].pi_count.fetch_sub(1, Ordering::Relaxed);
+                    self.pi_count.fetch_sub(1, Ordering::Release);
+                }
+                return false;
+            }
+            return true;
+        }
+    }
+}
+
+fn wake_in_bucket(entries: &mut Vec<Entry>, key: Key, n: u32, bitset: u32) -> u32 {
+    let mut woken = 0;
+    entries.retain(|e| {
+        if woken < n && e.key == key && e.bitset & bitset != 0 && e.pi.is_none() {
+            woken += 1;
+            e.slot.woken.store(true, Ordering::Release);
+            crate::kernel::signal_later(&e.event);
+            false
+        } else {
+            true
+        }
+    });
+    woken
 }
 
 /// Waiters registered in the queue ([`Futexes::enqueue`]); when done waiting they leave with
@@ -179,37 +499,45 @@ impl Futexes {
 /// removes those still queued: a leftover entry has nobody waiting on it, a later FUTEX_WAKE
 /// would count against it, and the real waiter would not be woken; when the key is a host
 /// address, that memory may later be given to another process.
-pub(crate) struct Enqueued<'s, I: AsRef<[u64]>> {
+pub(crate) struct Enqueued<'s, I: AsRef<[Waiter]>> {
     shared: &'s Shared,
-    ids: I,
+    waiters: I,
     left: bool,
 }
 
-impl<'s, I: AsRef<[u64]>> Enqueued<'s, I> {
-    pub fn new(shared: &'s Shared, ids: I) -> Self {
+impl<'s, I: AsRef<[Waiter]>> Enqueued<'s, I> {
+    pub fn new(shared: &'s Shared, waiters: I) -> Self {
         Enqueued {
             shared,
-            ids,
+            waiters,
             left: false,
         }
     }
 
-    /// The registered ids.
-    pub fn ids(&self) -> &[u64] {
-        self.ids.as_ref()
+    /// Lock-free check returning the index of the first waiter already woken, if any.
+    #[inline]
+    pub fn woken_index(&self) -> Option<usize> {
+        self.waiters.as_ref().iter().position(Waiter::is_woken)
     }
 
-    /// Leaves the queue: in the same lock hold, removes those still queued and returns the index of
-    /// the first one no longer queued (woken). A wake that coincides with a timeout or a signal
-    /// interruption counts as a wake, as in Linux's `futex_unqueue`, so that wake is not lost.
+    /// Leaves the queue: skips locking any bucket for waiters already marked woken, removes those
+    /// still queued, and returns the index of the first one woken. A wake that coincides with a
+    /// timeout or a signal interruption counts as a wake, as in Linux's `futex_unqueue`, so that
+    /// wake is not lost.
     pub fn leave(mut self) -> Option<usize> {
         self.left = true;
-        let mut futexes = self.shared.futexes();
+        let waiters = self.waiters.as_ref();
+        // Fast path for the common single-futex wait: when woken, zero bucket locks are taken.
+        if let [only] = waiters
+            && only.is_woken()
+        {
+            return Some(0);
+        }
+        let futexes = self.shared.futexes();
         let mut woken = None;
-        for (i, &id) in self.ids.as_ref().iter().enumerate() {
-            if futexes.is_queued(id) {
-                futexes.remove(id);
-            } else if woken.is_none() {
+        for (i, w) in waiters.iter().enumerate() {
+            let was_woken = w.is_woken() || futexes.remove(w);
+            if was_woken && woken.is_none() {
                 woken = Some(i);
             }
         }
@@ -217,12 +545,14 @@ impl<'s, I: AsRef<[u64]>> Enqueued<'s, I> {
     }
 }
 
-impl<I: AsRef<[u64]>> Drop for Enqueued<'_, I> {
+impl<I: AsRef<[Waiter]>> Drop for Enqueued<'_, I> {
     fn drop(&mut self) {
         if !self.left {
-            let mut futexes = self.shared.futexes();
-            for &id in self.ids.as_ref() {
-                futexes.remove(id);
+            let futexes = self.shared.futexes();
+            for w in self.waiters.as_ref() {
+                if !w.is_woken() {
+                    futexes.remove(w);
+                }
             }
         }
     }
@@ -238,7 +568,8 @@ const ROBUST_LIST_LIMIT: usize = 2048;
 /// same as Linux's `exit_robust_list`: locks it still holds are marked `FUTEX_OWNER_DIED`, and if
 /// there are waiters one is woken, which thereby gets EOWNERDEAD. `head` is the address of the
 /// `struct robust_list_head`.
-pub(crate) fn exit_robust_list(futexes: &mut Futexes, mm: &Mm, head: u64, tid: u32) {
+#[allow(clippy::needless_pass_by_ref_mut)] // preserves caller signature in task.rs
+pub(crate) fn exit_robust_list(futexes: &mut FutexesRef<'_>, mm: &Mm, head: u64, tid: u32) {
     if head == 0 {
         return;
     }
@@ -283,7 +614,7 @@ pub(crate) fn exit_robust_list(futexes: &mut Futexes, mm: &Mm, head: u64, tid: u
 /// Linux's `handle_futex_death`: if the lock at `addr` is held by `tid`, marks it
 /// `FUTEX_OWNER_DIED` (keeping `FUTEX_WAITERS`), and wakes one waiter if there are any. Other
 /// threads may be changing it with atomic operations in guest code, so a compare-and-swap is used.
-fn owner_died(futexes: &mut Futexes, mm: &Mm, addr: u64, tid: u32, pi: bool, pending: bool) {
+fn owner_died(futexes: &Futexes, mm: &Mm, addr: u64, tid: u32, pi: bool, pending: bool) {
     if !addr.is_multiple_of(4) {
         return;
     }
@@ -293,7 +624,7 @@ fn owner_died(futexes: &mut Futexes, mm: &Mm, addr: u64, tid: u32, pi: bool, pen
     let mut cur = lock.load(Ordering::SeqCst);
     // As Linux's handle_futex_death, a shared wake (glibc's robust mutexes use shared operations
     // for this reason)
-    let wake = |futexes: &mut Futexes| {
+    let wake = |futexes: &Futexes| {
         if let Some(key) = mm.futex_key(addr, false) {
             futexes.wake(key, 1, u32::MAX);
         }
@@ -324,40 +655,65 @@ fn owner_died(futexes: &mut Futexes, mm: &Mm, addr: u64, tid: u32, pi: bool, pen
 /// waiter (Linux's `exit_pi_state_list` handing the rt_mutex over, and the new owner's
 /// `fixup_pi_state_owner`). The word becomes the waiter's tid with `FUTEX_WAITERS` and
 /// `FUTEX_OWNER_DIED`, whether or not the lock was on the owner's robust list.
+#[allow(clippy::needless_pass_by_ref_mut)] // preserves caller signature in task.rs and syscall/proc.rs
 pub(crate) fn pi_owners_exited(
     k: &crate::kernel::Kernel,
-    futexes: &mut Futexes,
+    futexes: &mut FutexesRef<'_>,
     released_tid: Option<Tid>,
 ) {
-    for (id, w) in futexes.pi_heads() {
-        let Some(task) = k.tasks.get(&w.tid) else {
-            continue;
-        };
-        let ns = k.pid_ns_of(task.tgid);
-        let Ok(res) = task.res.try_borrow() else {
-            continue;
-        };
-        let Ok(mm) = res.mm.try_borrow() else {
-            continue;
-        };
-        let (Some(word), Some(me)) = (writable_word(&mm, w.addr), ns.vnr(w.tid)) else {
-            continue;
-        };
-        let cur = word.load(Ordering::SeqCst);
-        let owner = cur & FUTEX_TID_MASK;
-        if owner != 0
-            && ns
-                .find(owner as Tid)
-                .is_some_and(|g| Some(g) != released_tid && k.tasks.contains_key(&g))
-        {
+    if futexes.pi_count.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    for bucket in futexes.buckets.iter() {
+        if bucket.pi_count.load(Ordering::Acquire) == 0 {
             continue;
         }
-        let new = FUTEX_OWNER_DIED | me as u32 | FUTEX_WAITERS;
-        if word
-            .compare_exchange(cur, new, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            futexes.hand_over(id);
+        let mut entries = bucket.lock();
+        let mut keys: Vec<Key> = Vec::new();
+        let mut heads: Vec<(u64, PiWaiter)> = Vec::new();
+        for e in entries.iter() {
+            if let Some(w) = e.pi
+                && !keys.contains(&e.key)
+            {
+                keys.push(e.key);
+                heads.push((e.id, w));
+            }
+        }
+        for (id, w) in heads {
+            let Some(task) = k.tasks.get(&w.tid) else {
+                continue;
+            };
+            let ns = k.pid_ns_of(task.tgid);
+            let Ok(res) = task.res.try_borrow() else {
+                continue;
+            };
+            let Ok(mm) = res.mm.try_borrow() else {
+                continue;
+            };
+            let (Some(word), Some(me)) = (writable_word(&mm, w.addr), ns.vnr(w.tid)) else {
+                continue;
+            };
+            let cur = word.load(Ordering::SeqCst);
+            let owner = cur & FUTEX_TID_MASK;
+            if owner != 0
+                && ns
+                    .find(owner as Tid)
+                    .is_some_and(|g| Some(g) != released_tid && k.tasks.contains_key(&g))
+            {
+                continue;
+            }
+            let new = FUTEX_OWNER_DIED | me as u32 | FUTEX_WAITERS;
+            if word
+                .compare_exchange(cur, new, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+                && let Some(pos) = entries.iter().position(|e| e.id == id)
+            {
+                let e = entries.remove(pos);
+                bucket.pi_count.fetch_sub(1, Ordering::Relaxed);
+                futexes.pi_count.fetch_sub(1, Ordering::Release);
+                e.slot.woken.store(true, Ordering::Release);
+                crate::kernel::signal_later(&e.event);
+            }
         }
     }
 }
@@ -381,6 +737,8 @@ pub(crate) fn writable_word(mm: &Mm, addr: u64) -> Option<&AtomicU32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
+    use std::time::Duration;
 
     fn event() -> Arc<Event> {
         Arc::new(Event::new().unwrap())
@@ -389,7 +747,7 @@ mod tests {
     fn signaled(e: &Event) -> bool {
         crate::kernel::flush_signals();
         let mut p = [(e.fd(), 1, 0)];
-        appine_hal::poll(&mut p, Some(std::time::Duration::ZERO)).unwrap();
+        appine_hal::poll(&mut p, Some(Duration::ZERO)).unwrap();
         p[0].2 & 1 != 0
     }
 
@@ -403,19 +761,145 @@ mod tests {
                 offset: 0,
             },
         );
-        let mut f = Futexes::default();
+        let f = Futexes::default();
         let (ea, eb) = (event(), event());
         let a = f.enqueue(k1, u32::MAX, ea.clone());
         let b = f.enqueue(k1, 0b10, eb.clone());
         let c = f.enqueue(k1, u32::MAX, event());
         let d = f.enqueue(k2, u32::MAX, event());
         assert_eq!(f.wake(k1, 1, 0b01), 1);
-        assert!(!f.is_queued(a) && f.is_queued(b));
+        assert!(a.is_woken() && !f.is_queued(&a) && f.is_queued(&b));
         // Only the woken thread is notified
         assert!(signaled(&ea) && !signaled(&eb));
         assert_eq!(f.requeue(k1, 1, k2, 5), 2);
-        assert!(!f.is_queued(b) && f.is_queued(c));
+        assert!(b.is_woken() && !f.is_queued(&b) && f.is_queued(&c));
         assert_eq!(f.wake(k2, 10, u32::MAX), 2);
-        assert!(!f.is_queued(c) && !f.is_queued(d));
+        assert!(c.is_woken() && d.is_woken() && !f.is_queued(&c) && !f.is_queued(&d));
+    }
+
+    #[test]
+    fn requeue_same_and_distinct_buckets_updates_waiter_removal() {
+        let f = Futexes::default();
+        let k1 = Key::Private {
+            mm: 1,
+            addr: 0x1000,
+            shared: false,
+        };
+        let b1 = bucket_index(k1);
+        // Find a key in the same bucket and a key in a different bucket.
+        let mut same = None;
+        let mut diff = None;
+        for step in 1u64..10_000 {
+            let k = Key::Private {
+                mm: 1,
+                addr: 0x1000 + step * 4,
+                shared: false,
+            };
+            let b = bucket_index(k);
+            if b == b1 && same.is_none() {
+                same = Some(k);
+            } else if b != b1 && diff.is_none() {
+                diff = Some(k);
+            }
+            if same.is_some() && diff.is_some() {
+                break;
+            }
+        }
+        let (k_same, k_diff) = (same.unwrap(), diff.unwrap());
+
+        // Requeue to a different bucket, then remove (simulating timeout/signal after requeue).
+        let w1 = f.enqueue(k1, u32::MAX, event());
+        assert_eq!(f.requeue(k1, 0, k_diff, 1), 1);
+        assert!(f.is_queued(&w1));
+        assert!(!f.remove(&w1));
+        assert!(!f.is_queued(&w1));
+        assert_eq!(f.wake(k_diff, 1, u32::MAX), 0);
+
+        // Requeue within the same bucket, then wake on destination key.
+        let w2 = f.enqueue(k1, u32::MAX, event());
+        assert_eq!(f.requeue(k1, 0, k_same, 1), 1);
+        assert_eq!(f.wake(k1, 1, u32::MAX), 0);
+        assert_eq!(f.wake(k_same, 1, u32::MAX), 1);
+        assert!(w2.is_woken());
+        crate::kernel::flush_signals();
+    }
+
+    #[test]
+    fn concurrent_contention_requeue_and_timeout_stress() {
+        let shared = Arc::new(Shared::new(crate::kernel::Kernel::new(
+            crate::process::Tier::Interpreter,
+        )));
+        let keys: Vec<Key> = (0..16u64)
+            .map(|i| Key::Private {
+                mm: 1,
+                addr: 0x10000 + i * 4,
+                shared: false,
+            })
+            .collect();
+        let rounds = 200;
+        let n_waiters = 8;
+        let barrier = Arc::new(Barrier::new(n_waiters + 2));
+
+        std::thread::scope(|s| {
+            // Waiter threads repeatedly enqueue, wait with short timeouts or wakes, and leave.
+            for t in 0..n_waiters {
+                let shared = shared.clone();
+                let keys = &keys;
+                let barrier = barrier.clone();
+                s.spawn(move || {
+                    let ev = event();
+                    barrier.wait();
+                    for r in 0..rounds {
+                        let key = keys[(t + r) % keys.len()];
+                        let w = shared.futexes().enqueue(key, u32::MAX, ev.clone());
+                        let enq = Enqueued::new(&shared, [w]);
+                        if enq.woken_index().is_none() {
+                            let _ = ev.wait(Some(Duration::from_micros(50)));
+                            ev.clear();
+                        }
+                        let _ = enq.leave();
+                    }
+                });
+            }
+
+            // Requeue thread moving waiters in both directions across buckets (tests lock order).
+            {
+                let shared = shared.clone();
+                let keys = &keys;
+                let barrier = barrier.clone();
+                s.spawn(move || {
+                    barrier.wait();
+                    for r in 0..rounds * 2 {
+                        let k1 = keys[r % keys.len()];
+                        let k2 = keys[(r * 7 + 3) % keys.len()];
+                        let _ = shared.futexes().requeue(k1, 1, k2, 2);
+                        crate::kernel::flush_signals();
+                        let _ = shared.futexes().requeue(k2, 1, k1, 2);
+                        crate::kernel::flush_signals();
+                    }
+                });
+            }
+
+            // Waker thread continuously waking across all keys.
+            {
+                let shared = shared.clone();
+                let keys = &keys;
+                let barrier = barrier.clone();
+                s.spawn(move || {
+                    barrier.wait();
+                    for r in 0..rounds * 4 {
+                        let key = keys[r % keys.len()];
+                        let _ = shared.futexes().wake(key, 2, u32::MAX);
+                        crate::kernel::flush_signals();
+                    }
+                });
+            }
+        });
+
+        // After all threads finish, every bucket must be completely empty (zero leaked entries).
+        let futexes = shared.futexes();
+        for b in futexes.buckets.iter() {
+            assert!(b.lock().is_empty());
+        }
     }
 }

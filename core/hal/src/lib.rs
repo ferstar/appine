@@ -14,6 +14,7 @@ pub mod net;
 
 use std::io;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 // ---- Memory ----
@@ -1014,10 +1015,26 @@ pub fn host_meminfo() -> MemInfo {
 
 // ---- Waiting ----
 
-/// An event for waking across threads: an eventfd.
+/// Linux UAPI constants for process-private host futex operations (`<linux/futex.h>`).
+const FUTEX_WAIT_PRIVATE: libc::c_int = 128;
+const FUTEX_WAKE_PRIVATE: libc::c_int = 129;
+
+/// Event state bits in [`Event::state`].
+const EVENT_SIGNALED: u32 = 1 << 0;
+const EVENT_FUTEX_WAIT: u32 = 1 << 1;
+const EVENT_FD_WAIT: u32 = 1 << 2;
+const EVENT_FD_PINNED: u32 = 1 << 3;
+const EVENT_FD_DIRTY: u32 = 1 << 4;
+
+/// An event for waking across threads: a hybrid atomic-word + eventfd primitive.
 ///
-/// After [`Event::signal`], its fd is readable until [`Event::clear`].
+/// Pure waits ([`Event::wait`]) park directly on `state` via host `SYS_futex(FUTEX_WAIT_PRIVATE)`
+/// and never write or read the eventfd. Multi-fd waits ([`Event::poll_with`]) arm `EVENT_FD_WAIT`
+/// around `ppoll`, and external callers polling [`Event::fd`] directly pin `EVENT_FD_PINNED`.
+/// After [`Event::signal`], [`Event::is_signaled`] is true (and its fd readable when polled) until
+/// [`Event::clear`].
 pub struct Event {
+    state: AtomicU32,
     fd: i32,
 }
 
@@ -1028,32 +1045,195 @@ impl Event {
         if fd < 0 {
             return Err(last_errno());
         }
-        Ok(Event { fd })
+        Ok(Event {
+            state: AtomicU32::new(0),
+            fd,
+        })
     }
 
     /// Signals the event; can be called from any thread.
     pub fn signal(&self) {
+        let prev = self.state.fetch_or(EVENT_SIGNALED, Ordering::SeqCst);
+        if prev & EVENT_SIGNALED != 0 {
+            return;
+        }
+        if prev & EVENT_FUTEX_WAIT != 0 {
+            // SAFETY: `self.state` is a valid aligned `u32` owned for the duration of this call.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    &self.state as *const AtomicU32,
+                    FUTEX_WAKE_PRIVATE,
+                    1i32,
+                );
+            }
+        }
+        if prev & (EVENT_FD_WAIT | EVENT_FD_PINNED) != 0 {
+            self.write_fd();
+        }
+    }
+
+    /// Whether the event is signalled (without clearing it).
+    pub fn is_signaled(&self) -> bool {
+        self.state.load(Ordering::Acquire) & EVENT_SIGNALED != 0
+    }
+
+    /// Clears the signalled state.
+    pub fn clear(&self) {
+        if self.state.load(Ordering::Acquire) & (EVENT_FD_DIRTY | EVENT_FD_PINNED) != 0 {
+            self.state.fetch_and(!EVENT_FD_DIRTY, Ordering::AcqRel);
+            self.read_fd_once();
+        }
+        self.state.fetch_and(!EVENT_SIGNALED, Ordering::SeqCst);
+    }
+
+    /// Parks the calling thread directly on `self.state` via host `SYS_futex(FUTEX_WAIT_PRIVATE)`
+    /// until the event is signalled (`Ok(true)`), `timeout` expires (`Ok(false)`), or a host
+    /// signal interrupts the wait (`Err(EINTR)`). Does not clear the signalled state.
+    pub fn wait(&self, timeout: Option<Duration>) -> Result<bool, i32> {
+        loop {
+            let s = self.state.load(Ordering::Acquire);
+            if s & EVENT_SIGNALED != 0 {
+                return Ok(true);
+            }
+            if timeout == Some(Duration::ZERO) {
+                return Ok(false);
+            }
+            let waiting = s | EVENT_FUTEX_WAIT;
+            if self
+                .state
+                .compare_exchange(s, waiting, Ordering::SeqCst, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            let ts = timeout.map(|t| libc::timespec {
+                tv_sec: t.as_secs().min(i32::MAX as u64) as libc::time_t,
+                tv_nsec: t.subsec_nanos() as _,
+            });
+            let ts_ptr = ts
+                .as_ref()
+                .map_or(std::ptr::null(), |t| t as *const libc::timespec);
+            // SAFETY: `self.state` is a valid aligned `u32` and `ts_ptr` is null or a valid
+            // `timespec` for the duration of the syscall.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    &self.state as *const AtomicU32,
+                    FUTEX_WAIT_PRIVATE,
+                    waiting,
+                    ts_ptr,
+                    std::ptr::null::<u32>(),
+                    0u32,
+                )
+            };
+            let err = if rc < 0 { last_errno() } else { 0 };
+            self.state.fetch_and(!EVENT_FUTEX_WAIT, Ordering::AcqRel);
+            if self.state.load(Ordering::Acquire) & EVENT_SIGNALED != 0 {
+                return Ok(true);
+            }
+            if rc == 0 || err == libc::EAGAIN {
+                continue;
+            }
+            if err == libc::ETIMEDOUT {
+                return Ok(false);
+            }
+            return Err(err);
+        }
+    }
+
+    /// Waits on `fds` (each `(fd, events, revents)`) together with this event until a host fd is
+    /// ready, the event is signalled, `timeout` expires, or a host signal interrupts `ppoll`.
+    /// Returns `(ready_host_fds, event_signaled)`. Does not clear [`Event::is_signaled`].
+    pub fn poll_with(
+        &self,
+        fds: &mut [(i32, i16, i16)],
+        timeout: Option<Duration>,
+    ) -> Result<(usize, bool), i32> {
+        const POLLIN: i16 = 1;
+        let prev = self.state.fetch_or(EVENT_FD_WAIT, Ordering::SeqCst);
+        if prev & EVENT_SIGNALED != 0 {
+            self.state.fetch_and(!EVENT_FD_WAIT, Ordering::SeqCst);
+            let n = if fds.is_empty() {
+                0
+            } else {
+                poll(fds, Some(Duration::ZERO))?
+            };
+            return Ok((n, true));
+        }
+
+        let total = fds.len() + 1;
+        let mut stack = [libc::pollfd {
+            fd: 0,
+            events: 0,
+            revents: 0,
+        }; 9];
+        let mut heap;
+        let raw = if total <= stack.len() {
+            &mut stack[..total]
+        } else {
+            heap = vec![
+                libc::pollfd {
+                    fd: 0,
+                    events: 0,
+                    revents: 0,
+                };
+                total
+            ];
+            &mut heap[..]
+        };
+        for (dst, &(fd, events, _)) in raw[..fds.len()].iter_mut().zip(fds.iter()) {
+            dst.fd = fd;
+            dst.events = events;
+            dst.revents = 0;
+        }
+        raw[fds.len()] = libc::pollfd {
+            fd: self.fd,
+            events: POLLIN,
+            revents: 0,
+        };
+
+        let rc = poll_raw(raw, timeout);
+        self.state.fetch_and(!EVENT_FD_WAIT, Ordering::SeqCst);
+        if rc < 0 {
+            return Err(last_errno());
+        }
+        let n = fds.len();
+        let mut ready = 0;
+        for (slot, r) in fds.iter_mut().zip(&raw[..n]) {
+            slot.2 = r.revents;
+            if r.revents != 0 {
+                ready += 1;
+            }
+        }
+        let fd_signaled = raw[n].revents & POLLIN != 0;
+        if fd_signaled {
+            self.state.fetch_and(!EVENT_FD_DIRTY, Ordering::AcqRel);
+            self.read_fd_once();
+        }
+        Ok((ready, fd_signaled || self.is_signaled()))
+    }
+
+    /// The fd to poll directly (waiting for `POLLIN`). Pins eventfd mirroring for this `Event`.
+    pub fn fd(&self) -> i32 {
+        let prev = self.state.fetch_or(EVENT_FD_PINNED, Ordering::SeqCst);
+        if prev & EVENT_FD_PINNED == 0 && prev & EVENT_SIGNALED != 0 {
+            self.write_fd();
+        }
+        self.fd
+    }
+
+    fn write_fd(&self) {
+        self.state.fetch_or(EVENT_FD_DIRTY, Ordering::SeqCst);
         let one = 1u64.to_ne_bytes();
         // The write fails when the counter is full, but then the event is already signalled
         unsafe { libc::write(self.fd, one.as_ptr().cast(), one.len()) };
     }
 
-    /// Whether the event is signalled (without clearing it).
-    pub fn is_signaled(&self) -> bool {
-        const POLLIN: i16 = 1;
-        let mut fds = [(self.fd, POLLIN, 0)];
-        matches!(poll(&mut fds, Some(Duration::ZERO)), Ok(n) if n > 0)
-    }
-
-    /// Clears the signalled state.
-    pub fn clear(&self) {
-        let mut buf = [0u8; 64];
-        while unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
-    }
-
-    /// The fd to poll (waiting for `POLLIN`).
-    pub fn fd(&self) -> i32 {
-        self.fd
+    /// Non-semaphore eventfd drains its entire counter on a single 8-byte read.
+    fn read_fd_once(&self) {
+        let mut buf = [0u8; 8];
+        unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
     }
 }
 
@@ -1233,19 +1413,35 @@ impl HostEpoll {
 /// None waits forever. Returns the number of ready fds; returns `EINTR` when interrupted by a host
 /// signal.
 pub fn poll(fds: &mut [(i32, i16, i16)], timeout: Option<Duration>) -> Result<usize, i32> {
-    let mut raw: Vec<libc::pollfd> = fds
-        .iter()
-        .map(|&(fd, events, _)| libc::pollfd {
-            fd,
-            events,
-            revents: 0,
-        })
-        .collect();
-    let rc = poll_raw(&mut raw, timeout);
+    let mut stack = [libc::pollfd {
+        fd: 0,
+        events: 0,
+        revents: 0,
+    }; 16];
+    let mut heap;
+    let raw = if fds.len() <= stack.len() {
+        &mut stack[..fds.len()]
+    } else {
+        heap = vec![
+            libc::pollfd {
+                fd: 0,
+                events: 0,
+                revents: 0,
+            };
+            fds.len()
+        ];
+        &mut heap[..]
+    };
+    for (dst, &(fd, events, _)) in raw.iter_mut().zip(fds.iter()) {
+        dst.fd = fd;
+        dst.events = events;
+        dst.revents = 0;
+    }
+    let rc = poll_raw(raw, timeout);
     if rc < 0 {
         return Err(last_errno());
     }
-    for (slot, r) in fds.iter_mut().zip(&raw) {
+    for (slot, r) in fds.iter_mut().zip(raw.iter()) {
         slot.2 = r.revents;
     }
     Ok(rc as usize)
@@ -1897,6 +2093,130 @@ mod tests {
         assert!(e.is_signaled());
         e.clear();
         assert!(!e.is_signaled());
+    }
+
+    #[test]
+    fn event_clear_drains_multiple_signals_and_fd_stays_in_sync() {
+        let e = Event::new().unwrap();
+        // Signal before fd() is requested: fd() must mirror the pending signal.
+        e.signal();
+        e.signal();
+        let fd = e.fd();
+        let mut p = [(fd, 1, 0)];
+        assert_eq!(poll(&mut p, Some(Duration::ZERO)).unwrap(), 1);
+        assert_ne!(p[0].2 & 1, 0);
+
+        // A single clear() drains the counter completely and clears is_signaled.
+        e.clear();
+        assert!(!e.is_signaled());
+        p[0].2 = 0;
+        assert_eq!(poll(&mut p, Some(Duration::ZERO)).unwrap(), 0);
+
+        // Subsequent signals after fd() pinning continue to make fd readable.
+        e.signal();
+        e.signal();
+        assert!(e.is_signaled());
+        assert_eq!(poll(&mut p, Some(Duration::ZERO)).unwrap(), 1);
+        e.clear();
+        assert!(!e.is_signaled());
+        assert_eq!(poll(&mut p, Some(Duration::ZERO)).unwrap(), 0);
+    }
+
+    #[test]
+    fn event_wait_futex_ping_pong_and_timeout() {
+        use std::sync::Arc;
+        let a = Arc::new(Event::new().unwrap());
+        let b = Arc::new(Event::new().unwrap());
+
+        // Timeout without signal returns Ok(false).
+        assert_eq!(a.wait(Some(Duration::from_millis(2))), Ok(false));
+        assert_eq!(a.wait(Some(Duration::ZERO)), Ok(false));
+
+        // Pre-signaled wait returns immediately without clearing.
+        a.signal();
+        assert_eq!(a.wait(None), Ok(true));
+        assert!(a.is_signaled());
+        a.clear();
+        assert!(!a.is_signaled());
+
+        // Multi-round cross-thread ping-pong via host futex parking (never touches eventfd).
+        let (a2, b2) = (a.clone(), b.clone());
+        let rounds = 200;
+        let peer = std::thread::spawn(move || {
+            for _ in 0..rounds {
+                assert_eq!(a2.wait(Some(Duration::from_secs(5))), Ok(true));
+                a2.clear();
+                b2.signal();
+            }
+        });
+        for _ in 0..rounds {
+            a.signal();
+            assert_eq!(b.wait(Some(Duration::from_secs(5))), Ok(true));
+            b.clear();
+        }
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn event_poll_with_wakes_on_host_fd_and_event() {
+        use std::sync::Arc;
+        let mut pipe = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+            0
+        );
+        let (rfd, wfd) = (pipe[0], pipe[1]);
+        let ev = Arc::new(Event::new().unwrap());
+
+        // 1. Timeout when neither host fd nor event is ready.
+        let mut fds = [(rfd, 1i16, 0i16)];
+        assert_eq!(
+            ev.poll_with(&mut fds, Some(Duration::from_millis(2))),
+            Ok((0, false))
+        );
+        assert_eq!(fds[0].2, 0);
+
+        // 2. Wake by host fd without signaling event.
+        assert_eq!(write(wfd, b"x"), Ok(1));
+        assert_eq!(
+            ev.poll_with(&mut fds, Some(Duration::from_secs(1))),
+            Ok((1, false))
+        );
+        assert_ne!(fds[0].2 & 1, 0);
+        let mut b = [0u8; 1];
+        assert_eq!(read(rfd, &mut b), Ok(1));
+
+        // 3. Wake by concurrent Event::signal while parked in poll_with.
+        let ev2 = ev.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            ev2.signal();
+        });
+        fds[0].2 = 0;
+        assert_eq!(
+            ev.poll_with(&mut fds, Some(Duration::from_secs(5))),
+            Ok((0, true))
+        );
+        assert!(ev.is_signaled());
+        ev.clear();
+        assert!(!ev.is_signaled());
+        t.join().unwrap();
+
+        // 4. Pre-signaled Event::poll_with returns immediately and still reports ready host fds.
+        assert_eq!(write(wfd, b"y"), Ok(1));
+        ev.signal();
+        fds[0].2 = 0;
+        assert_eq!(
+            ev.poll_with(&mut fds, Some(Duration::from_secs(5))),
+            Ok((1, true))
+        );
+        assert_ne!(fds[0].2 & 1, 0);
+        ev.clear();
+
+        unsafe {
+            libc::close(rfd);
+            libc::close(wfd);
+        }
     }
 
     #[test]
