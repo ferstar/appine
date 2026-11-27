@@ -29,8 +29,8 @@ internal class VtImages {
         val src = Rect()
     }
 
-    /** An image's bitmap and the [generation] of its pixels it holds, -1 when copying them failed. */
-    private class Picture(val bitmap: Bitmap, var generation: Long)
+    /** An image's bitmap and the [generation] of its pixels it holds. */
+    private class Picture(val bitmap: Bitmap, val generation: Long)
 
     private val placements = ArrayList<Placement>()
     private var count = 0
@@ -40,9 +40,7 @@ internal class VtImages {
     /**
      * Takes [frame]'s image placements and copies the pixels of the images they show that are not
      * held at their generation yet from [tab]'s terminal; bitmaps no placement shows are dropped.
-     * True when new pixels arrived: they come with a frame that repaints every row since the
-     * placements changed, and when they come later (an earlier frame could not get them), the
-     * whole screen must be asked for again so that the rows they reach show them.
+     * True when new pixels arrived so callers can invalidate cached row display lists.
      */
     fun take(tab: Long, frame: VtFrame): Boolean {
         val n = frame.imageCount
@@ -54,38 +52,43 @@ internal class VtImages {
             frame.placement(k, p)
             val held = pictures[p.id]
             if (held != null && held.generation == p.generation) continue
-            if (copy(tab, p, held)) arrived = true
+            if (copy(tab, p)) arrived = true
         }
         val it = pictures.entries.iterator()
         while (it.hasNext()) {
             val e = it.next()
-            if (!shown(e.key)) {
-                e.value.bitmap.recycle()
-                it.remove()
-            }
+            if (!shown(e.key)) it.remove()
         }
         return arrived
     }
 
     /**
-     * Copies the pixels of [p]'s image at its generation into its bitmap, reusing the one [held]
-     * for an older generation when the size is the same; false when they cannot be had now (a
-     * later frame names a newer generation), or the bitmap cannot be made.
+     * Copies the pixels of [p]'s image at its generation into a fresh bitmap so any hardware
+     * [android.graphics.RenderNode] referencing an earlier generation on RenderThread never races
+     * with in-place pixel writes; false when they cannot be had now (a later frame names a newer
+     * generation), or the bitmap cannot be made.
      */
-    private fun copy(tab: Long, p: Placement, held: Picture?): Boolean {
+    private fun copy(tab: Long, p: Placement): Boolean {
         if (p.imageWidth <= 0 || p.imageHeight <= 0) return false
-        val reuse = held?.bitmap?.takeIf { it.width == p.imageWidth && it.height == p.imageHeight }
-        val bitmap = reuse ?: try {
+        val bitmap = try {
             createBitmap(p.imageWidth, p.imageHeight)
         } catch (_: OutOfMemoryError) {
-            return false
+            null
         } catch (_: IllegalArgumentException) {
+            null
+        } ?: run {
+            pictures.remove(p.id)
             return false
         }
-        if (held != null && held.bitmap !== bitmap) held.bitmap.recycle()
         val copied = VtNative.image(tab, p.id, p.generation, bitmap)
-        pictures[p.id] = Picture(bitmap, if (copied) p.generation else -1L)
-        return copied
+        if (!copied) {
+            // Safe to recycle: this newly allocated bitmap was never handed to any Canvas/RenderNode.
+            bitmap.recycle()
+            pictures.remove(p.id)
+            return false
+        }
+        pictures[p.id] = Picture(bitmap, p.generation)
+        return true
     }
 
     /** Whether one of the last frame's placements shows image [id]. */
@@ -116,7 +119,6 @@ internal class VtImages {
      */
     fun drop() {
         count = 0
-        for (p in pictures.values) p.bitmap.recycle()
         pictures.clear()
     }
 

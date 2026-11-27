@@ -215,4 +215,66 @@ class VtRendererTest {
         assertFalse(screen.rowHasMarks[0])
         assertFalse(screen.rowHasMarks[1])
     }
+
+    @Test
+    fun rowDisplayStateTracksValidityDirtyOverscanAndDiscard() {
+        val state = RowDisplayState()
+        state.resize(rows = 3)
+
+        // Fresh grid: no row is valid or needs recording yet.
+        for (y in 0..3) {
+            assertFalse(state.isValid(y))
+            assertFalse(state.needsRecord(y, hasDisplayList = false))
+            assertFalse(state.needsRecord(y, hasDisplayList = true))
+        }
+        assertEquals(3, RowDisplayState.visibleRowCount(rows = 3, scrollPx = 0))
+        assertEquals(4, RowDisplayState.visibleRowCount(rows = 3, scrollPx = 5))
+
+        // First frame delivers viewport rows 0..2 and overscan row 3.
+        for (y in 0..3) state.markDirty(y)
+        for (y in 0..3) {
+            assertTrue(state.isValid(y))
+            assertTrue(state.needsRecord(y, hasDisplayList = true))
+        }
+
+        // Hardware draw with scrollPx == 0 records only rows 0..2; overscan row 3 stays dirty.
+        for (y in 0 until RowDisplayState.visibleRowCount(3, 0)) state.markRecorded(y)
+        for (y in 0..2) {
+            assertFalse(state.needsRecord(y, hasDisplayList = true))
+            // After RenderNode.discardDisplayList(), hasDisplayList is false -> must re-record.
+            assertTrue(state.needsRecord(y, hasDisplayList = false))
+        }
+        assertTrue(state.needsRecord(3, hasDisplayList = true))
+
+        // Scrolling reveals overscan row 3, which then records and clears dirty.
+        state.markRecorded(3)
+        assertFalse(state.needsRecord(3, hasDisplayList = true))
+
+        // Incremental frame dirties only row 1; rows 0, 2, 3 remain clean.
+        state.markDirty(1)
+        assertFalse(state.needsRecord(0, hasDisplayList = true))
+        assertTrue(state.needsRecord(1, hasDisplayList = true))
+        assertFalse(state.needsRecord(2, hasDisplayList = true))
+        assertFalse(state.needsRecord(3, hasDisplayList = true))
+        state.markRecorded(1)
+
+        // invalidateAll marks every valid row dirty, while leaving uninitialized rows invalid.
+        state.resize(rows = 2)
+        state.markRecorded(1) // no-op on EMPTY row
+        assertFalse(state.isValid(1))
+        state.markDirty(0)
+        state.markRecorded(0)
+        state.invalidateAll()
+        assertTrue(state.needsRecord(0, hasDisplayList = true))
+        assertFalse(state.isValid(1))
+        assertFalse(state.needsRecord(1, hasDisplayList = false))
+
+        // Out-of-bounds indices are safely ignored.
+        state.markDirty(-1)
+        state.markDirty(99)
+        state.markRecorded(-1)
+        state.markRecorded(99)
+        assertFalse(state.isValid(-1))
+        assertFalse(state.isValid(99))
+    }
 }

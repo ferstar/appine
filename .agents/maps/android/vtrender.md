@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of android/vtview, inherited from the android/terminal full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-27 (targeted update for `vt.c` `get_multi`/`row_iterator_next_dirty` frame encoding and `VtRenderer`/`VtScreen`/`VtFrame` rendering optimizations)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: per-row RenderNode hardware rendering in VtRenderer, immutable-per-generation VtImages bitmaps, and immediate row invalidation)
 
 ## Responsibilities
 
@@ -34,12 +34,13 @@ it does not transfer those lifecycle methods here.
   flag), one row taller than the grid (the overscan row), the default colours and the cursor.
 - `VtRenderer` — four paints (regular/bold × upright/italic) and the cell metrics from them, an
   unboxed open-addressed `GlyphWidthCache` (keyed by paint index and codepoint, cleared on font
-  change, bounded at 16,384 slots), the backing bitmap (one row taller than the grid, like the
-  mirror) and the drawing: rows into the bitmap, the bitmap, the cursor (or the lock) and the
-  composing text into the view's canvas; the cell attribute, underline, cursor and search colour
-  constants.
+  change, bounded at 16,384 slots), per-row hardware `RenderNode` display lists (one per viewport
+  row plus the overscan row, tracked by `RowDisplayState`, with direct software `Canvas` fallback)
+  and the drawing: lazy per-row recording and replay, the cursor (or the lock) and the composing
+  text into the view's canvas; the cell attribute, underline, cursor and search colour constants.
 - `VtImages` — the last frame's image placements (`Placement`, pooled) and the bitmaps they show
-  by id and generation (`Picture`), copied, drawn per layer into a row and dropped.
+  by id and generation (`Picture`, allocated fresh per generation without manual recycling of drawn
+  bitmaps), copied, drawn per layer into a row and dropped.
 - `VtGlyphs` — box drawing (U+2500–U+257F), block elements (U+2580–U+259F) and the Powerline
   triangles (U+E0B0–U+E0B3) drawn as shapes.
 
@@ -51,8 +52,9 @@ it does not transfer those lifecycle methods here.
   `VtNative.image` (holding `Tab.term`) with its JNI buffer/bitmap handling.
 - `VtFrame`: header accessors, `placement` and `takeRows`; the format is shared with vt.c.
 - `VtScreen`: `resize`, `span`, cell arrays, default colours and cursor state.
-- `VtRenderer`: `setFont`, cell metrics, `resize`, `hasGrid`, `takeRows`, `drawGrid`, `drawCursor`,
-  `advance` and `drawPreedit`; `VtImages`: `take`, `draw`, `drop`; `VtGlyphs`: `covers`, `draw`.
+- `VtRenderer`: `setFont`, cell metrics, `resize`, `hasGrid`, `takeRows`, `invalidateRows`,
+  `discardDisplayLists`, `drawGrid`, `drawCursor`, `advance` and `drawPreedit`; `VtImages`:
+  `take`, `draw`, `drop`; `VtGlyphs`: `covers`, `draw`.
 
 ## Data flow / lifecycle
 
@@ -96,14 +98,16 @@ it does not transfer those lifecycle methods here.
   carries the whole list, and the header the milliseconds to the next animation frame (at least
   8, 0 when none plays), for which the view draws again.
 - The view keeps a bitmap per image shown (`VtImages`), by id with the generation of its pixels:
-  a placement of another generation has them copied (`VtNative.image`, through libjnigraphics' bitmap
-  locking, premultiplied as `ARGB_8888` holds them; gray and RGB images widened), reusing the
-  bitmap when the size is the same; a copy fails when the terminal has moved on to another
-  generation, and the next frame names that. Bitmaps no placement shows are recycled; attaching
-  another tab drops them all, and so does the window being hidden (the activity stopped), after
-  which the next frame copies them again from libghostty-vt while the backing bitmap still holds
-  the rows painted with them. Pixels that arrive in a frame that does not repaint every row ask
-  for a full frame.
+  a placement of another generation allocates a fresh `ARGB_8888` bitmap and copies into it
+  (`VtNative.image`, through libjnigraphics' bitmap locking, premultiplied; gray and RGB images
+  widened) so hardware `RenderNode` display lists on `RenderThread` never race with in-place writes;
+  a copy fails when the terminal has moved on to another generation (immediately recycling the
+  unrecorded bitmap and removing the stale entry), and the next frame names that. Bitmaps no
+  placement shows are removed from the map without manual `recycle()` so GC reclaims them after
+  `RenderThread` finishes; attaching another tab or hiding the window drops them all and calls
+  `VtRenderer.discardDisplayLists()` so row nodes release bitmap references, after which the next
+  visible frame copies them again from libghostty-vt and re-records rows from `VtScreen`. Newly
+  arrived pixels call `VtRenderer.invalidateRows()` so painted rows re-record on the current frame.
 - A hold (mode 2026) captures the screen into `vt->held_state` (under `Tab.term` only, never
   racing with `AppineVtRender`) when it begins; it ends with the program, a resize or a full
   reset, or by force once a frame is taken more than 1 s after it began. On the first frame while
@@ -112,10 +116,12 @@ it does not transfer those lifecycle methods here.
   `held_state` consumed are never missed. During a hold the rows, cursor and colours come from the
   capture, and so does the overscan byte, while the header's modes, selection and scroll position
   are read live.
-- The view asks for a full frame after a regrid, a new bitmap, new default colours (OSC 10 or 11,
-  reverse video), a change of the wide-cell setting, attaching another tab or the attached tab's
-  shell starting; a frame captured at an old size is dropped and a full one requested. Attaching
-  also resizes the tab's terminal and console to the view's grid when it differs.
+- The view asks for a full frame after a regrid, a change of the wide-cell setting, attaching
+  another tab or the attached tab's shell starting; default colour changes (OSC 10 or 11, reverse
+  video) and newly arrived image pixels invalidate cached row display lists in place via
+  `VtRenderer.invalidateRows()`. A frame captured at an old size is dropped and a full one
+  requested. Attaching also resizes the tab's terminal and console to the view's grid when it
+  differs.
 - The header also carries mode flags (mouse tracking, alternate screen, alternate scroll 1007,
   focus events 1004, a selection exists, it is a rectangle, the search is still catching up), plus
   output pending (flags bit 7: resize output has not settled at parser ground, or a synchronized-output hold), the
@@ -125,22 +131,25 @@ it does not transfer those lifecycle methods here.
   far, the selected one's place from the newest) and the mouse pointer's shape the program asked
   for (OSC 22, byte 59); each row carries its selected columns (a
   rectangle's columns on each of its rows) and each cell its search mark (attributes bits 14 and
-  15). `VtView` reads the dirty byte only to tell whether late image pixels need a full frame and,
-  while searching, whether to take the matches' rows again, the focus-events flag not at all, and
-  reports the count to the activity when it changes.
+  15). `VtView` reads the dirty byte only while searching to decide whether to refresh match rows,
+  the focus-events flag not at all, and reports the count to the activity when it changes.
 - Cell metrics: the width is the font's advance rounded to whole pixels and the text size is
   adjusted so the advance equals it; the height is the ceiling of ascent+descent, with the baseline
   centred; the light line width is the font's underline thickness. The wide scale is two cells over
   the advance of "水" (the system's CJK fallback, one em, so 1.2 with JetBrains Mono; a font's own
   ideograph when it has one), at least 1, or 1 with the setting off.
-- `onDraw` fills the view with the default background, applies the frame, draws the bitmap
+- `onDraw` fills the view with the opaque default background, applies the frame, draws the grid
   clipped to the grid's whole cells (the margin below keeps the background) and shifted up by
   `scrollPx`, then the cursor and the composing text translated by it, then the handles (whose
-  places subtract it). Applying a frame repaints each row it brings into the bitmap under a
-  clip: default background,
-  the images below the backgrounds (showing through cells of the default background), runs of
-  other backgrounds (a search match's colour over a cell's own), the images below the text, the
-  selection's translucent highlight, text (black in a search match), then the images above the
+  places subtract it). Applying a frame copies incoming rows into `VtScreen` and marks them dirty in
+  `RowDisplayState`. On hardware-accelerated canvases, `drawGrid` translates by `-scrollPx` and
+  replays each visible row's `RenderNode` (skipping the overscan row when `scrollPx == 0`), lazily
+  recording any dirty or discarded row into its node (`setPosition(0, top, bw, top + cellHeight)`,
+  `clipToBounds = true`, `translate(0, -top)`); on software canvases, `drawGrid` draws each valid
+  visible row directly under a row clip. Each row paints over the canvas's opaque default
+  background: the images below the backgrounds (showing through cells of the default background),
+  runs of other backgrounds (a search match's colour over a cell's own), the images below the text,
+  the selection's translucent highlight, text (black in a search match), then the images above the
   text; images are scaled from their source to their destination with bilinear filtering, as
   Ghostty samples them, and only the part in the row is drawn. Plain ASCII runs of
   one paint, colour and decoration go out in one draw call (skipping blank undecorated cells
@@ -161,10 +170,12 @@ it does not transfer those lifecycle methods here.
   background colour, underline, hollow; a block is drawn hollow while the view lacks focus; all
   but the bar cover two cells on a wide cell; in the OSC 12 colour, else the default foreground;
   a lock while the console reads a password, below), the IME's composing text (shifted
-  left at the right edge) and the theme's text selection handles are drawn over the bitmap each
+  left at the right edge) and the theme's text selection handles are drawn over the grid each
   draw. During android/vtview's bounded height-shrink preview, that view can reject a frame whose
   output-pending bit is set and draw its own capture of the prior grid, cursor and preedit instead.
-  It requests all rows again until it accepts a frame; the renderer's bitmap still resizes at once.
+  It requests all rows again until it accepts a frame; the renderer's grid and row `RenderNode`s
+  still resize at once, allocating fresh nodes without discarding the previous ones in place so a
+  hardware preview `RenderNode` referencing them stays valid until cleared.
 - While the console reads a password the frame gives the cursor as a lock (style 4), as Ghostty
   shows one at password prompts: wherever the cursor is in the viewport, even when the program
   hid it, never blinking, with or without the focus; `VtRenderer` draws a padlock about as tall as a
@@ -227,10 +238,13 @@ it does not transfer those lifecycle methods here.
 - The render state's source rectangles are whole image pixels, so a virtual placement's rows,
   drawn one by one, overlap or gap by a pixel each and show seams (Ghostty's renderer draws them
   so); vt.c joins rows that meet. Rows only partly in the viewport keep the rounding at their top.
-- The view paints images into its row bitmap, so a changed placement list must repaint every row:
-  vt.c makes such a frame a full one, and the view asks for one when pixels arrive late. An image
-  read for a frame during a synchronized-output hold may be gone or replaced by then; its copy
-  fails (by generation) and the frame after the hold names the new one.
+- The view records images into per-row `RenderNode`s, so a changed placement list must repaint every
+  row: vt.c makes such a frame a full one, and late or restored image pixels call
+  `VtRenderer.invalidateRows()` to re-record painted rows on the current frame. An image read for a
+  frame during a synchronized-output hold may be gone or replaced by then; its copy fails (by
+  generation) and the frame after the hold names the new one. Never call `recycle()` on a `VtImages`
+  bitmap after it may have been recorded into a `RenderNode`, and never overwrite a drawn bitmap in
+  place via JNI.
 - libghostty-vt's render state keeps search highlights internally, but the C API does not expose
   them: vt.c marks the matches itself, from the viewport's matches in screen coordinates (viewport
   ones fail for a match that starts above the viewport), and resends a row whose marks differ from
@@ -273,7 +287,9 @@ it does not transfer those lifecycle methods here.
   `sendevent` and a `uinput` virtual mouse) and through vt.c's harnesses on a macOS build, where
   the search and frame times come from; not on real or 16 KB-page devices or Android 11–13.
   Unverified beyond that:
-  - drawing: Kitty graphics with yazi, timg, `kitten icat`, tmux passthrough and the 32 MiB storage
+  - drawing: per-row `RenderNode` hardware rendering, hardware height-shrink preview and
+    `TerminalResizeTest.hardwareRecordingPopulatesAndRecoversAfterDiscard` on an Android device or
+    emulator; Kitty graphics with yazi, timg, `kitten icat`, tmux passthrough and the 32 MiB storage
     filled; the cursor setting in Chinese or while a full-screen program
     shows; the lock cursor with other IMEs composing at it; the search's marks while rows leave a
     full scrollback.

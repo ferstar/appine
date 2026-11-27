@@ -2,6 +2,7 @@ package io.github.mthli.appine
 
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.RenderNode
 import android.os.SystemClock
 import android.view.ContextThemeWrapper
 import androidx.core.graphics.createBitmap
@@ -33,10 +34,27 @@ class TerminalResizeTest {
 
     private class Fixture(val view: VtView, val tab: Long) {
         private val bitmaps = mutableListOf<Bitmap>()
+        val renderer: VtRenderer = VtView::class.java.getDeclaredField("renderer")
+            .apply { isAccessible = true }.get(view) as VtRenderer
         fun draw(): Bitmap = createBitmap(view.width, view.height).also {
             bitmaps.add(it)
             view.draw(Canvas(it))
         }
+        fun drawHardware() {
+            val frameNode = RenderNode("test-frame").apply {
+                setPosition(0, 0, view.width, view.height)
+            }
+            val rc = frameNode.beginRecording()
+            try {
+                view.draw(rc)
+            } finally {
+                frameNode.endRecording()
+            }
+            frameNode.discardDisplayList()
+        }
+        @Suppress("UNCHECKED_CAST")
+        fun rowNodes(): Array<RenderNode> = VtRenderer::class.java.getDeclaredField("rowNodes")
+            .apply { isAccessible = true }.get(renderer) as Array<RenderNode>
         fun previewMatches(before: Bitmap): Boolean {
             val cropped = Bitmap.createBitmap(before, 0, 0, view.width, view.height)
             return try { cropped.sameAs(draw()) } finally { cropped.recycle() }
@@ -93,7 +111,6 @@ class TerminalResizeTest {
 
     @Test fun subrowShrinkKeepsThePreview() = withView {
         val before = draw()
-        val renderer = VtView::class.java.getDeclaredField("renderer").apply { isAccessible = true }.get(view) as VtRenderer
         val h = renderer.cellHeight * 8 + 2
         view.layout(0, 0, 480, h)
         assertTrue(previewMatches(before))
@@ -151,5 +168,22 @@ class TerminalResizeTest {
         assertTrue(previewMatches(before))
         view.attach(null)
         assertFalse("A detached session must not keep its resize preview", previewMatches(before))
+    }
+
+    @Test fun hardwareRecordingPopulatesAndRecoversAfterDiscard() = withView {
+        drawHardware()
+        val nodes = rowNodes()
+        assertTrue(nodes.isNotEmpty())
+        for (y in 0 until nodes.size - 1) {
+            assertTrue("Viewport row $y should hold a recorded display list", nodes[y].hasDisplayList())
+        }
+        renderer.discardDisplayLists()
+        for (y in 0 until nodes.size - 1) {
+            assertFalse("Discarded row $y must drop its display list", nodes[y].hasDisplayList())
+        }
+        drawHardware()
+        for (y in 0 until nodes.size - 1) {
+            assertTrue("Discarded row $y must re-record on the next hardware draw", nodes[y].hasDisplayList())
+        }
     }
 }

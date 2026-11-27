@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 4 research concerns; 12 claims checked by 2 independent verifiers — 9 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-25 (targeted verification only since the full mapping; latest change: deliver mode 1004 focus-out / focus-in when switching tabs while window-focused)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: hardware RenderNode height-shrink preview, display-list discard on dropImages, and in-place row invalidation)
 
 ## Responsibilities
 
@@ -72,7 +72,8 @@ terminal handles and locks, JNI functions (`VtNative`, `vt.rs`) and the rest of 
   native selection gesture (`VtNative.gestureEnd`), cancels autoscroll and flings, stops
   `passwordCheck`, resets `imePassword`, clears `preedit` (`setPreedit("")`), calls `restartInput()`
   synchronously when switching/detaching tabs or when `imePassword`/`preedit` was active, clears
-  hover/selection/scroll state, and drops `VtImages` bitmaps and `animationTick`. For the new
+  hover/selection/scroll state, and drops `VtImages` bitmaps, cached row display lists and
+  `animationTick`. For the new
   session it clears `hasFrame`, binds `s.view = this`, calls `s.resize` and `host.onGrid` when the
   grid is already known (starting an unstarted shell), calls `updateBlink()` (stopping `blinkTick`
   whenever `tab == 0L`), sets `full = true` and invalidates.
@@ -95,16 +96,17 @@ terminal handles and locks, JNI functions (`VtNative`, `vt.rs`) and the rest of 
   gate (below), copies cursor/mode/viewport/selection/scrollbar/pointer fields, resets `scrollPx`
   when `!frame.overscan` or `scrollWay() != WAY_VIEWPORT`, awakens the scroll bar if `stepFrom`
   changed `scrollOffset`, updates search progress/counts/marks, updates cursor anchor and blink
-  timers, requests another full frame on default foreground/background color changes or late
-  `VtImages.take` pixels, reschedules `animationTick` for animated Kitty images, calls
-  `VtRenderer.takeRows(frame)`, and sets `hasFrame = true`.
+  timers, invalidates cached row display lists via `VtRenderer.invalidateRows()` on default
+  foreground/background color changes or newly arrived `VtImages.take` pixels, reschedules
+  `animationTick` for animated Kitty images, calls `VtRenderer.takeRows(frame)`, and sets
+  `hasFrame = true`.
 - After `apply`, `onDraw` either paints the active resize preview (scheduling
   `postInvalidateOnAnimation()` and returning early) or paints `drawContent` (grid, cursor if not
   blinked off, preedit), then `drawMatchMarks`, then `android/vtgestures`'s `drawHandles`, and
   finally shows or repositions the floating `ActionMode` menu.
-- `onWindowVisibilityChanged` drops `VtImages` bitmaps, cancels `animationTick`, stops
-  `passwordCheck` and clears any resize preview when hidden; becoming visible invalidates so images
-  and password checks resume. `onDetachedFromWindow` clears the resize preview, stops
+- `onWindowVisibilityChanged` drops `VtImages` bitmaps, discards cached row display lists, cancels
+  `animationTick`, stops `passwordCheck` and clears any resize preview when hidden; becoming visible
+  invalidates so rows re-record from `VtScreen` and images and password checks resume. `onDetachedFromWindow` clears the resize preview, stops
   `passwordCheck`, and clears blink state directly (since `isAttachedToWindow` is still true).
 - Cursor blinking runs on a 500 ms half-period (`BLINK_MS`) only while `tab != 0L`, requested by
   the frame, cursor is shown, and the view is attached with view and window focus; cursor movement
@@ -120,22 +122,24 @@ terminal handles and locks, JNI functions (`VtNative`, `vt.rs`) and the rest of 
 
 - In `onSizeChanged` (before `regrid`), when width is unchanged and height shrinks (`h > 0 && h < oldh`)
   with a live terminal, `atBottom`, no selection, no active search and a grid allocated, if
-  `h / cellHeight < rows && resizePreview == null && hasFrame`, the view snapshots
-  `screen.defaultBg` plus `drawContent` (grid, cursor, preedit) into a temporary `w × h`
-  `ARGB_8888` bitmap (clipped to the new smaller bounds) and sets `resizePreviewUntil` to
+  `h / cellHeight < rows && resizePreview == null && hasFrame`, the view snapshots `screen.defaultBg`
+  plus `drawContent` (grid, cursor, preedit) into a clipped `w × h` `RenderNode` when
+  `isHardwareAccelerated` (referencing the prior grid's row nodes) or a temporary `w × h`
+  `ARGB_8888` bitmap on software canvases, and sets `resizePreviewUntil` to
   `uptimeMillis() + 200 ms` (`RESIZE_PREVIEW_MS`).
-- While `resizePreview != null`, `apply` rejects frames whose `outputPending` flag is set
+- While a resize preview is active, `apply` rejects frames whose `outputPending` flag is set
   (native `resize_pending || held`, where `resize_pending` clears once post-resize output has been
   quiet for 32 ms at VT parser ground with no mode 2026 synchronized-output hold), re-setting
   `full = true` because `appine_vt_frame` already cleaned native dirty rows. `onDraw` draws the
-  snapshot and calls `postInvalidateOnAnimation()` so both the 32 ms quiet timer and the 200 ms
-  deadline advance even without further PTY output.
-- Subsequent shrink steps (including sub-row shrinks) keep the existing bitmap and original 200 ms
-  deadline without reallocating. The preview is cleared and recycled on settlement
-  (`!frame.outputPending`), deadline expiry, any non-shrinking or ineligible `onSizeChanged` (width
-  change, growth, scrolled back, selected, searching), `setFontSize`/`zoom`, `setFillWide`,
-  `attach`, any `onTouchEvent` (plus `invalidate()`), any non-empty `send(...)`, window hide, or
-  detach.
+  snapshot (clearing a hardware preview if unexpectedly drawn on a software canvas) and calls
+  `postInvalidateOnAnimation()` so both the 32 ms quiet timer and the 200 ms deadline advance even
+  without further PTY output.
+- Subsequent shrink steps (including sub-row shrinks) keep the existing preview and original 200 ms
+  deadline without reallocating. The preview is cleared (discarding any preview `RenderNode` display
+  list) on settlement (`!frame.outputPending`), deadline expiry, any non-shrinking or ineligible
+  `onSizeChanged` (width change, growth, scrolled back, selected, searching), `setFontSize`/`zoom`,
+  `setFillWide`, `attach`, any `onTouchEvent` (plus `invalidate()`), any non-empty `send(...)`,
+  window hide, or detach.
 
 ### Input, IME, paste and focus
 
@@ -321,7 +325,7 @@ terminal handles and locks, JNI functions (`VtNative`, `vt.rs`) and the rest of 
 - `VtView.search("")` sets `searching = true` without allocating `vt->search`, suppressing
   height-shrink previews until `endSearch()`. `jumpToPrompt` checks cached `altScreen` from the
   last frame.
-- `VtView` with `tab == 0L` keeps drawing the last painted grid bitmap in `onDraw`.
+- `VtView` with `tab == 0L` keeps drawing the last painted grid from `VtScreen`/row display lists in `onDraw`.
 
 ## Confirmed bugs / technical debt
 

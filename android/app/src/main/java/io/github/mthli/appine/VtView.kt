@@ -10,6 +10,7 @@ import android.graphics.Canvas
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Rect
+import android.graphics.RenderNode
 import android.graphics.drawable.Drawable
 import android.os.Build
 import android.os.SystemClock
@@ -55,9 +56,10 @@ import kotlin.math.roundToInt
  * parsing output while no view shows them; [attach] switches the view to another tab.
  *
  * Each frame ([VtNative.frame], read as a [VtFrame]) takes the rows that changed into a mirror of
- * the screen ([VtScreen]), which [VtRenderer] paints into a bitmap the size of the grid together
- * with the images programs show (the Kitty graphics protocol, [VtImages], whose pixels are copied
- * once per change); the cursor and the input method's composing text are drawn over it.
+ * the screen ([VtScreen]), which [VtRenderer] records into per-row hardware [RenderNode] display
+ * lists (with a software fallback) together with the images programs show (the Kitty graphics
+ * protocol, [VtImages], whose pixels are copied once per change); the cursor and the input method's
+ * composing text are drawn over it.
  *
  * Touch: a tap opens the keyboard unless on a link (and clicks when the program tracks the mouse);
  * a drag scrolls the scrollback, or sends wheel events to a program tracking the mouse, or arrow keys on the
@@ -256,14 +258,14 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     /** Draws again for the next frame of an animated image. */
     private val animationTick = Runnable { invalidate() }
 
-    /** Ask the next frame for every row (after a resize, a new bitmap, new default colours). */
+    /** Ask the next frame for every row (after a resize, a tab switch or shell start). */
     private var full = true
 
-    /** The current bitmap has been painted; requesting a full frame does not invalidate it. */
+    /** The current grid has been painted; requesting a full frame does not invalidate it. */
     private var hasFrame = false
 
     /** The last drawn content, clipped in place while a smaller grid awaits the program's redraw. */
-    private var resizePreview: Bitmap? = null
+    private var resizePreview: ResizePreview? = null
     private var resizePreviewUntil = 0L
 
     /** The input method's composing text, drawn at the cursor. */
@@ -467,10 +469,11 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         invalidate()
     }
 
-    /** Forgets the images of the tab shown ([VtImages.drop]) and stops their animation. */
+    /** Forgets the images of the tab shown ([VtImages.drop]), drops cached row display lists and stops animation. */
     private fun dropImages() {
         removeCallbacks(animationTick)
         images.drop()
+        renderer.discardDisplayLists()
     }
 
     /** Stops asking whether a password is still read ([passwordCheck]). */
@@ -569,11 +572,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         val shrinking = w == oldw && h > 0 && h < oldh
         if (shrinking && tab != 0L && atBottom && !selected && !searching && renderer.hasGrid) {
             if (h / cellHeight < rows && resizePreview == null && hasFrame) {
-                resizePreview = createBitmap(w, h).also {
-                    val c = Canvas(it)
-                    c.drawColor(screen.defaultBg)
-                    drawContent(c)
-                }
+                resizePreview = captureResizePreview(w, h)
                 resizePreviewUntil = SystemClock.uptimeMillis() + RESIZE_PREVIEW_MS
             }
         } else {
@@ -582,13 +581,34 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         regrid()
     }
 
+    private fun captureResizePreview(w: Int, h: Int): ResizePreview {
+        fun paint(c: Canvas) {
+            c.drawColor(screen.defaultBg)
+            drawContent(c)
+        }
+        if (isHardwareAccelerated) {
+            val node = RenderNode("vt-resize-preview").apply {
+                setPosition(0, 0, w, h)
+                setClipToBounds(true)
+            }
+            val rc = node.beginRecording()
+            try {
+                paint(rc)
+            } finally {
+                node.endRecording()
+            }
+            return ResizePreview.Hardware(node)
+        }
+        return ResizePreview.Software(createBitmap(w, h).also { paint(Canvas(it)) })
+    }
+
     private fun clearResizePreview() {
-        resizePreview?.recycle()
+        resizePreview?.clear()
         resizePreview = null
     }
 
     /**
-     * Fits the grid to the view. The screen and the bitmap hold one row more than the grid, the
+     * Fits the grid to the view. The screen and the renderer hold one row more than the grid, the
      * frame's overscan row after the viewport, which shows in part while the grid is drawn
      * shifted up by [scrollPx].
      */
@@ -645,9 +665,11 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             if (buffer != null) apply(VtFrame(buffer)) else full = f
         }
         resizePreview?.let {
-            c.drawBitmap(it, 0f, 0f, null)
-            postInvalidateOnAnimation()
-            return
+            if (it.draw(c)) {
+                postInvalidateOnAnimation()
+                return
+            }
+            clearResizePreview()
         }
         drawContent(c)
         drawMatchMarks(c)
@@ -673,7 +695,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     /**
      * Takes a frame: its header's state, its images ([VtImages.take]) and its rows into the screen,
-     * which the renderer paints into the bitmap.
+     * marking them for the renderer to record on draw.
      */
     private fun apply(frame: VtFrame) {
         if (frame.cols != cols || frame.rows != rows) {
@@ -759,17 +781,15 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         updateBlink()
         if (cursorMoved) restartBlink()
         if (frame.defaultFg != screen.defaultFg || frame.defaultBg != screen.defaultBg) {
-            // Rows that did not change still have the old default colours
+            // Rows that did not change still hold display lists with the old default colours
             screen.defaultFg = frame.defaultFg
             screen.defaultBg = frame.defaultBg
-            full = true
-            postInvalidateOnAnimation()
+            renderer.invalidateRows()
         }
-        // Pixels that came later than the frame that placed the images (one that did not repaint
-        // every row): the rows they reach are asked for again
-        if (images.take(tab, frame) && frame.dirty != VtFrame.DIRTY_FULL) {
-            full = true
-            postInvalidateOnAnimation()
+        // Pixels that came later than the frame that placed the images (or after visibility
+        // restored dropped images): re-record every painted row on this frame
+        if (images.take(tab, frame)) {
+            renderer.invalidateRows()
         }
         removeCallbacks(animationTick)
         val animationMs = frame.animationMs
@@ -929,8 +949,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     }
 
     /**
-     * A hidden window asks the kernel nothing and keeps no copies of the images' pixels; the frame
-     * drawn when it shows again resumes both (the bitmap still holds the rows painted with them).
+     * A hidden window asks the kernel nothing and keeps neither image copies nor row display lists;
+     * the frame drawn when it shows again resumes both and re-records rows from [screen].
      */
     override fun onWindowVisibilityChanged(visibility: Int) {
         super.onWindowVisibilityChanged(visibility)
@@ -2140,6 +2160,28 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     /** The row of the viewport at [y], counting the [scrollPx] (the overscan row's part as the last row). */
     private fun cellY(y: Float) = floor((y + scrollPx) / cellHeight).toInt().coerceIn(0, rows - 1)
+
+    private sealed interface ResizePreview {
+        fun draw(c: Canvas): Boolean
+        fun clear() {}
+
+        class Hardware(private val node: RenderNode) : ResizePreview {
+            override fun draw(c: Canvas): Boolean {
+                if (!c.isHardwareAccelerated) return false
+                c.drawRenderNode(node)
+                return true
+            }
+
+            override fun clear() = node.discardDisplayList()
+        }
+
+        class Software(private val bitmap: Bitmap) : ResizePreview {
+            override fun draw(c: Canvas): Boolean {
+                c.drawBitmap(bitmap, 0f, 0f, null)
+                return true
+            }
+        }
+    }
 
     private companion object {
         /** A program that ignores SIGWINCH must not leave the preview on screen. */

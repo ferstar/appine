@@ -1,13 +1,12 @@
 package io.github.mthli.appine
 
 import android.content.Context
-import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.RenderNode
 import android.graphics.Typeface
-import androidx.core.graphics.createBitmap
 import androidx.core.graphics.withClip
 import kotlin.math.ceil
 import kotlin.math.max
@@ -16,8 +15,9 @@ import kotlin.math.roundToInt
 
 /**
  * How [VtView] draws its [VtScreen] (the android/vtrender map): with JetBrains Mono on a fixed cell
- * grid, each row a frame brings painted into a bitmap the size of the grid (and the overscan row),
- * and the cursor and the input method's composing text drawn over it.
+ * grid, each row a frame brings recorded into a per-row hardware [RenderNode] display list (one per
+ * grid row plus the overscan row, with direct software [Canvas] fallback when hardware acceleration
+ * is unavailable), and the cursor and the input method's composing text drawn over it.
  *
  * Glyphs are placed cell by cell: runs of ASCII share one draw call (the font size is chosen so
  * their advance is exactly one cell), every other glyph is centred in its one or two cells,
@@ -70,13 +70,15 @@ internal class VtRenderer(
     /** Advances of single codepoints, per paint (unboxed open-addressed cache). */
     private val widths = GlyphWidthCache()
 
-    /** The rows painted so far, one more than the grid (the overscan row). */
-    private var bitmap: Bitmap? = null
-    private var canvas: Canvas? = null
+    /** Per-row hardware display lists (plus the overscan row), null before the first [resize]. */
+    private var rowNodes: Array<RenderNode>? = null
+    private var gridWidth = 0
+    private var gridHeight = 0
+    private val rowState = RowDisplayState()
     private val runChars = CharArray(4096)
     /** Reusable UTF-16 scratch for a single codepoint (avoids per-cell String allocation). */
     private val glyphChars = CharArray(2)
-    // Scratch state for drawRow / drawGlyph (UI thread only; avoids per-row Ref allocations).
+    // Scratch state for drawRowContent / drawGlyph (UI thread only; avoids per-row Ref allocations).
     private var runStart = -1
     private var runLength = 0
     private var runPaint: Paint? = null
@@ -121,135 +123,171 @@ internal class VtRenderer(
     }
 
     /**
-     * Fits the screen and the bitmap to a grid of [cols] × [rows] cells, and the overscan row;
-     * false when they fit it already.
+     * Fits the screen and the per-row [RenderNode]s to a grid of [cols] × [rows] cells, and the
+     * overscan row; false when they fit it already.
      */
     fun resize(cols: Int, rows: Int): Boolean {
         val bw = cols * cellWidth
         val bh = (rows + 1) * cellHeight
-        if (cols == screen.cols && rows == screen.rows && bitmap?.width == bw && bitmap?.height == bh) return false
+        if (cols == screen.cols && rows == screen.rows && gridWidth == bw && gridHeight == bh && rowNodes != null) {
+            return false
+        }
         screen.resize(cols, rows)
-        bitmap?.recycle()
-        bitmap = createBitmap(bw, bh).also { canvas = Canvas(it) }
+        gridWidth = bw
+        gridHeight = bh
+        rowState.resize(rows)
+        // Allocate fresh nodes instead of discarding the old ones in place so an active
+        // height-shrink preview RenderNode referencing the prior grid stays intact until cleared.
+        rowNodes = Array(rows + 1) { y ->
+            RenderNode("vt-row-$y").apply {
+                val top = y * cellHeight
+                setPosition(0, top, bw, top + cellHeight)
+                setClipToBounds(true)
+            }
+        }
         return true
     }
 
     /** Whether there is a grid to draw ([resize]). */
-    val hasGrid: Boolean get() = bitmap != null
+    val hasGrid: Boolean get() = rowNodes != null
 
-    /** Takes [frame]'s rows into the screen and paints them. */
+    /** Takes [frame]'s rows into the screen and marks them dirty for the next draw. */
     fun takeRows(frame: VtFrame) {
-        val target = canvas ?: return
-        frame.takeRows(screen) { y -> drawRow(target, y) }
+        if (rowNodes == null) return
+        frame.takeRows(screen) { y -> rowState.markDirty(y) }
+    }
+
+    /** Marks every painted row dirty so it re-records on the next draw (default colour or image changes). */
+    fun invalidateRows() {
+        rowState.invalidateAll()
+    }
+
+    /** Discards cached row display lists so references to dropped [VtImages] bitmaps are released. */
+    fun discardDisplayLists() {
+        rowNodes?.forEach(RenderNode::discardDisplayList)
+    }
+
+    private fun recordRow(node: RenderNode, y: Int) {
+        val rc = node.beginRecording()
+        try {
+            val top = y * cellHeight
+            if (top != 0) rc.translate(0f, -top.toFloat())
+            drawRowContent(rc, y, screen.cols, top)
+        } finally {
+            node.endRecording()
+        }
     }
 
     private fun drawRow(c: Canvas, y: Int) {
         val cols = screen.cols
+        val top = y * cellHeight
+        c.withClip(0, top, cols * cellWidth, top + cellHeight) {
+            drawRowContent(c, y, cols, top)
+        }
+    }
+
+    private fun drawRowContent(c: Canvas, y: Int, cols: Int, top: Int) {
         val cp = screen.cp
         val attrs = screen.attrs
         val clusters = screen.clusters
-        val top = y * cellHeight
         val base = y * cols
         val rowMarked = screen.rowHasMarks[y]
-        c.withClip(0, top, cols * cellWidth, top + cellHeight) {
-            fill.color = screen.defaultBg
-            c.drawRect(0f, top.toFloat(), (cols * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
-            // Images below the backgrounds show through cells of the default one
-            images.draw(c, VtImages.LAYER_BELOW_BACKGROUND, top, cellHeight)
-            if (cols > 0) {
-                var x = 0
-                var color = bgOf(base, 0, rowMarked)
-                while (x < cols) {
-                    var end = x + 1
-                    var nextColor = color
-                    while (end < cols) {
-                        nextColor = bgOf(base + end, end, rowMarked)
-                        if (nextColor != color) break
-                        end++
-                    }
-                    if (color != screen.defaultBg) {
-                        fill.color = color
-                        c.drawRect((x * cellWidth).toFloat(), top.toFloat(), (end * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
-                    }
-                    x = end
-                    color = nextColor
-                }
-            }
-            images.draw(c, VtImages.LAYER_BELOW_TEXT, top, cellHeight)
-            val from = screen.selFrom[y]
-            if (from >= 0) {
-                // The highlight covers a wide character whose first cell ends the selection
-                val to = screen.selTo[y] + screen.span(base + screen.selTo[y])
-                fill.color = SELECTION
-                c.drawRect((from * cellWidth).toFloat(), top.toFloat(), (min(to, cols) * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
-            }
-
-            // Runs of plain ASCII in one style go out in one call; scaled non-ASCII glyphs share
-            // one canvas scale around (0, midY) across consecutive cells with the same scale.
-            runStart = -1
-            runLength = 0
-            runPaint = null
-            runColor = 0
-            runDecor = 0
-            val baselineY = (top + baseline).toFloat()
+        // The view canvas already holds opaque screen.defaultBg; images below the backgrounds
+        // show through cells of the default one without an extra full-row background fill.
+        images.draw(c, VtImages.LAYER_BELOW_BACKGROUND, top, cellHeight)
+        if (cols > 0) {
             var x = 0
+            var color = bgOf(base, 0, rowMarked)
             while (x < cols) {
-                val i = base + x
-                val a = attrs[i]
-                val wide = (a shr 12) and 3
-                if (wide == SPACER_TAIL || wide == SPACER_HEAD) {
+                var end = x + 1
+                var nextColor = color
+                while (end < cols) {
+                    nextColor = bgOf(base + end, end, rowMarked)
+                    if (nextColor != color) break
+                    end++
+                }
+                if (color != screen.defaultBg) {
+                    fill.color = color
+                    c.drawRect((x * cellWidth).toFloat(), top.toFloat(), (end * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
+                }
+                x = end
+                color = nextColor
+            }
+        }
+        images.draw(c, VtImages.LAYER_BELOW_TEXT, top, cellHeight)
+        val from = screen.selFrom[y]
+        if (from >= 0) {
+            // The highlight covers a wide character whose first cell ends the selection
+            val to = screen.selTo[y] + screen.span(base + screen.selTo[y])
+            fill.color = SELECTION
+            c.drawRect((from * cellWidth).toFloat(), top.toFloat(), (min(to, cols) * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
+        }
+
+        // Runs of plain ASCII in one style go out in one call; scaled non-ASCII glyphs share
+        // one canvas scale around (0, midY) across consecutive cells with the same scale.
+        runStart = -1
+        runLength = 0
+        runPaint = null
+        runColor = 0
+        runDecor = 0
+        val baselineY = (top + baseline).toFloat()
+        var x = 0
+        while (x < cols) {
+            val i = base + x
+            val a = attrs[i]
+            val wide = (a shr 12) and 3
+            if (wide == SPACER_TAIL || wide == SPACER_HEAD) {
+                x++
+                continue
+            }
+            val span = if (wide == WIDE) 2 else 1
+            if (!drawsForeground(a)) {
+                flushRun(c, top, baselineY)
+                x += span
+                continue
+            }
+            val code = cp[i]
+            val decor = a and DECORATIONS
+            val cluster = clusters[i]
+            val plain = cluster == null && wide == NARROW &&
+                (code == 0 || code in 0x20..0x7e)
+            if (plain) {
+                val blank = decor == 0 && (code == 0 || code == ' '.code)
+                if (runLength == 0 && blank) {
                     x++
                     continue
                 }
-                val span = if (wide == WIDE) 2 else 1
-                if (!drawsForeground(a)) {
+                val color = fgOf(i, x, rowMarked)
+                val paint = paints[a and (BOLD or ITALIC)]
+                if (runLength > 0 && (paint !== runPaint || color != runColor || decor != runDecor || runLength == runChars.size)) {
                     flushRun(c, top, baselineY)
-                    x += span
-                    continue
-                }
-                val code = cp[i]
-                val decor = a and DECORATIONS
-                val cluster = clusters[i]
-                val plain = cluster == null && wide == NARROW &&
-                    (code == 0 || code in 0x20..0x7e)
-                if (plain) {
-                    val blank = decor == 0 && (code == 0 || code == ' '.code)
-                    if (runLength == 0 && blank) {
+                    if (blank) {
                         x++
                         continue
                     }
-                    val color = fgOf(i, x, rowMarked)
-                    val paint = paints[a and (BOLD or ITALIC)]
-                    if (runLength > 0 && (paint !== runPaint || color != runColor || decor != runDecor || runLength == runChars.size)) {
-                        flushRun(c, top, baselineY)
-                        if (blank) {
-                            x++
-                            continue
-                        }
-                    }
-                    if (runLength == 0) {
-                        runStart = x
-                        runPaint = paint
-                        runColor = color
-                        runDecor = decor
-                    }
-                    runChars[runLength++] = if (code == 0) ' ' else code.toChar()
-                    x++
-                    continue
                 }
-                flushRun(c, top, baselineY)
-                val color = fgOf(i, x, rowMarked)
-                drawGlyph(c, i, x, span, top, color, a and (BOLD or ITALIC))
-                if (decor != 0) {
-                    endScale(c)
-                    decorate(c, decor, x, x + span, top, color)
+                if (runLength == 0) {
+                    runStart = x
+                    runPaint = paint
+                    runColor = color
+                    runDecor = decor
                 }
-                x += span
+                runChars[runLength++] = if (code == 0) ' ' else code.toChar()
+                x++
+                continue
             }
             flushRun(c, top, baselineY)
-            endScale(c)
-            images.draw(c, VtImages.LAYER_ABOVE_TEXT, top, cellHeight)
+            val color = fgOf(i, x, rowMarked)
+            drawGlyph(c, i, x, span, top, color, a and (BOLD or ITALIC))
+            if (decor != 0) {
+                endScale(c)
+                decorate(c, decor, x, x + span, top, color)
+            }
+            x += span
         }
+        flushRun(c, top, baselineY)
+        endScale(c)
+        images.draw(c, VtImages.LAYER_ABOVE_TEXT, top, cellHeight)
     }
 
     private fun endScale(c: Canvas) {
@@ -402,9 +440,25 @@ internal class VtRenderer(
 
     /** The rows as last painted, [scrollPx] above their place, clipped to the grid's whole cells. */
     fun drawGrid(c: Canvas, scrollPx: Int) {
-        val bmp = bitmap ?: return
+        val nodes = rowNodes ?: return
+        val visibleRows = RowDisplayState.visibleRowCount(screen.rows, scrollPx)
         c.withClip(0, 0, screen.cols * cellWidth, screen.rows * cellHeight) {
-            c.drawBitmap(bmp, 0f, -scrollPx.toFloat(), null)
+            if (scrollPx != 0) c.translate(0f, -scrollPx.toFloat())
+            if (c.isHardwareAccelerated) {
+                for (y in 0 until visibleRows) {
+                    if (!rowState.isValid(y)) continue
+                    val node = nodes[y]
+                    if (rowState.needsRecord(y, node.hasDisplayList())) {
+                        recordRow(node, y)
+                        rowState.markRecorded(y)
+                    }
+                    c.drawRenderNode(node)
+                }
+            } else {
+                for (y in 0 until visibleRows) {
+                    if (rowState.isValid(y)) drawRow(c, y)
+                }
+            }
         }
     }
 
@@ -691,5 +745,47 @@ internal class GlyphWidthCache(initialCapacity: Int = INITIAL_CAPACITY) {
             while (v < n) v = v shl 1
             return v
         }
+    }
+}
+
+/**
+ * Per-row state for [VtRenderer]'s [RenderNode] display lists (one slot per viewport row plus the
+ * overscan row). Slots start [EMPTY] after [resize], become [DIRTY] as frames deliver them, stay
+ * [DIRTY] while unrecorded (e.g. the overscan row while `scrollPx == 0` or after software-only
+ * draws), and re-record whenever [DIRTY] or after `discardDisplayList`.
+ */
+internal class RowDisplayState {
+    private var states = ByteArray(0)
+
+    fun resize(rows: Int) {
+        states = ByteArray(rows + 1)
+    }
+
+    fun markDirty(y: Int) {
+        if (y in states.indices) states[y] = DIRTY
+    }
+
+    fun invalidateAll() {
+        for (y in states.indices) {
+            if (states[y] == CLEAN) states[y] = DIRTY
+        }
+    }
+
+    fun isValid(y: Int): Boolean = y in states.indices && states[y] != EMPTY
+
+    fun needsRecord(y: Int, hasDisplayList: Boolean): Boolean =
+        y in states.indices && (states[y] == DIRTY || (states[y] == CLEAN && !hasDisplayList))
+
+    fun markRecorded(y: Int) {
+        if (y in states.indices && states[y] != EMPTY) states[y] = CLEAN
+    }
+
+    companion object {
+        private const val EMPTY: Byte = 0
+        private const val DIRTY: Byte = 1
+        private const val CLEAN: Byte = 2
+
+        fun visibleRowCount(rows: Int, scrollPx: Int): Int =
+            if (scrollPx > 0) rows + 1 else rows
     }
 }
