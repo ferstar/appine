@@ -360,6 +360,9 @@ pub(crate) struct Kernel {
     pub eventfd_ids: Rc<RefCell<crate::fd::EventFdIds>>,
     /// Read-only file mappings shared by all address spaces ([`crate::mm::FileMaps`]).
     pub file_maps: crate::mm::FileMaps,
+    /// Shared with [`Shared::fast`]: incremented by [`Kernel::fast_changed`] and
+    /// [`Shared::fast_changed`] whenever state recorded for no-BKL syscalls may be stale.
+    fast: Arc<AtomicU64>,
 }
 
 // SAFETY: Kernel and the Rc/RefCell in it are accessed only while holding the BKL (the
@@ -469,7 +472,15 @@ impl Kernel {
             inotify: Rc::default(),
             eventfd_ids: Rc::default(),
             file_maps: Default::default(),
+            fast: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Marks state recorded for no-BKL syscalls (`syscall::fast`) as stale. Called while holding
+    /// the BKL from paths that hold only `&Kernel` (such as `/proc/<pid>/uid_map` and `gid_map`
+    /// writes).
+    pub fn fast_changed(&self) {
+        self.fast.fetch_add(1, Ordering::Release);
     }
 
     /// Chooses the global number for a new thread or process in pid namespace `ns` (the checking
@@ -792,8 +803,8 @@ pub(crate) struct Shared {
     /// [`crate::loadavg`]) have stopped: all threads are waiting.
     pub checks_idle: AtomicBool,
     /// Incremented whenever the state threads recorded for no-BKL syscalls may be stale
-    /// ([`Shared::fast_changed`]).
-    fast: AtomicU64,
+    /// ([`Shared::fast_changed`], [`Kernel::fast_changed`]).
+    fast: Arc<AtomicU64>,
     /// The futex wait queue. No-BKL futexes (`syscall::fast`) take only this lock; it may also be
     /// taken while holding the BKL, but not the other way round. Checking the futex value and
     /// registering as a waiter happen in one hold of it, and waking takes it too, so no wake-up
@@ -803,6 +814,7 @@ pub(crate) struct Shared {
 
 impl Shared {
     pub fn new(kernel: Kernel) -> Shared {
+        let fast = kernel.fast.clone();
         Shared {
             kernel: Mutex::new(kernel),
             hold: Hold::default(),
@@ -811,7 +823,7 @@ impl Shared {
             timers: Arc::new(Event::new().expect("cannot create an eventfd for the timers")),
             dns_answers: Arc::new(Mutex::new(Vec::new())),
             checks_idle: AtomicBool::new(false),
-            fast: AtomicU64::new(0),
+            fast,
             futexes: Mutex::new(Futexes::default()),
         }
     }
@@ -886,8 +898,8 @@ impl Shared {
     }
 
     /// The state threads recorded for no-BKL syscalls (`syscall::fast`) may be stale: some
-    /// thread's root directory, current directory or credentials changed. Called while holding
-    /// the BKL.
+    /// thread's root directory, current directory, credentials or user-namespace ID maps changed.
+    /// Called while holding the BKL.
     pub fn fast_changed(&self) {
         self.fast.fetch_add(1, Ordering::Release);
     }

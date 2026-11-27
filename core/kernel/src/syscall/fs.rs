@@ -8,7 +8,9 @@
 //! pipes may block; while blocked they release the BKL and hold no borrow of any open file (other
 //! threads may be using the same open file).
 
+use std::cell::Cell;
 use std::io::Write;
+use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::FileExt;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
@@ -3432,7 +3434,7 @@ fn splice_into_pipe(
     let slots = (offset + n).div_ceil(PIPE_BUF);
     pipe.borrow_mut().reserved += slots;
     let mut claim = PipeSlots { pipe, slots };
-    let mut buf = vec![0; n];
+    let mut buf = IoScratch::take(n);
     let got = match splice_read(cx, input, &mut buf, src, nonblock, pos.is_some()) {
         Err(e) if e == Errno::ENOTCONN => return Err(Errno::EINVAL),
         r => r?,
@@ -4009,7 +4011,7 @@ fn read_scattered(
         let nonblock = file.borrow().nonblocking() || io.nowait;
         return fuse_dev_read_user(cx, file, nonblock, vecs);
     }
-    let mut buf = vec![0u8; total.min(step)];
+    let mut buf = IoScratch::take(total.min(step));
     let k = read_bytes_with(cx, file, &mut buf, None, io)?;
     note_read(cx, file, k);
     let mut done = 0;
@@ -4050,36 +4052,35 @@ fn write_gathered(
     let mut cur = None;
     let mut done = 0;
     let total = vecs.iter().map(|v| v.1).sum();
-    let mut chunk = Vec::with_capacity(step.min(total));
+    let cap = step.min(total);
+    let mut chunk = IoScratch::take(cap);
     loop {
-        chunk.clear();
+        let mut filled = 0;
         let mut fault = None;
-        while chunk.len() < step {
+        while filled < cap {
             let Some((base, len)) = cur.take().or_else(|| rest.next()) else {
                 break;
             };
-            let n = len.min(step - chunk.len());
-            let start = chunk.len();
-            chunk.resize(start + n, 0);
-            if let Err(e) = cx.read_user(UserSlice::new(base, n), &mut chunk[start..]) {
-                chunk.truncate(start);
+            let n = len.min(cap - filled);
+            if let Err(e) = cx.read_user(UserSlice::new(base, n), &mut chunk[filled..filled + n]) {
                 fault = Some(e);
                 break;
             }
+            filled += n;
             if n < len {
                 cur = Some((base.wrapping_add(n as u64), len - n));
             }
         }
-        if chunk.is_empty() {
+        if filled == 0 {
             return match fault {
                 Some(e) if done == 0 => Err(e),
                 _ => Ok(done as u64),
             };
         }
-        match write_bytes_with(cx, file, &chunk, None, io) {
+        match write_bytes_with(cx, file, &chunk[..filled], None, io) {
             Ok(k) => {
                 done += k;
-                if k < chunk.len() || fault.is_some() {
+                if k < filled || fault.is_some() {
                     return Ok(done as u64);
                 }
             }
@@ -4200,7 +4201,7 @@ pub(super) fn sendfile(
     let lock_in = off.is_none() && needs_pos_lock(&input.borrow());
     let lock_out = needs_pos_lock(&output.borrow());
     let _pos = TwoPosGuard::lock(cx, (&input, lock_in), (&output, lock_out))?;
-    let mut chunk = vec![0u8; count.min(IO_CHUNK)];
+    let mut chunk = IoScratch::take(count.min(IO_CHUNK));
     let mut done = 0;
     let mut touch_atime = true;
     while done < count {
@@ -4359,7 +4360,7 @@ fn copy_data(
     let lock_out = dst.is_none() && needs_pos_lock(&output.borrow());
     let _pos = TwoPosGuard::lock(cx, (input, lock_in), (output, lock_out))?;
     // As with sendfile, an error after some bytes were copied returns those bytes
-    let mut chunk = vec![0u8; len.min(IO_CHUNK)];
+    let mut chunk = IoScratch::take(len.min(IO_CHUNK));
     let mut done = 0;
     while done < len {
         let n = (len - done).min(IO_CHUNK);
@@ -4802,7 +4803,7 @@ fn read_file_inner(
             }
     ) || matches!(file.borrow().kind, FileKind::Host(fd) if host_regular(fd));
     let step = io_chunk(&file.borrow());
-    let mut chunk = vec![0u8; len.min(step)];
+    let mut chunk = IoScratch::take(len.min(step));
     let mut done = 0;
     while done < len {
         let n = (len - done).min(step);
@@ -4855,6 +4856,90 @@ fn io_chunk(f: &OpenFile) -> usize {
     match f.kind {
         FileKind::FuseDev(_) | FileKind::Fuse(_) => FUSE_CHUNK,
         _ => IO_CHUNK,
+    }
+}
+
+thread_local! {
+    /// Per-thread scratch buffer reused across file, pipe, and stream I/O syscalls.
+    ///
+    /// Stored as an owned `Vec<u8>` in a `Cell` rather than a `RefCell`: callers take ownership
+    /// for one operation via [`IoScratch`], so the buffer stays `Send` across `Cx::unlocked`
+    /// without holding any borrow across BKL release, and re-entrant I/O on the same thread
+    /// safely falls back to a fresh transient `Vec` instead of panicking.
+    static IO_SCRATCH: Cell<Vec<u8>> = const { Cell::new(Vec::new()) };
+}
+
+/// RAII guard for a per-thread I/O scratch slice of exact length `len`.
+///
+/// The cached `Vec<u8>` retains its initialized high-water mark (up to [`IO_CHUNK`]) across calls
+/// so warm I/O neither allocates nor re-zeroes. Callers must only read bytes overwritten in the
+/// current operation and never assume the slice is zero-filled. Oversized transfers (`> IO_CHUNK`,
+/// such as large FUSE messages or resized pipes) use a transient buffer that is freed on drop.
+struct IoScratch {
+    buf: Vec<u8>,
+    len: usize,
+}
+
+impl IoScratch {
+    /// Minimum cached allocation once a thread needs scratch space, avoiding repeated tiny
+    /// reallocations as transfer sizes grow toward a page or [`IO_CHUNK`].
+    const MIN_CAP: usize = 4096;
+
+    fn take(len: usize) -> Self {
+        if len == 0 {
+            return Self {
+                buf: Vec::new(),
+                len: 0,
+            };
+        }
+        if len > IO_CHUNK {
+            return Self {
+                buf: vec![0u8; len],
+                len,
+            };
+        }
+        let mut buf = IO_SCRATCH.try_with(Cell::take).unwrap_or_default();
+        if buf.capacity() < len {
+            let target = len.max(Self::MIN_CAP).next_power_of_two().min(IO_CHUNK);
+            buf.reserve_exact(target - buf.len());
+        }
+        if buf.len() < len {
+            buf.resize(len, 0);
+        }
+        Self { buf, len }
+    }
+}
+
+impl Deref for IoScratch {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl DerefMut for IoScratch {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.buf[..self.len]
+    }
+}
+
+impl Drop for IoScratch {
+    fn drop(&mut self) {
+        let buf = std::mem::take(&mut self.buf);
+        if buf.capacity() == 0 || buf.capacity() > IO_CHUNK {
+            return;
+        }
+        let _ = IO_SCRATCH.try_with(|cell| {
+            let existing = cell.take();
+            if buf.capacity() > existing.capacity()
+                || (buf.capacity() == existing.capacity() && buf.len() > existing.len())
+            {
+                cell.set(buf);
+            } else {
+                cell.set(existing);
+            }
+        });
     }
 }
 
@@ -4947,7 +5032,7 @@ fn write_file_inner(
     let (len, mut prechecked_flags) =
         fsize_allowed_flags(cx, &file.borrow(), offset, len, io.append)?;
     let step = io_chunk(&file.borrow());
-    let mut chunk = vec![0u8; len.min(step)];
+    let mut chunk = IoScratch::take(len.min(step));
     let mut done = 0;
     while done < len {
         let n = (len - done).min(step);
@@ -5240,7 +5325,10 @@ fn pipe_read_user(
         }
         cx.wait_object(crate::pipe::object(pipe))?;
     }
-    let data = pipe.borrow().snapshot(total);
+    let avail = pipe.borrow().bytes().len().min(total);
+    let mut buf = IoScratch::take(avail);
+    let got = pipe.borrow().copy_out(&mut buf);
+    let data = &buf[..got];
     let mut done = 0;
     for &(base, len) in vecs {
         let n = len.min(data.len() - done);
@@ -13256,6 +13344,190 @@ mod tests {
             }
 
             close(cx, self_fd).unwrap();
+        });
+    }
+
+    #[test]
+    fn io_scratch_reuses_buffer_without_reallocating() {
+        fn assert_send<T: Send>() {}
+        assert_send::<IoScratch>();
+
+        IO_SCRATCH.with(Cell::take);
+
+        let ptr_small = {
+            let mut buf = IoScratch::take(4096);
+            assert_eq!(buf.len(), 4096);
+            buf.fill(0xaa);
+            buf.as_ptr()
+        };
+        {
+            let buf = IoScratch::take(2048);
+            assert_eq!(buf.len(), 2048);
+            assert_eq!(buf.as_ptr(), ptr_small);
+        }
+        let ptr_full = {
+            let buf = IoScratch::take(IO_CHUNK);
+            assert_eq!(buf.len(), IO_CHUNK);
+            assert_eq!(buf.buf.capacity(), IO_CHUNK);
+            buf.as_ptr()
+        };
+        // Zero-length requests do not allocate or disturb the cached buffer.
+        {
+            let empty = IoScratch::take(0);
+            assert!(empty.is_empty());
+        }
+        for len in [1, 4096, 16384, IO_CHUNK] {
+            let buf = IoScratch::take(len);
+            assert_eq!(buf.len(), len);
+            assert_eq!(buf.as_ptr(), ptr_full);
+            assert_eq!(buf.buf.capacity(), IO_CHUNK);
+        }
+    }
+
+    #[test]
+    fn io_scratch_does_not_retain_oversized_buffers() {
+        IO_SCRATCH.with(Cell::take);
+
+        {
+            let big = IoScratch::take(IO_CHUNK + 4096);
+            assert_eq!(big.len(), IO_CHUNK + 4096);
+        }
+        IO_SCRATCH.with(|cell| {
+            let cached = cell.take();
+            assert_eq!(cached.capacity(), 0);
+        });
+
+        let ptr_cached = {
+            let buf = IoScratch::take(4096);
+            buf.as_ptr()
+        };
+        {
+            let big = IoScratch::take(IO_CHUNK + 4096);
+            assert_eq!(big.len(), IO_CHUNK + 4096);
+            assert_ne!(big.as_ptr(), ptr_cached);
+        }
+        let reused = IoScratch::take(4096);
+        assert_eq!(reused.as_ptr(), ptr_cached);
+        assert!(reused.buf.capacity() <= IO_CHUNK);
+    }
+
+    #[test]
+    fn io_scratch_supports_reentrant_acquisition_and_keeps_larger_cache() {
+        IO_SCRATCH.with(Cell::take);
+
+        let ptr_big = {
+            let buf = IoScratch::take(IO_CHUNK);
+            buf.as_ptr()
+        };
+        {
+            let mut outer = IoScratch::take(IO_CHUNK);
+            assert_eq!(outer.as_ptr(), ptr_big);
+            outer.fill(0x11);
+            {
+                let mut inner = IoScratch::take(4096);
+                assert_ne!(inner.as_ptr(), ptr_big);
+                inner.fill(0x22);
+                assert_eq!(outer[0], 0x11);
+            }
+            assert_eq!(outer[0], 0x11);
+        }
+        // Outer (IO_CHUNK) dropped after inner (4096) and must remain cached.
+        {
+            let buf = IoScratch::take(IO_CHUNK);
+            assert_eq!(buf.as_ptr(), ptr_big);
+        }
+
+        // Reverse order: outer holds 4096, inner allocates IO_CHUNK and drops first.
+        IO_SCRATCH.with(Cell::take);
+        let ptr_inner_big = {
+            let _outer = IoScratch::take(4096);
+            let inner = IoScratch::take(IO_CHUNK);
+            inner.as_ptr()
+        };
+        let buf = IoScratch::take(IO_CHUNK);
+        assert_eq!(buf.as_ptr(), ptr_inner_big);
+    }
+
+    #[test]
+    fn io_scratch_returns_buffer_on_panic() {
+        IO_SCRATCH.with(Cell::take);
+
+        let ptr = {
+            let buf = IoScratch::take(4096);
+            buf.as_ptr()
+        };
+        let panicked = std::panic::catch_unwind(|| {
+            let mut buf = IoScratch::take(4096);
+            assert_eq!(buf.as_ptr(), ptr);
+            buf.fill(0x55);
+            panic!("simulated panic while holding IoScratch");
+        });
+        assert!(panicked.is_err());
+
+        let recovered = IoScratch::take(4096);
+        assert_eq!(recovered.as_ptr(), ptr);
+    }
+
+    #[test]
+    fn io_scratch_never_leaks_stale_bytes_on_short_read_or_fault() {
+        with_guest(0, |cx, addr, _| {
+            // Poison the per-thread cache with a recognizable non-zero byte pattern.
+            {
+                let mut poison = IoScratch::take(IO_CHUNK);
+                poison.fill(0xa5);
+            }
+
+            let fd = open(
+                cx,
+                addr,
+                b"/tmp/scratch-test",
+                oflags::O_CREAT | oflags::O_RDWR | oflags::O_TRUNC,
+                0o600,
+            )
+            .unwrap();
+            put(cx, addr, *b"hello").unwrap();
+            assert_eq!(pwrite(cx, fd, addr, 5, 0), Ok(5));
+
+            // Short regular-file read must only touch the bytes actually read.
+            let sentinel = [0xcc; 128];
+            cx.write_user(UserSlice::new(addr, sentinel.len()), &sentinel)
+                .unwrap();
+            assert_eq!(pread(cx, fd, addr, sentinel.len(), 0), Ok(5));
+            let mut out = [0u8; 128];
+            cx.read_user(UserSlice::new(addr, out.len()), &mut out)
+                .unwrap();
+            assert_eq!(&out[..5], b"hello");
+            assert_eq!(&out[5..], &[0xcc; 123]);
+
+            // Failed copy_from_user on write must leave the file untouched.
+            assert_eq!(pwrite(cx, fd, 0, 64, 0), Err(Errno::EFAULT));
+            let mut check = [0u8; 16];
+            let file = cx.fds().get(fd).unwrap();
+            assert_eq!(read_bytes(cx, &file, &mut check, Some(0)), Ok(5));
+            assert_eq!(&check[..5], b"hello");
+            close(cx, fd).unwrap();
+
+            // Pipe read with poisoned cache must only copy bytes present in the pipe.
+            {
+                let mut poison = IoScratch::take(IO_CHUNK);
+                poison.fill(0xa5);
+            }
+            let (reader, _writer) = PipeEnd::pair(PIPE_BUF);
+            let pipe = reader.pipe.clone();
+            pipe.borrow_mut().write(b"pipe", false);
+            let rfile = OpenFile::new(FileKind::Pipe(reader), oflags::O_RDONLY);
+            let pipe_sentinel = [0xdd; 64];
+            cx.write_user(UserSlice::new(addr, pipe_sentinel.len()), &pipe_sentinel)
+                .unwrap();
+            assert_eq!(
+                pipe_read_user(cx, &rfile, &pipe, true, &[(addr, pipe_sentinel.len())]),
+                Ok(4)
+            );
+            let mut pout = [0u8; 64];
+            cx.read_user(UserSlice::new(addr, pout.len()), &mut pout)
+                .unwrap();
+            assert_eq!(&pout[..4], b"pipe");
+            assert_eq!(&pout[4..], &[0xdd; 60]);
         });
     }
 }

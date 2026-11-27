@@ -5635,6 +5635,8 @@ fn write_id_map(
     }
     let kernel = new.lower_to_kernel(&parent_map)?;
     *map.borrow_mut() = kernel;
+    // Cached user-namespace uid/gid translations in `syscall::fast` depend on uid_map/gid_map.
+    k.fast_changed();
     Ok(())
 }
 

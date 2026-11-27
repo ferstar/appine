@@ -9,10 +9,6 @@ import android.graphics.Path
 import android.graphics.Typeface
 import androidx.core.graphics.createBitmap
 import androidx.core.graphics.withClip
-import androidx.core.graphics.withScale
-import io.github.mthli.appine.VtRenderer.Companion.MARK_MATCH
-import io.github.mthli.appine.VtRenderer.Companion.MARK_NONE
-import io.github.mthli.appine.VtRenderer.Companion.MARK_SELECTED
 import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
@@ -71,13 +67,22 @@ internal class VtRenderer(
      */
     private var wideScale = 1f
 
-    /** Advances of single codepoints, per paint (index << 32 | codepoint). */
-    private val widths = HashMap<Long, Float>()
+    /** Advances of single codepoints, per paint (unboxed open-addressed cache). */
+    private val widths = GlyphWidthCache()
 
     /** The rows painted so far, one more than the grid (the overscan row). */
     private var bitmap: Bitmap? = null
     private var canvas: Canvas? = null
     private val runChars = CharArray(4096)
+    /** Reusable UTF-16 scratch for a single codepoint (avoids per-cell String allocation). */
+    private val glyphChars = CharArray(2)
+    // Scratch state for drawRow / drawGlyph (UI thread only; avoids per-row Ref allocations).
+    private var runStart = -1
+    private var runLength = 0
+    private var runPaint: Paint? = null
+    private var runColor = 0
+    private var runDecor = 0
+    private var activeScale = 1f
 
     private fun font(path: String, weight: Int): Typeface =
         Typeface.Builder(context.assets, path).setFontVariationSettings("'wght' $weight").build()
@@ -145,21 +150,30 @@ internal class VtRenderer(
         val clusters = screen.clusters
         val top = y * cellHeight
         val base = y * cols
+        val rowMarked = screen.rowHasMarks[y]
         c.withClip(0, top, cols * cellWidth, top + cellHeight) {
             fill.color = screen.defaultBg
             c.drawRect(0f, top.toFloat(), (cols * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
             // Images below the backgrounds show through cells of the default one
             images.draw(c, VtImages.LAYER_BELOW_BACKGROUND, top, cellHeight)
-            var x = 0
-            while (x < cols) {
-                val color = bgOf(base + x)
-                var end = x + 1
-                while (end < cols && bgOf(base + end) == color) end++
-                if (color != screen.defaultBg) {
-                    fill.color = color
-                    c.drawRect((x * cellWidth).toFloat(), top.toFloat(), (end * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
+            if (cols > 0) {
+                var x = 0
+                var color = bgOf(base, 0, rowMarked)
+                while (x < cols) {
+                    var end = x + 1
+                    var nextColor = color
+                    while (end < cols) {
+                        nextColor = bgOf(base + end, end, rowMarked)
+                        if (nextColor != color) break
+                        end++
+                    }
+                    if (color != screen.defaultBg) {
+                        fill.color = color
+                        c.drawRect((x * cellWidth).toFloat(), top.toFloat(), (end * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
+                    }
+                    x = end
+                    color = nextColor
                 }
-                x = end
             }
             images.draw(c, VtImages.LAYER_BELOW_TEXT, top, cellHeight)
             val from = screen.selFrom[y]
@@ -170,22 +184,15 @@ internal class VtRenderer(
                 c.drawRect((from * cellWidth).toFloat(), top.toFloat(), (min(to, cols) * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
             }
 
-            // Runs of plain ASCII in one style go out in one call; other cells one at a time
-            var runStart = -1
-            var runLength = 0
-            var runPaint: Paint? = null
-            var runColor = 0
-            var runDecor = 0
-            fun flush() {
-                if (runLength > 0) {
-                    runPaint!!.color = runColor
-                    c.drawText(runChars, 0, runLength, (runStart * cellWidth).toFloat(), (top + baseline).toFloat(), runPaint!!)
-                    decorate(c, runDecor, runStart, runStart + runLength, top, runColor)
-                }
-                runStart = -1
-                runLength = 0
-            }
-            x = 0
+            // Runs of plain ASCII in one style go out in one call; scaled non-ASCII glyphs share
+            // one canvas scale around (0, midY) across consecutive cells with the same scale.
+            runStart = -1
+            runLength = 0
+            runPaint = null
+            runColor = 0
+            runDecor = 0
+            val baselineY = (top + baseline).toFloat()
+            var x = 0
             while (x < cols) {
                 val i = base + x
                 val a = attrs[i]
@@ -196,18 +203,30 @@ internal class VtRenderer(
                 }
                 val span = if (wide == WIDE) 2 else 1
                 if (!drawsForeground(a)) {
-                    flush()
+                    flushRun(c, top, baselineY)
                     x += span
                     continue
                 }
                 val code = cp[i]
-                val color = fgOf(i)
-                val paint = paintOf(i)
                 val decor = a and DECORATIONS
-                val plain = clusters[i] == null && wide == NARROW &&
+                val cluster = clusters[i]
+                val plain = cluster == null && wide == NARROW &&
                     (code == 0 || code in 0x20..0x7e)
                 if (plain) {
-                    if (runLength > 0 && (paint !== runPaint || color != runColor || decor != runDecor)) flush()
+                    val blank = decor == 0 && (code == 0 || code == ' '.code)
+                    if (runLength == 0 && blank) {
+                        x++
+                        continue
+                    }
+                    val color = fgOf(i, x, rowMarked)
+                    val paint = paints[a and (BOLD or ITALIC)]
+                    if (runLength > 0 && (paint !== runPaint || color != runColor || decor != runDecor || runLength == runChars.size)) {
+                        flushRun(c, top, baselineY)
+                        if (blank) {
+                            x++
+                            continue
+                        }
+                    }
                     if (runLength == 0) {
                         runStart = x
                         runPaint = paint
@@ -218,55 +237,97 @@ internal class VtRenderer(
                     x++
                     continue
                 }
-                flush()
-                drawGlyph(c, i, x, span, top, color, paint)
-                decorate(c, decor, x, x + span, top, color)
+                flushRun(c, top, baselineY)
+                val color = fgOf(i, x, rowMarked)
+                drawGlyph(c, i, x, span, top, color, a and (BOLD or ITALIC))
+                if (decor != 0) {
+                    endScale(c)
+                    decorate(c, decor, x, x + span, top, color)
+                }
                 x += span
             }
-            flush()
+            flushRun(c, top, baselineY)
+            endScale(c)
             images.draw(c, VtImages.LAYER_ABOVE_TEXT, top, cellHeight)
         }
     }
 
-    /** A cell's background: a search match's colour, else its own (inverse swaps it with the text's). */
-    private fun bgOf(i: Int): Int = when (markOf(i)) {
-        MARK_MATCH -> SEARCH_MATCH
-        MARK_SELECTED -> SEARCH_SELECTED
-        else -> {
-            val s = screen
-            if (s.attrs[i] and INVERSE != 0) s.fg[i].takeIf { it != 0 } ?: s.defaultFg else s.bg[i].takeIf { it != 0 } ?: s.defaultBg
+    private fun endScale(c: Canvas) {
+        if (activeScale != 1f) {
+            c.restore()
+            activeScale = 1f
         }
     }
 
+    private fun setScale(c: Canvas, s: Float, midY: Float) {
+        if (s == activeScale) return
+        endScale(c)
+        if (s != 1f) {
+            c.save()
+            c.scale(s, s, 0f, midY)
+            activeScale = s
+        }
+    }
+
+    private fun flushRun(c: Canvas, top: Int, baselineY: Float) {
+        if (runLength > 0) {
+            endScale(c)
+            if (runDecor == 0) {
+                while (runLength > 0 && runChars[runLength - 1] == ' ') runLength--
+            }
+            if (runLength > 0) {
+                val paint = runPaint!!
+                paint.color = runColor
+                c.drawText(runChars, 0, runLength, (runStart * cellWidth).toFloat(), baselineY, paint)
+                decorate(c, runDecor, runStart, runStart + runLength, top, runColor)
+            }
+        }
+        runStart = -1
+        runLength = 0
+    }
+
+    /** A cell's background: a search match's colour, else its own (inverse swaps it with the text's). */
+    private fun bgOf(i: Int, col: Int, rowMarked: Boolean): Int {
+        if (rowMarked) {
+            when (markOf(screen.attrs, i, col, true)) {
+                MARK_MATCH -> return SEARCH_MATCH
+                MARK_SELECTED -> return SEARCH_SELECTED
+            }
+        }
+        val s = screen
+        return if (s.attrs[i] and INVERSE != 0) s.fg[i].takeIf { it != 0 } ?: s.defaultFg else s.bg[i].takeIf { it != 0 } ?: s.defaultBg
+    }
+
     /** A cell's text colour: black on a search match, as in Ghostty, else its own. */
-    private fun fgOf(i: Int): Int {
-        if (markOf(i) != MARK_NONE) return SEARCH_TEXT
+    private fun fgOf(i: Int, col: Int, rowMarked: Boolean): Int {
+        if (rowMarked && markOf(screen.attrs, i, col, true) != MARK_NONE) return SEARCH_TEXT
         val s = screen
         val a = s.attrs[i]
         val color = if (a and INVERSE != 0) s.bg[i].takeIf { it != 0 } ?: s.defaultBg else s.fg[i].takeIf { it != 0 } ?: s.defaultFg
         return if (a and FAINT != 0) (color and 0x00ffffff) or 0x80000000.toInt() else color
     }
 
-    /**
-     * A cell's search mark (vt.c's attrs bits 14 and 15): [MARK_MATCH], [MARK_SELECTED] or
-     * [MARK_NONE]. The second cell of a wide character takes the first's, so a match ending on one
-     * covers the whole character.
-     */
-    private fun markOf(i: Int): Int {
-        val attrs = screen.attrs
-        val a = attrs[i]
-        val own = (a shr 14) and 3
-        if (own != MARK_NONE || (a shr 12) and 3 != SPACER_TAIL || i % screen.cols == 0) return own
-        return (attrs[i - 1] shr 14) and 3
+    private fun drawGlyphText(
+        c: Canvas,
+        cluster: String?,
+        charCount: Int,
+        x: Float,
+        y: Float,
+        paint: Paint,
+    ) {
+        if (cluster != null) {
+            c.drawText(cluster, x, y, paint)
+        } else {
+            c.drawText(glyphChars, 0, charCount, x, y, paint)
+        }
     }
-
-    private fun paintOf(i: Int): Paint = paints[screen.attrs[i] and (BOLD or ITALIC)]
 
     /**
      * One cell's glyph, centred in its [span] cells: a wide one enlarged by [wideScale], and any
-     * shrunk evenly to fit them.
+     * shrunk evenly to fit them. May leave a batched canvas scale active in [activeScale]; callers
+     * must call [endScale] before unscaled drawing or leaving the row/clip.
      */
-    private fun drawGlyph(c: Canvas, i: Int, x: Int, span: Int, top: Int, color: Int, paint: Paint) {
+    private fun drawGlyph(c: Canvas, i: Int, x: Int, span: Int, top: Int, color: Int, paintIdx: Int) {
         val code = screen.cp[i]
         // With or without the diacritics that say which part of the image the cell shows
         if (code == KITTY_PLACEHOLDER) return
@@ -274,26 +335,25 @@ internal class VtRenderer(
         val left = x * cellWidth
         val w = span * cellWidth
         if (cluster == null && glyphs.covers(code)) {
+            endScale(c)
             glyphs.draw(c, code, left, top, w, cellHeight, light, color)
             return
         }
         if (cluster == null && (code == 0 || code == ' '.code)) return
-        val text = cluster ?: String(Character.toChars(code))
+        val paint = paints[paintIdx]
+        var charCount = 0
         val advance = if (cluster != null) {
             paint.measureText(cluster)
         } else {
-            val key = (paints.indexOf(paint).toLong() shl 32) or code.toLong()
-            widths.getOrPut(key) { paint.measureText(text) }
+            charCount = encodeCodepoint(code, glyphChars)
+            widths.getOrPut(paintIdx, code) { paint.measureText(glyphChars, 0, charCount) }
         }
         paint.color = color
-        var s = if (span == 2) wideScale else 1f
-        if (advance * s > w + 0.5f) s = w / advance
-        val l = left + (w - advance * s) / 2
-        if (s == 1f) {
-            c.drawText(text, l, (top + baseline).toFloat(), paint)
-        } else {
-            c.withScale(s, s, l, top + cellHeight / 2f) { c.drawText(text, l, (top + baseline).toFloat(), paint) }
-        }
+        val s = computeGlyphScale(advance, span, w, wideScale)
+        val l = left + (w - advance * s) / 2f
+        val baselineY = (top + baseline).toFloat()
+        setScale(c, s, top + cellHeight / 2f)
+        drawGlyphText(c, cluster, charCount, if (s == 1f) l else l / s, baselineY, paint)
     }
 
     private fun decorate(c: Canvas, decor: Int, from: Int, to: Int, top: Int, color: Int) {
@@ -376,7 +436,15 @@ internal class VtRenderer(
                 // A block: the cell's glyph in the background colour on top
                 c.withClip(l, t, r, b) {
                     c.drawRect(l.toFloat(), t.toFloat(), r.toFloat(), b.toFloat(), fill)
-                    if (drawsForeground(s.attrs[i])) drawGlyph(c, i, s.cursorX, span, t, bgOf(i), paintOf(i))
+                    val a = s.attrs[i]
+                    if (drawsForeground(a)) {
+                        drawGlyph(
+                            c, i, s.cursorX, span, t,
+                            bgOf(i, s.cursorX, s.rowHasMarks[s.cursorY]),
+                            a and (BOLD or ITALIC),
+                        )
+                        endScale(c)
+                    }
                 }
             }
         }
@@ -434,6 +502,37 @@ internal class VtRenderer(
         /** SGR 8 conceals the glyph and every decoration over the cell background. */
         fun drawsForeground(attrs: Int): Boolean = attrs and INVISIBLE == 0
 
+        /**
+         * A cell's search mark (vt.c's attrs bits 14 and 15): [MARK_MATCH], [MARK_SELECTED] or
+         * [MARK_NONE]. Skips all lookups when [rowMarked] is false. The second cell of a wide
+         * character takes the first's, so a match ending on one covers the whole character.
+         */
+        fun markOf(attrs: IntArray, i: Int, col: Int, rowMarked: Boolean): Int {
+            if (!rowMarked) return MARK_NONE
+            val a = attrs[i]
+            val own = (a shr 14) and 3
+            if (own != MARK_NONE || (a shr 12) and 3 != SPACER_TAIL || col == 0) return own
+            return (attrs[i - 1] shr 14) and 3
+        }
+
+        /**
+         * Uniform scale factor for a glyph of measured [advance] in a cell span of [w] pixels:
+         * wide cells enlarge by [wideScale], and any glyph wider than [w] + 0.5 px shrinks evenly
+         * to fit.
+         */
+        fun computeGlyphScale(advance: Float, span: Int, w: Int, wideScale: Float): Float {
+            var s = if (span == 2) wideScale else 1f
+            if (advance * s > w + 0.5f) s = w / advance
+            return s
+        }
+
+        /**
+         * Encodes [codepoint] into [dst] without allocating a [String], returning the UTF-16
+         * code-unit count (1 for BMP, 2 for supplementary surrogate pairs).
+         */
+        fun encodeCodepoint(codepoint: Int, dst: CharArray): Int =
+            Character.toChars(codepoint, dst, 0)
+
         // Cell attributes (vt.c)
         private const val BOLD = 1
         private const val ITALIC = 2
@@ -461,9 +560,9 @@ internal class VtRenderer(
         private const val KITTY_PLACEHOLDER = 0x10EEEE
 
         // A cell's search mark (attrs bits 14 and 15)
-        private const val MARK_NONE = 0
-        private const val MARK_MATCH = 1
-        private const val MARK_SELECTED = 2
+        internal const val MARK_NONE = 0
+        internal const val MARK_MATCH = 1
+        internal const val MARK_SELECTED = 2
 
         /** The selection's highlight, over cell backgrounds and under text. */
         private const val SELECTION = 0x604A90E2
@@ -475,5 +574,122 @@ internal class VtRenderer(
         const val SEARCH_MATCH = 0xFFFFE082.toInt()
         const val SEARCH_SELECTED = 0xFFF2A57E.toInt()
         private const val SEARCH_TEXT = 0xFF000000.toInt()
+    }
+}
+
+/**
+ * Primitive open-addressed cache of single-codepoint glyph advances, keyed by
+ * `(paintIdx shl 21) or codepoint` (2-bit paint index + 21-bit Unicode scalar value).
+ * Avoids `Long`/`Float` boxing, clears on font change, and bounds capacity at [MAX_CAPACITY].
+ */
+internal class GlyphWidthCache(initialCapacity: Int = INITIAL_CAPACITY) {
+    private var keys: IntArray
+    private var values: FloatArray
+    private var mask: Int
+    private var growAt: Int
+    var size = 0
+        private set
+
+    init {
+        val cap = powerOfTwo(initialCapacity.coerceIn(MIN_CAPACITY, MAX_CAPACITY))
+        keys = IntArray(cap) { EMPTY }
+        values = FloatArray(cap)
+        mask = cap - 1
+        growAt = (cap * 7) / 10
+    }
+
+    fun clear() {
+        if (size == 0) return
+        keys.fill(EMPTY)
+        size = 0
+    }
+
+    inline fun getOrPut(paintIdx: Int, codepoint: Int, measure: () -> Float): Float {
+        val key = packKey(paintIdx, codepoint)
+        val existing = get(key)
+        if (!existing.isNaN()) return existing
+        val measured = measure()
+        put(key, measured)
+        return measured
+    }
+
+    fun get(key: Int): Float {
+        val k = keys
+        val m = mask
+        var slot = mix(key) and m
+        while (true) {
+            val cur = k[slot]
+            if (cur == key) return values[slot]
+            if (cur == EMPTY) return Float.NaN
+            slot = (slot + 1) and m
+        }
+    }
+
+    fun put(key: Int, value: Float) {
+        if (size >= growAt) {
+            if (keys.size >= MAX_CAPACITY) {
+                clear()
+            } else {
+                rehash(keys.size shl 1)
+            }
+        }
+        val k = keys
+        val m = mask
+        var slot = mix(key) and m
+        while (true) {
+            val cur = k[slot]
+            if (cur == EMPTY) {
+                k[slot] = key
+                values[slot] = value
+                size++
+                return
+            }
+            if (cur == key) {
+                values[slot] = value
+                return
+            }
+            slot = (slot + 1) and m
+        }
+    }
+
+    private fun rehash(newCap: Int) {
+        val oldKeys = keys
+        val oldValues = values
+        val newKeys = IntArray(newCap) { EMPTY }
+        val newValues = FloatArray(newCap)
+        val newMask = newCap - 1
+        for (i in oldKeys.indices) {
+            val key = oldKeys[i]
+            if (key == EMPTY) continue
+            var slot = mix(key) and newMask
+            while (newKeys[slot] != EMPTY) slot = (slot + 1) and newMask
+            newKeys[slot] = key
+            newValues[slot] = oldValues[i]
+        }
+        keys = newKeys
+        values = newValues
+        mask = newMask
+        growAt = (newCap * 7) / 10
+    }
+
+    companion object {
+        private const val EMPTY = -1
+        private const val MIN_CAPACITY = 16
+        private const val INITIAL_CAPACITY = 256
+        internal const val MAX_CAPACITY = 16384
+
+        fun packKey(paintIdx: Int, codepoint: Int): Int =
+            ((paintIdx and 3) shl 21) or (codepoint and 0x1FFFFF)
+
+        private fun mix(key: Int): Int {
+            val h = key * -1640531527
+            return h xor (h ushr 16)
+        }
+
+        private fun powerOfTwo(n: Int): Int {
+            var v = 1
+            while (v < n) v = v shl 1
+            return v
+        }
     }
 }

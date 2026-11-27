@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of android/vtview, inherited from the android/terminal full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-26 (targeted verification of SGR 8 drawing and alternate-screen cursor behavior against libghostty-vt 1.0.0 and a native C harness)
+> Maintained: 2026-11-27 (targeted update for `vt.c` `get_multi`/`row_iterator_next_dirty` frame encoding and `VtRenderer`/`VtScreen`/`VtFrame` rendering optimizations)
 
 ## Responsibilities
 
@@ -30,12 +30,14 @@ it does not transfer those lifecycle methods here.
 - `VtFrame` — a frame read in place (an inline class over the direct buffer): the header's
   fields, each image placement, and copying the rows into a `VtScreen`.
 - `VtScreen` — the screen as of the last frame: a mirror of the cells (codepoint, colours,
-  attributes with search marks, grapheme clusters, each row's selected columns), one row taller
-  than the grid (the overscan row), the default colours and the cursor.
-- `VtRenderer` — four paints (regular/bold × upright/italic) and the cell metrics from them, the
-  backing bitmap (one row taller than the grid, like the mirror) and the drawing: rows into the
-  bitmap, the bitmap, the cursor (or the lock) and the composing text into the view's canvas; the
-  cell attribute, underline, cursor and search colour constants.
+  attributes with search marks, grapheme clusters, each row's selected columns and `rowHasMarks`
+  flag), one row taller than the grid (the overscan row), the default colours and the cursor.
+- `VtRenderer` — four paints (regular/bold × upright/italic) and the cell metrics from them, an
+  unboxed open-addressed `GlyphWidthCache` (keyed by paint index and codepoint, cleared on font
+  change, bounded at 16,384 slots), the backing bitmap (one row taller than the grid, like the
+  mirror) and the drawing: rows into the bitmap, the bitmap, the cursor (or the lock) and the
+  composing text into the view's canvas; the cell attribute, underline, cursor and search colour
+  constants.
 - `VtImages` — the last frame's image placements (`Placement`, pooled) and the bitmaps they show
   by id and generation (`Picture`), copied, drawn per layer into a row and dropped.
 - `VtGlyphs` — box drawing (U+2500–U+257F), block elements (U+2580–U+259F) and the Powerline
@@ -67,8 +69,16 @@ it does not transfer those lifecycle methods here.
   header, image placements (56 bytes each) and dirty/mark-changed rows (all rows when full or
   placements changed while some were or are shown) in the format documented in `vt.c` (12-byte row
   headers, 16-byte cells, a grapheme's extra codepoints after its row), and cleans the render
-  state; the direct `ByteBuffer` is valid until the next `frame`. A search not yet caught up sets
-  a header flag, and the view draws again on the next animation frame to go on.
+  state; the direct `ByteBuffer` is valid until the next `frame`. `appine_vt_frame_end` uses
+  `ghostty_render_state_row_iterator_next_dirty` on incremental frames whose search marks did not
+  change (safe because `overscan.above == 0`), falling back to `row_iterator_next` when `full` or
+  search marks changed; `marks_nonempty` and `marks_sent_nonempty` skip full-grid mark `memset`,
+  `memcmp` and `memcpy` when no search highlights are active or clearing. `put_row` batches row
+  reads via `ghostty_render_state_row_get_multi` (`CELLS`, then optional `SELECTION`) and per-cell
+  reads via `ghostty_render_state_row_cells_get_multi` (`RAW`, `HAS_STYLING`, `GRAPHEMES_BUF` into
+  a 16-codepoint stack buffer falling back to `render->grapheme` on `GHOSTTY_OUT_OF_SPACE`, and
+  optional `BG_COLOR` last; plus `STYLE` and optional `FG_COLOR` last when styled). A search not
+  yet caught up sets a header flag, and the view draws again on the next animation frame to go on.
 - Overscan: while the viewport is scrolled back the render state captures the row after it too,
   the header says so (byte 58) and that row comes as row `rows` (vt.c numbers rows by the
   iterator, which is right while nothing above the viewport is asked for), with the same cells,
@@ -133,10 +143,15 @@ it does not transfer those lifecycle methods here.
   selection's translucent highlight, text (black in a search match), then the images above the
   text; images are scaled from their source to their destination with bilinear filtering, as
   Ghostty samples them, and only the part in the row is drawn. Plain ASCII runs of
-  one paint, colour and decoration go out in one draw call; other glyphs are centred in their one
-  or two cells, a wide cell's glyph enlarged evenly by the wide scale about the cell's vertical
-  middle, and any glyph still wider than its cells shrunk evenly to fit (never stretched); single
-  codepoints `VtGlyphs` covers are shapes across their one or two cells; Kitty placeholder cells
+  one paint, colour and decoration go out in one draw call (skipping blank undecorated cells
+  outside active runs and trimming trailing spaces when undecorated); other glyphs are centred in
+  their one or two cells, single codepoints encoded into a reusable `CharArray(2)` with advances
+  cached in `GlyphWidthCache`, a wide cell's glyph enlarged evenly by the wide scale about the
+  cell's vertical middle, and any glyph still wider than its cells shrunk evenly to fit (never
+  stretched), with consecutive undecorated same-scale glyphs in a row sharing one canvas scale
+  transform pivoted at `(0, midY)` (`x = l / s`); `markOf` skips wide-tail lookup when
+  `screen.rowHasMarks[y]` is false; single codepoints `VtGlyphs` covers are shapes across their one
+  or two cells; Kitty placeholder cells
   (U+10EEEE, with or without their diacritics) have no glyph drawn, as in Ghostty; four paints
   (regular/bold × upright/italic) from the variable font with ligatures off. Underlines (single,
   double, curly, dotted, dashed), strikethrough and overline are drawn; inverse and faint apply;
@@ -245,10 +260,8 @@ it does not transfer those lifecycle methods here.
   a primary shape chosen by a program.
 
 - **libghostty-vt's drawing features left unused**: the default palette option (the colour scheme
-  reply is fixed to dark); overscan above the viewport; `row_iterator_next_dirty`;
-  `ghostty_render_state_row_cells_get_multi` in place of the four to six reads `frame` makes per
-  cell (it stops at the first failing key, so the colours would go last; gain unmeasured); the
-  colour utilities (`palette_generate`, contrast and luminance), of use only with themes.
+  reply is fixed to dark); overscan above the viewport; the colour utilities (`palette_generate`,
+  contrast and luminance), of use only with themes.
 
 ## Open questions
 

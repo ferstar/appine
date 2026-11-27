@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: conditional open-description reconciliation on store mmap)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: per-thread `IoScratch` buffer reuse across file, pipe, splice, copy and vectored I/O)
 
 ## Responsibilities
 
@@ -41,6 +41,11 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 - `IoPath` — the route of one I/O call, chosen so no borrow of the open file is held during I/O
   (`Local` uses `unlocked_io` for regular files and holds the BKL for other local files,
   tmpfs writes and regular-file appends).
+- `IoScratch` — RAII guard for the per-thread `IO_SCRATCH` `Cell<Vec<u8>>` buffer (retained up to
+  `IO_CHUNK` = 64 KiB) reused by `read_file_inner`, `write_file_inner`, `read_scattered`,
+  `write_gathered`, `sendfile`, `copy_data`, `splice_into_pipe` and `pipe_read_user`; owns the
+  `Vec<u8>` so it stays `Send` across `Cx::unlocked` without holding a borrow across BKL release,
+  and falls back to transient allocations on re-entrancy or transfers over `IO_CHUNK`.
 - `Kernel::unsharing` — inodes `make_private` is copying with the BKL released.
 - Shared `OpenFile` state owned by `kernel/files` and driven here: `pos`, `pos_busy` (0 free, 1
   taken, 2 with waiters), `FileKind::Regular { cow, .. }` and `retired` old host handles kept until
@@ -284,6 +289,10 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 - File operations here call `kernel/inotify` hooks where Linux's fsnotify does, passing an overlay
   node's key (`key_of`), and obey `kernel/overlay`'s rule never to mutate a layer's `Node::Store`
   directly.
+- `IoScratch` keeps its underlying `Vec<u8>` initialized up to its high-water mark (at most
+  `IO_CHUNK`) without re-zeroing between syscalls: callers must only read or copy out the exact
+  byte count overwritten in the current operation (`&chunk[..k]` after a read, `&chunk[..filled]`
+  after `copy_from_user`) and must never expose unwritten bytes to guest memory or files.
 
 ## Confirmed bugs / technical debt
 

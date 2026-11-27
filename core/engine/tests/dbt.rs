@@ -5677,3 +5677,491 @@ fn tbi0_register_branches_memop_returns_and_entry_match_tier0() {
         }
     }
 }
+
+#[test]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
+fn stlb_fast_path_in_emit_fill() {
+    const SUPER: u64 = PAGE_SIZE << 9; // 2 MiB
+    const RW: u32 = prot::READ | prot::WRITE;
+    const RO: u32 = prot::READ;
+    const NZCV_A: u64 = 0xa000_0000; // N=1, C=1
+    const NZCV_B: u64 = 0x5000_0000; // Z=1, V=1
+    const SENTINEL_X3: u64 = 0x1357_2468_9ace_bdf0;
+    const SENTINEL_STOLEN: u64 = 0xfeed_face_caf0_1234;
+
+    // Allocate 3 separate 2 MiB host buffers (+ 1 extra page for demotion), each intentionally
+    // offset by +4 KiB so host bases are 4 KiB-aligned (non-2 MiB-aligned) and superpage 0 and
+    // superpage 1 are non-contiguous in host memory.
+    let alloc_aligned = |len: usize| -> (Vec<u8>, NonNull<u8>) {
+        let mut buf = vec![0u8; len + 2 * PAGE_SIZE as usize];
+        let align_off = (4096 - (buf.as_ptr() as usize & 4095)) & 4095;
+        let ptr = unsafe { NonNull::new_unchecked(buf.as_mut_ptr().add(align_off + 4096)) };
+        (buf, ptr)
+    };
+    let (_rw0_buf, rw0_host) = alloc_aligned(SUPER as usize);
+    let (_rw1_buf, rw1_host) = alloc_aligned(SUPER as usize);
+    let (_ro_buf, ro_host) = alloc_aligned(SUPER as usize);
+    let (_alt_buf, alt_host) = alloc_aligned(PAGE_SIZE as usize);
+
+    let rw0_va = 0x2000_0000u64;
+    let rw1_va = rw0_va + SUPER;
+    let ro_va = 0x3000_0000u64;
+
+    let fill_pattern = |ptr: NonNull<u8>, seed: u64| {
+        let words = unsafe {
+            std::slice::from_raw_parts_mut(ptr.as_ptr().cast::<u64>(), (SUPER / 8) as usize)
+        };
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = seed
+                .wrapping_add(i as u64)
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .wrapping_add(1);
+        }
+    };
+    let read_host_u64 = |ptr: NonNull<u8>, byte_off: u64| -> u64 {
+        unsafe {
+            ptr.as_ptr()
+                .add(byte_off as usize)
+                .cast::<u64>()
+                .read_unaligned()
+        }
+    };
+
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        fill_pattern(rw0_host, 0x1000_0000);
+        fill_pattern(rw1_host, 0x2000_0000);
+        fill_pattern(ro_host, 0x3000_0000);
+
+        let mut g = Guest::new();
+        let mut dbt = Dbt::with_regs(regs).expect("tier 1");
+        unsafe {
+            g.mmu.map(rw0_va, rw0_host, SUPER, RW).unwrap();
+            g.mmu.map(rw1_va, rw1_host, SUPER, RW).unwrap();
+            g.mmu.map(ro_va, ro_host, SUPER, RO).unwrap();
+        }
+        let s0: usize = match regs {
+            DbtRegs::Default => 16,
+            DbtRegs::Go => 21,
+        };
+
+        // Single-access blocks: preserve x3, stolen s0, and NZCV across emit_refill / emit_fill.
+        let f_ldr = CODE + 0x100;
+        g.code(
+            f_ldr,
+            &[
+                0xf940_0041, // ldr x1, [x2]
+                SVC,
+            ],
+        );
+        let f_str = CODE + 0x120;
+        g.code(
+            f_str,
+            &[
+                0xf900_0041, // str x1, [x2]
+                SVC,
+            ],
+        );
+        // Sequential page scan loop (cbz prevents fast-loop match -> uses inline TLB + emit_fill).
+        let f_seq = CODE + 0x140;
+        g.code(
+            f_seq,
+            &[
+                0xf940_0041,                  // ldr x1, [x2]
+                0x8b01_0000,                  // add x0, x0, x1
+                0x9140_0442,                  // add x2, x2, #4096
+                0xb400_0024,                  // cbz x4, +4
+                0xf100_0484,                  // subs x4, x4, #1
+                b_cond(f_seq + 20, f_seq, 1), // b.ne f_seq
+                SVC,
+            ],
+        );
+
+        let do_load = |g: &mut Guest, dbt: &mut Dbt, addr: u64, nzcv: u64| -> u64 {
+            let s = g.cpu.state_mut();
+            s.x[1] = 0;
+            s.x[2] = addr;
+            s.x[3] = SENTINEL_X3;
+            s.x[s0] = SENTINEL_STOLEN;
+            s.nzcv = nzcv;
+            s.pc = f_ldr;
+            assert_eq!(dbt.run(&mut g.cpu), Exit::Svc { imm: 0 });
+            let st = g.cpu.state();
+            assert_eq!(st.x[3], SENTINEL_X3, "x3 preserved on load ({regs:?})");
+            assert_eq!(st.x[s0], SENTINEL_STOLEN, "stolen reg preserved ({regs:?})");
+            assert_eq!(st.nzcv, nzcv, "NZCV preserved on load ({regs:?})");
+            st.x[1]
+        };
+
+        let do_store = |g: &mut Guest, dbt: &mut Dbt, addr: u64, val: u64, nzcv: u64| -> Exit {
+            let s = g.cpu.state_mut();
+            s.x[1] = val;
+            s.x[2] = addr;
+            s.x[3] = SENTINEL_X3;
+            s.x[s0] = SENTINEL_STOLEN;
+            s.nzcv = nzcv;
+            s.pc = f_str;
+            let exit = dbt.run(&mut g.cpu);
+            let st = g.cpu.state();
+            assert_eq!(st.x[3], SENTINEL_X3, "x3 preserved on store ({regs:?})");
+            assert_eq!(st.x[s0], SENTINEL_STOLEN, "stolen reg preserved ({regs:?})");
+            assert_eq!(st.nzcv, nzcv, "NZCV preserved on store ({regs:?})");
+            exit
+        };
+
+        // 1. RW superpage: warm STLB on page 0, then hit STLB on cold non-sequential 4 KiB slots
+        //    for both read refills and write refills with zero Tier 0 exits.
+        let before = dbt.stats().exits_interp;
+        assert_eq!(
+            do_load(&mut g, &mut dbt, rw0_va, NZCV_A),
+            read_host_u64(rw0_host, 0)
+        );
+        for (i, page) in [10u64, 30, 70, 511].into_iter().enumerate() {
+            let off = page * PAGE_SIZE + 0x18;
+            let nzcv = if i & 1 == 0 { NZCV_A } else { NZCV_B };
+            assert_eq!(
+                do_load(&mut g, &mut dbt, rw0_va + off, nzcv),
+                read_host_u64(rw0_host, off),
+                "RW STLB read hit page {page} ({regs:?})"
+            );
+        }
+        for (i, page) in [20u64, 40, 80, 510].into_iter().enumerate() {
+            let off = page * PAGE_SIZE + 0x20;
+            let val = 0xabcd_0000_0000_0000 | page;
+            let nzcv = if i & 1 == 0 { NZCV_B } else { NZCV_A };
+            assert_eq!(
+                do_store(&mut g, &mut dbt, rw0_va + off, val, nzcv),
+                Exit::Svc { imm: 0 },
+                "RW STLB write hit page {page} ({regs:?})"
+            );
+            assert_eq!(read_host_u64(rw0_host, off), val);
+        }
+        // Read-miss STLB hit on an RW superpage must also populate tag_write in the 4 KiB TLB so
+        // an immediate write to that same page succeeds inline without Tier 0 exits.
+        let rw_page90 = 90 * PAGE_SIZE + 0x40;
+        assert_eq!(
+            do_load(&mut g, &mut dbt, rw0_va + rw_page90, NZCV_A),
+            read_host_u64(rw0_host, rw_page90)
+        );
+        assert_eq!(
+            do_store(
+                &mut g,
+                &mut dbt,
+                rw0_va + rw_page90,
+                0x55aa_1234_5678_9abc,
+                NZCV_B
+            ),
+            Exit::Svc { imm: 0 }
+        );
+        assert_eq!(read_host_u64(rw0_host, rw_page90), 0x55aa_1234_5678_9abc);
+        assert_eq!(
+            dbt.stats().exits_interp,
+            before,
+            "RW STLB hits must not exit to Tier 0 ({regs:?})"
+        );
+
+        // 2. RO superpage: warm STLB via page 0, hit STLB on non-sequential reads AND sequential
+        //    8-slot batch prefill, then confirm writes to single-slot, batch-prefilled, and
+        //    cold-4KiB/warm-STLB pages ALL fault cleanly without modifying memory.
+        let before = dbt.stats().exits_interp;
+        assert_eq!(
+            do_load(&mut g, &mut dbt, ro_va, NZCV_A),
+            read_host_u64(ro_host, 0)
+        );
+        for page in [5u64, 25, 511] {
+            let off = page * PAGE_SIZE + 0x10;
+            assert_eq!(
+                do_load(&mut g, &mut dbt, ro_va + off, NZCV_B),
+                read_host_u64(ro_host, off),
+                "RO STLB read hit page {page} ({regs:?})"
+            );
+        }
+        // Sequential read of pages 6..22 triggers STLB-hit 8-slot batch prefill on RO superpage.
+        let mut exp_ro_seq = 0u64;
+        for page in 6..22u64 {
+            exp_ro_seq = exp_ro_seq.wrapping_add(read_host_u64(ro_host, page * PAGE_SIZE));
+        }
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[2] = ro_va + 6 * PAGE_SIZE;
+            s.x[4] = 16;
+        }
+        assert_eq!(
+            g.run_at(&mut dbt, f_seq),
+            exp_ro_seq,
+            "RO STLB sequential batch prefill ({regs:?})"
+        );
+        assert_eq!(
+            dbt.stats().exits_interp,
+            before,
+            "RO STLB reads must not exit to Tier 0 ({regs:?})"
+        );
+
+        // Writes to (a) single-slot STLB-filled page 5, (b) batch-prefilled page 12, and (c) cold
+        // 4 KiB slot page 100 with warm RO STLB entry must all fault cleanly.
+        for page in [5u64, 12, 100, 511] {
+            let off = page * PAGE_SIZE + 0x10;
+            let orig = read_host_u64(ro_host, off);
+            assert_eq!(
+                do_store(&mut g, &mut dbt, ro_va + off, 0xdead_beef_dead_beef, NZCV_A),
+                Exit::Fault {
+                    addr: ro_va + off,
+                    access: Access::Write,
+                    kind: FaultKind::Page,
+                },
+                "RO superpage write must fault on page {page} ({regs:?})"
+            );
+            assert_eq!(
+                read_host_u64(ro_host, off),
+                orig,
+                "RO superpage memory must stay unmodified ({regs:?})"
+            );
+        }
+
+        // Permission upgrade RO -> RW WITHOUT tlb_flush: write refill must miss STLB write half
+        // (tag_write == 0), walk radix tree, observe RW, and succeed.
+        g.mmu.protect(ro_va, SUPER, RW).unwrap();
+        let before = dbt.stats().exits_interp;
+        let upg_off = 100 * PAGE_SIZE + 0x10;
+        assert_eq!(
+            do_store(
+                &mut g,
+                &mut dbt,
+                ro_va + upg_off,
+                0x1122_3344_5566_7788,
+                NZCV_B
+            ),
+            Exit::Svc { imm: 0 },
+            "RO->RW upgrade without flush must miss STLB write half and succeed ({regs:?})"
+        );
+        assert_eq!(read_host_u64(ro_host, upg_off), 0x1122_3344_5566_7788);
+        assert_eq!(dbt.stats().exits_interp, before);
+        // Downgrade back to RO + flush -> write faults again.
+        g.mmu.protect(ro_va, SUPER, RO).unwrap();
+        g.cpu.tlb_flush();
+        assert_eq!(
+            do_store(&mut g, &mut dbt, ro_va + upg_off, 0x9999, NZCV_A),
+            Exit::Fault {
+                addr: ro_va + upg_off,
+                access: Access::Write,
+                kind: FaultKind::Page,
+            }
+        );
+
+        // 3. Sequential prefill near & across the 2 MiB boundary between two NON-CONTIGUOUS
+        //    superpages (rw0_va -> rw1_va), plus cross-4KiB accesses exercising emit_fill(T0/x3).
+        g.cpu.tlb_flush();
+        // Warm STLB for rw0_va via page 0, then scan sequentially from page 500 across page 511
+        // into rw1_va (pages 0..11 of rw1_va). If batch prefill ever spilled past page 511 into
+        // rw1_va using rw0_host's addend, the checksum would mismatch.
+        assert_eq!(
+            do_load(&mut g, &mut dbt, rw0_va, NZCV_A),
+            read_host_u64(rw0_host, 0)
+        );
+        let mut exp_cross_2m = 0u64;
+        for k in 0..24u64 {
+            let v = if k < 12 {
+                read_host_u64(rw0_host, (500 + k) * PAGE_SIZE)
+            } else {
+                read_host_u64(rw1_host, (k - 12) * PAGE_SIZE)
+            };
+            exp_cross_2m = exp_cross_2m.wrapping_add(v);
+        }
+        let before = dbt.stats().exits_interp;
+        {
+            let s = g.cpu.state_mut();
+            s.x[0] = 0;
+            s.x[2] = rw0_va + 500 * PAGE_SIZE;
+            s.x[4] = 24;
+        }
+        assert_eq!(
+            g.run_at(&mut dbt, f_seq),
+            exp_cross_2m,
+            "sequential prefill near/across non-contiguous 2 MiB boundary ({regs:?})"
+        );
+        assert_eq!(dbt.stats().exits_interp, before);
+
+        // Cross-4KiB-page unaligned 8-byte load & store inside warm rw0_va (pages 200..201 and
+        // 210..211 are cold in 4 KiB TLB while STLB is warm): exercises emit_fill(T0) & emit_fill(x3).
+        let before = dbt.stats().exits_interp;
+        let x4k_r = 200 * PAGE_SIZE + 4092;
+        assert_eq!(
+            do_load(&mut g, &mut dbt, rw0_va + x4k_r, NZCV_A),
+            read_host_u64(rw0_host, x4k_r),
+            "cross-4KiB load via warm STLB ({regs:?})"
+        );
+        let x4k_w = 210 * PAGE_SIZE + 4092;
+        assert_eq!(
+            do_store(
+                &mut g,
+                &mut dbt,
+                rw0_va + x4k_w,
+                0x0123_4567_89ab_cdef,
+                NZCV_B
+            ),
+            Exit::Svc { imm: 0 },
+            "cross-4KiB store via warm STLB ({regs:?})"
+        );
+        assert_eq!(read_host_u64(rw0_host, x4k_w), 0x0123_4567_89ab_cdef);
+        assert_eq!(
+            dbt.stats().exits_interp,
+            before,
+            "same-superpage cross-4KiB access must stay in Tier 1 ({regs:?})"
+        );
+
+        // Cross-2MiB-boundary unaligned 8-byte load across non-contiguous rw0_va and rw1_va (both
+        // warm in STLB): emit_fill fills both from STLB, probe detects addend mismatch and falls
+        // back cleanly to Tier 0 to assemble the exact split 8 bytes.
+        let lo_u32 = unsafe {
+            rw0_host
+                .as_ptr()
+                .add((SUPER - 4) as usize)
+                .cast::<u32>()
+                .read_unaligned()
+        };
+        let hi_u32 = unsafe { rw1_host.as_ptr().cast::<u32>().read_unaligned() };
+        let exp_split = u64::from(lo_u32) | (u64::from(hi_u32) << 32);
+        assert_eq!(
+            do_load(&mut g, &mut dbt, rw0_va + SUPER - 4, NZCV_A),
+            exp_split,
+            "cross-2MiB non-contiguous load via warm STLBs ({regs:?})"
+        );
+
+        // 4. TBI top-byte addresses on STLB hits and tag changes.
+        let tag_a = 0xab_u64 << 56;
+        let tag_b = 0xcd_u64 << 56;
+        let before = dbt.stats().exits_interp;
+        // Populate STLB with tag_a on page 2, then hit STLB with tag_a on cold pages 14 & 16.
+        assert_eq!(
+            do_load(&mut g, &mut dbt, tag_a | (rw0_va + 2 * PAGE_SIZE), NZCV_A),
+            read_host_u64(rw0_host, 2 * PAGE_SIZE)
+        );
+        assert_eq!(
+            do_load(&mut g, &mut dbt, tag_a | (rw0_va + 14 * PAGE_SIZE), NZCV_B),
+            read_host_u64(rw0_host, 14 * PAGE_SIZE)
+        );
+        assert_eq!(
+            do_store(
+                &mut g,
+                &mut dbt,
+                tag_a | (rw0_va + 16 * PAGE_SIZE + 8),
+                0x7777_8888_9999_aaaa,
+                NZCV_A
+            ),
+            Exit::Svc { imm: 0 }
+        );
+        assert_eq!(
+            read_host_u64(rw0_host, 16 * PAGE_SIZE + 8),
+            0x7777_8888_9999_aaaa
+        );
+        // Switching to tag_b must miss STLB (top byte differs), walk radix table, and succeed.
+        assert_eq!(
+            do_load(
+                &mut g,
+                &mut dbt,
+                tag_b | (rw0_va + 16 * PAGE_SIZE + 8),
+                NZCV_B
+            ),
+            0x7777_8888_9999_aaaa
+        );
+        assert_eq!(
+            do_store(
+                &mut g,
+                &mut dbt,
+                tag_b | (rw0_va + 18 * PAGE_SIZE + 8),
+                0x3333_4444_5555_6666,
+                NZCV_A
+            ),
+            Exit::Svc { imm: 0 }
+        );
+        assert_eq!(
+            read_host_u64(rw0_host, 18 * PAGE_SIZE + 8),
+            0x3333_4444_5555_6666
+        );
+        assert_eq!(dbt.stats().exits_interp, before);
+        // Non-zero bits 55:48 must still fault even when STLB is warm for the low 48 bits.
+        let bad_va = (1u64 << 48) | rw0_va;
+        {
+            let s = g.cpu.state_mut();
+            s.x[2] = bad_va;
+            s.pc = f_ldr;
+        }
+        assert_eq!(
+            dbt.run(&mut g.cpu),
+            Exit::Fault {
+                addr: bad_va,
+                access: Access::Read,
+                kind: FaultKind::Page,
+            }
+        );
+
+        // 5. Watchpoints bypass emit_fill / STLB even when STLB is already warm.
+        //    Warm STLB for untagged rw0_va first, then install a write watchpoint on cold page 300.
+        assert_eq!(
+            do_load(&mut g, &mut dbt, rw0_va, NZCV_A),
+            read_host_u64(rw0_host, 0)
+        );
+        let wp_va = rw0_va + 300 * PAGE_SIZE + 0x10;
+        g.cpu
+            .state_mut()
+            .set_hw_debug(&[], &[(wp_va, wp_va + 8, WATCH_STORE)]);
+        assert_eq!(
+            do_store(&mut g, &mut dbt, wp_va, 0x4242, NZCV_B),
+            Exit::Fault {
+                addr: wp_va,
+                access: Access::Write,
+                kind: FaultKind::Watchpoint,
+            },
+            "watchpoint must bypass warm STLB in emit_fill ({regs:?})"
+        );
+        g.cpu.state_mut().set_hw_debug(&[], &[]);
+
+        // 6. STLB invalidation on demotion and unmap (with tlb_flush): replaced RO page and
+        //    unmapped page inside former superpage must be observed immediately.
+        assert_eq!(
+            do_load(&mut g, &mut dbt, rw0_va, NZCV_A),
+            read_host_u64(rw0_host, 0)
+        );
+        let alt_val = 0x0bad_c0de_f00d_cafe_u64;
+        unsafe {
+            alt_host.as_ptr().cast::<u64>().write(alt_val);
+            g.mmu
+                .map_shared(rw0_va + 35 * PAGE_SIZE, alt_host, PAGE_SIZE, RO)
+                .unwrap();
+        }
+        g.mmu.unmap(rw0_va + 36 * PAGE_SIZE, PAGE_SIZE).unwrap();
+        g.cpu.tlb_flush();
+
+        assert_eq!(
+            do_load(&mut g, &mut dbt, rw0_va + 35 * PAGE_SIZE, NZCV_A),
+            alt_val,
+            "demoted page observed after tlb_flush ({regs:?})"
+        );
+        assert_eq!(
+            do_store(&mut g, &mut dbt, rw0_va + 35 * PAGE_SIZE, 0x1234, NZCV_B),
+            Exit::Fault {
+                addr: rw0_va + 35 * PAGE_SIZE,
+                access: Access::Write,
+                kind: FaultKind::Page,
+            },
+            "demoted RO page write must fault ({regs:?})"
+        );
+        {
+            let s = g.cpu.state_mut();
+            s.x[2] = rw0_va + 36 * PAGE_SIZE;
+            s.pc = f_ldr;
+        }
+        assert_eq!(
+            dbt.run(&mut g.cpu),
+            Exit::Fault {
+                addr: rw0_va + 36 * PAGE_SIZE,
+                access: Access::Read,
+                kind: FaultKind::Page,
+            },
+            "unmapped page in former superpage must fault ({regs:?})"
+        );
+    }
+}

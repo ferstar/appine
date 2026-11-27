@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-23 (targeted verification only since the full mapping; latest change: hand over held PI futexes to waiters on execve)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: skip `shared_maps` read lock on fast-path `FUTEX_PRIVATE_FLAG` operations)
 
 ## Responsibilities
 
@@ -99,9 +99,11 @@ breaking copy-on-write (`kernel/cow`); counting unimplemented commands (`kernel/
   later exit or execve.
 - Lock order is BKL then futex lock; the fast path takes only the futex lock, so BKL and fast paths
   share one queue without lost wakeups.
-- On the fast path (the conditions and the deadline hand-over are `kernel/process`'s fast path), a
-  wait compares and enqueues under the futex lock and sleeps on its event; dequeued means woken,
-  still queued after waking hands over to the BKL path.
+- On the fast path (the conditions and the deadline hand-over are `kernel/process`'s fast path),
+  `FUTEX_PRIVATE_FLAG` operations skip the `shared_maps` check (their key is always `Key::Private`
+  even in shared mappings), while non-private operations check `!in_shared_map`; a wait compares
+  and enqueues under the futex lock and sleeps on its event; dequeued means woken, still queued
+  after waking hands over to the BKL path.
 
 ## Dependencies (inbound / outbound)
 

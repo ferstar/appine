@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: enforce RLIMIT_RTPRIO in sched_setscheduler, sched_setparam and sched_setattr)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: bypass `shared_maps` read lock for `FUTEX_PRIVATE_FLAG` and add `getpid`/`gettid`/`getuid`/`geteuid`/`getgid`/`getegid` to `syscall::fast` with `uid_map`/`gid_map` epoch invalidation)
 
 ## Responsibilities
 
@@ -69,8 +69,9 @@ and `kernel/oom`.
   internal `OBJECTS`); `wake::Object` is the address of a value (inside a `RefCell`, or a plain
   counter).
 - Waiter — (event, interest channels, optional sorted object list), stored in `Kernel::waiters`.
-- `fast::Fast` — a thread's fast-path record (epoch, tracing, resolved root and cwd, tid, CPU-clock
-  base, address-space id and its shared writable mappings, vDSO address, time-namespace offsets).
+- `fast::Fast` — a thread's fast-path record (epoch, tracing, resolved root and cwd, tid,
+  namespace-translated tgid/tid and real/effective uid/gid, CPU-clock base, address-space id and
+  its shared writable mappings, vDSO address, time-namespace offsets).
 
 ## Public entry points
 
@@ -80,7 +81,7 @@ and `kernel/oom`.
   `prlimit`, `personality`, `sethostname`/`setdomainname`, `getcpu`, `sysinfo`, `getrandom`.
 - **Internal & host (`Machine`)**: `task::start`, `thread_main` → `run` → `exit`, `finish_group`,
   `Shared::lock`, `block`/`block_for`, `Cx::wait*`/`unlocked`, `request_wake*`,
-  `signal_later`/`flush_signals`, `Shared::fast_changed`; `Machine::{processes, cpu_time_ns, rootfs_stats, wait,
+  `signal_later`/`flush_signals`, `Shared::fast_changed`/`Kernel::fast_changed`; `Machine::{processes, cpu_time_ns, rootfs_stats, wait,
   try_wait, wait_or_power, signal}` (lifecycle in `kernel/boot`; `take_kills`/`stall` in
   `kernel/bug`); procfs `threads-max`, `/proc/<pid>/task/<tid>/children`.
 
@@ -274,10 +275,14 @@ and `kernel/oom`.
 
 - Without the BKL, a thread can run `futex` (WAIT, WAKE and the BITSET forms with a non-zero
   bitset, `FUTEX_CLOCK_REALTIME` only with WAIT_BITSET, on a 4-byte-aligned address that
-  translates writable and is not in a shared mapping that may be written), `nanosleep`,
-  `clock_nanosleep` (REALTIME, MONOTONIC, BOOTTIME), `clock_gettime` (host clocks with time-ns
-  offsets, or own CPU clock by namespace tid), `clock_getres`, `gettimeofday`, `sched_yield`
-  (yields the host thread, not counted as running guest code meanwhile), and `newfstatat`/`statx`
+  translates writable; `FUTEX_PRIVATE_FLAG` skips `shared_maps` lookup completely, while
+  non-private operations also require the address not to be in a writable shared mapping),
+  `nanosleep`, `clock_nanosleep` (REALTIME, MONOTONIC, BOOTTIME), `clock_gettime` (host clocks
+  with time-ns offsets, or own CPU clock by namespace tid), `clock_getres`, `gettimeofday`,
+  `sched_yield` (yields the host thread, not counted as running guest code meanwhile), read-only
+  ID queries (`getpid`, `gettid`, `getuid`, `geteuid`, `getgid`, `getegid`, served from the
+  namespace-translated values cached in `Fast` while `Shared::fast_epoch` matches; `getppid`
+  stays on the BKL path), and `newfstatat`/`statx`
   (absolute or `AT_FDCWD`-relative paths, when the root is the root mount's store directory, the
   root mount is usable, the walk stays in the store's metadata cache and crosses no other mount,
   and the credentials can skip search-permission checks).
@@ -285,9 +290,10 @@ and `kernel/oom`.
   `ivau_page`; with seccomp only for numbers the filter always allows, and for the vDSO stubs'
   reads of clocks Linux's vDSO reads in user space (`kernel/vdso`).
 - The per-thread record is built under the BKL and rebuilt when a global epoch moves, bumped by
-  `fast_changed` (chdir, chroot, credential and fs changes, mounts, setns, execve, time-namespace
-  entry); a call that cannot complete falls back to the BKL path (writes to guest memory it made
-  stay). Panics kill the process (`kernel/bug`).
+  `Shared::fast_changed`/`Kernel::fast_changed` (chdir, chroot, credential and fs changes, mounts,
+  setns, execve, time-namespace entry, and `/proc/<pid>/uid_map`/`gid_map` writes); a call that
+  cannot complete falls back to the BKL path (writes to guest memory it made stay). Panics kill
+  the process (`kernel/bug`).
 - Fast futex (`kernel/futex`) shares the BKL queue/lock; wakes flush immediately. Early-woken timed
   waits (`futex`, `nanosleep`, `clock_nanosleep`) pass their deadline in `fast_sleep` so BKL
   fallback reuses it (and computes remaining time) without re-reading guest memory; the run loop

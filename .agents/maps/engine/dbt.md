@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: batched conditional-branch relinking with retire_gen/sole_tag, entry-stub CAS, and TBI0 untagging in lookup)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: 2 MiB STLB fast-path probe in emit_fill before the radix page-table walk)
 
 ## Responsibilities
 
@@ -154,10 +154,14 @@ triggers (`kernel/oom`).
 - Refill stubs (5 words, never merged) carry `info` (`bytes - 1`, `fail` reason `R_INTERP` or
   `R_UNGROUP`, resume delta) and guest `pc` to shared routines `d->refill[0]` (read) and
   `d->refill[1]` (write). The routine saves host `x0–x5` into `cpu->x[0..5]`, fails on
-  `cpu->nwatch != 0` or non-zero bits `55:48` at either endpoint, and walks the 4-level radix page
-  table via plain address-dependent loads. Write refills require `PROT_READ | PROT_WRITE` (serving
-  atomics and grouped reads). When L2 carries `PTE_SUPER`, refill skips L3, populates 2 MiB
-  `cpu->stlb` (`stlb_used`), and—if preceding 4 KiB slot `(vpn - 1)` holds a matching tag and
+  `cpu->nwatch != 0` or non-zero bits `55:48` at either endpoint, and calls `emit_fill`, which first
+  probes 2 MiB `cpu->stlb` (`tag_write` on write refills; `tag_read` on read refills, deriving
+  `w_mask` strictly from `tag_write == ~svpn` via `EON`/`CLZ`/`SBFX`) to skip the page-table walk
+  on warm superpages. On an STLB miss (or a write refill against a read-only STLB entry), it walks
+  the 4-level radix page table via plain address-dependent loads. Write refills require
+  `PROT_READ | PROT_WRITE` (serving atomics and grouped reads). Both an STLB hit and an L2
+  `PTE_SUPER` leaf (which also populates `cpu->stlb` and `stlb_used`) feed the same superpage 4 KiB
+  TLB fill path, which—if preceding 4 KiB slot `(vpn - 1)` holds a matching tag and
   addend—batch-prefills up to 8 contiguous 4 KiB slots within the same 64-entry `tlb_used` word.
   Cross-page accesses probe/fill both ends and succeed only when both have equal addends
   (contiguous host memory). Failures exit cleanly to `d->exit` before modifying guest state.

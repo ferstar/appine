@@ -35,6 +35,10 @@ internal class VtScreen {
     var selTo = IntArray(0)
         private set
 
+    /** Whether each row contains any cell with a search mark (attrs bits 14–15). */
+    var rowHasMarks = BooleanArray(0)
+        private set
+
     var defaultFg = Color.WHITE
     var defaultBg = Color.BLACK
     var cursorColor = 0
@@ -56,6 +60,7 @@ internal class VtScreen {
         clusters = arrayOfNulls(n)
         selFrom = IntArray(rows + 1) { -1 }
         selTo = IntArray(rows + 1) { -1 }
+        rowHasMarks = BooleanArray(rows + 1)
     }
 
     /** How many cells the character in cell [i] takes: 2 when it is wide, else 1. */

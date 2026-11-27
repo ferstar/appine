@@ -118,6 +118,7 @@ internal value class VtFrame(private val b: ByteBuffer) {
                 screen.selFrom[y] = if (to >= 0) from else -1
                 screen.selTo[y] = to
                 val base = y * cols
+                var rowAttrsOr = 0
                 for (x in 0 until cols) {
                     val i = base + x
                     if (x >= n) {
@@ -132,7 +133,9 @@ internal value class VtFrame(private val b: ByteBuffer) {
                     screen.cp[i] = b.getInt(o)
                     screen.fg[i] = b.getInt(o + 4)
                     screen.bg[i] = b.getInt(o + 8)
-                    screen.attrs[i] = u16(o + 12)
+                    val attr = u16(o + 12)
+                    screen.attrs[i] = attr
+                    rowAttrsOr = rowAttrsOr or attr
                     val more = u16(o + 14)
                     screen.clusters[i] = if (more == 0) {
                         null
@@ -146,6 +149,7 @@ internal value class VtFrame(private val b: ByteBuffer) {
                         }.toString()
                     }
                 }
+                screen.rowHasMarks[y] = (rowAttrsOr and MARK_MASK) != 0
                 painted(y)
             }
             pos += n * CELL_BYTES + extra * 4
@@ -165,6 +169,7 @@ internal value class VtFrame(private val b: ByteBuffer) {
         private const val IMAGE_BYTES = 56
         private const val ROW_HEADER_BYTES = 12
         private const val CELL_BYTES = 16
+        private const val MARK_MASK = 3 shl 14
         private const val FLAG_MOUSE = 1
         private const val FLAG_ALT_SCREEN = 1 shl 1
         private const val FLAG_ALT_SCROLL = 1 shl 2

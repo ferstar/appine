@@ -23,19 +23,45 @@ static void emit_to_fail(struct xlate *x, struct refill_fails *f, uint32_t insn)
 }
 
 /*
- * Walk the page table with mmu.c's structure and fill the page containing address `a` (T0 or x3)
- * into the TLB: the tags of the read and write halves are filled separately according to the leaf
- * entry's permissions, and tlb_used is recorded at the same time, as in Tier 0's appine_tlb_fill.
- * For 2 MiB L2 superpages (PTE_SUPER_BIT), skips L3, populates cpu->stlb, and when the preceding
- * 4 KiB TLB slot holds (vpn - 1) with the same addend, batch-prefills up to 8 contiguous 4 KiB
- * slots within the same 64-entry tlb_used word.
- * Jumps to failure if unmapped or lacking the permission this access needs. Afterwards
- * x2 = addend; uses up x0, x1, x4, x5 and T2, and preserves x3, T0 and T1.
+ * Fill the 4 KiB TLB slot for the page containing address `a` (T0 or x3): first probes the 2 MiB
+ * superpage TLB (cpu->stlb) to skip the radix walk on warm superpages; on an STLB miss (or a write
+ * refill against a read-only STLB entry), walks the 4-level page table with mmu.c's structure. The
+ * read and write halves are filled separately according to permissions and tlb_used is recorded,
+ * matching Tier 0's appine_tlb_fill. For 2 MiB superpages (either from an STLB hit or an L2
+ * PTE_SUPER leaf, which also populates cpu->stlb and stlb_used), when the preceding 4 KiB TLB slot
+ * holds (vpn - 1) with the same addend, batch-prefills up to 8 contiguous 4 KiB slots within the
+ * same 64-entry tlb_used word. Jumps to failure if unmapped or lacking the permission this access
+ * needs. Afterwards x2 = addend; uses up x0, x1, x4, x5 and T2, preserves x3, T0 and T1, and
+ * leaves NZCV untouched.
  */
 static void emit_fill(struct xlate *x, unsigned a, bool write, struct refill_fails *f)
 {
     size_t used = offsetof(struct appine_cpu, tlb_used);
     size_t sused = offsetof(struct appine_cpu, stlb_used);
+
+    /* Fast path: probe the 2 MiB STLB before walking L0 -> L1 -> L2. On hit, load x2 = addend and
+     * T2 = w_mask (~0 if writable, 0 if read-only) and jump straight into the superpage 4 KiB TLB
+     * fill / sequential batch-prefill path. */
+    emit(x, enc_add_imm(1, CTX, (uint32_t)(STLB_OFF >> 12), 1));
+    emit(x, enc_ubfx(0, a, MMU_SUPER_SHIFT, STLB_BITS));
+    emit(x, enc_add_lsl(1, 1, 0, 5));
+    emit(x, enc_ldp_x(0, 2, 1, write ? 16 : 0)); /* tag_{write,read}, addend_{write,read} */
+    emit(x, enc_eon_lsr(0, 0, a, MMU_SUPER_SHIFT));
+    uint32_t *stlb_miss = here(x);
+    emit(x, enc_cbnz_x(0));
+    if (write) {
+        emit(x, enc_eon_lsr(T2, 31, 31, 0)); /* w_mask = ~0 (entry matched tag_write) */
+    } else {
+        /* Derive w_mask strictly from tag_write == ~svpn so RO superpages never get tag_write. */
+        emit(x, enc_ldr_x(0, 1, 16));
+        emit(x, enc_eon_lsr(0, 0, a, MMU_SUPER_SHIFT));
+        emit(x, enc_clz_x(0, 0));       /* 64 (bit 6 = 1) iff equal, else 0..63 (bit 6 = 0) */
+        emit(x, enc_sbfx(T2, 0, 6, 1)); /* w_mask: all-1s if writable, else 0 */
+    }
+    uint32_t *stlb_hit = here(x);
+    emit(x, enc_b(0));
+
+    patch_branch(x->wdelta, stlb_miss, here(x));
     emit(x, enc_ldr_x(0, CTX, offsetof(struct appine_cpu, mmu)));
     emit(x, enc_ldr_x(0, 0, offsetof(struct appine_mmu, root)));
     /* An intermediate entry is the address of the next level's table; loads through the address
@@ -115,6 +141,7 @@ static void emit_fill(struct xlate *x, unsigned a, bool write, struct refill_fai
     emit(x, enc_str_x(5, 1, sused & 0xfff));
 
     /* Detect sequential streaming: preceding 4 KiB slot holds (vpn - 1) with the same addend */
+    patch_branch(x->wdelta, stlb_hit, here(x));
     emit(x, enc_ubfx(4, a, APPINE_PAGE_SHIFT, 64 - APPINE_PAGE_SHIFT)); /* vpn */
     emit(x, enc_eon_lsr(5, 31, 4, 0));                                  /* r_tag = ~vpn */
     emit(x, enc_sub_imm(1, 4, 1, 0));

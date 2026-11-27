@@ -440,10 +440,14 @@ typedef struct AppineVtRender {
   // Scratch for one row's further codepoints
   Buf extras;
   // The search mark (MARK_*) of each viewport cell, row by row: as of this frame, and as last sent
-  // (a row whose marks changed is sent again); marks_cells cells each, the grid's when allocated
+  // (a row whose marks changed is sent again); marks_cells cells each, the grid's when allocated.
+  // marks_nonempty and marks_sent_nonempty track whether either buffer holds any non-zero mark so
+  // frames without search highlights skip full-grid scans and clean rows.
   uint8_t *marks;
   uint8_t *marks_sent;
   size_t marks_cells;
+  bool marks_nonempty;
+  bool marks_sent_nonempty;
   // Kitty graphics: the render state's image list, read into placed (in drawing order) whenever
   // its placements generation changes, and that generation as last read
   Placement *placed;
@@ -1646,86 +1650,131 @@ static bool mode_on(AppineVt *vt, GhosttyMode mode) {
 // for none). Runs under the render lock only (no terminal access).
 static bool put_row(AppineVtRender *render, uint16_t y, const uint8_t *marks) {
   uint16_t cols = render->snap.cols;
-  if (ghostty_render_state_row_get(render->rows, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS,
-                                   &render->cells) != GHOSTTY_SUCCESS) {
-    return false;
-  }
+  // Batch CELLS (always present) and SELECTION (optional: returns GHOSTTY_NO_VALUE when the row
+  // has no selection). SELECTION is last because get_multi stops at the first failing key.
+  static const GhosttyRenderStateRowData row_keys[] = {
+      GHOSTTY_RENDER_STATE_ROW_DATA_CELLS,
+      GHOSTTY_RENDER_STATE_ROW_DATA_SELECTION,
+  };
+  GhosttyRenderStateRowSelection sel = GHOSTTY_INIT_SIZED(GhosttyRenderStateRowSelection);
+  void *row_vals[] = {&render->cells, &sel};
+  size_t row_written = 0;
+  GhosttyResult row_res =
+      ghostty_render_state_row_get_multi(render->rows, 2, row_keys, row_vals, &row_written);
+  if (row_written < 1) return false;
+  bool selected = row_res == GHOSTTY_SUCCESS;
+
   if (!buf_reserve(&render->frame, ROW_HEADER_BYTES + (size_t)cols * CELL_BYTES)) return false;
   size_t row_at = render->frame.len;
   render->frame.len += ROW_HEADER_BYTES;
   render->extras.len = 0;
+
+  // get_multi stops at the first failing key:
+  // - RAW and HAS_STYLING always succeed.
+  // - GRAPHEMES_BUF succeeds for empty cells and graphemes up to 16 codepoints; larger graphemes
+  //   return GHOSTTY_OUT_OF_SPACE with the required length and fall back to render->grapheme.
+  // - BG_COLOR is last because default-background cells return GHOSTTY_NO_VALUE.
+  static const GhosttyRenderStateRowCellsData cell_keys[] = {
+      GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW,
+      GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_HAS_STYLING,
+      GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF,
+      GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR,
+  };
+  // For styled cells, STYLE always succeeds and FG_COLOR is last (GHOSTTY_NO_VALUE when default).
+  static const GhosttyRenderStateRowCellsData style_keys[] = {
+      GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE,
+      GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR,
+  };
+
+  enum { INLINE_GRAPHEME_CAP = 16 };
   uint16_t count = 0;
   while (count < cols && ghostty_render_state_row_cells_next(render->cells)) {
+    uint32_t inline_cp[INLINE_GRAPHEME_CAP];
+    GhosttyCell raw = 0;
+    bool styled = false;
+    GhosttyCodepointBuffer graphemes = {.ptr = inline_cp, .cap = INLINE_GRAPHEME_CAP};
+    GhosttyColorRgb bg_rgb = {0};
+    void *cell_vals[] = {&raw, &styled, &graphemes, &bg_rgb};
+    size_t written = 0;
+    GhosttyResult r = ghostty_render_state_row_cells_get_multi(render->cells, 4, cell_keys,
+                                                               cell_vals, &written);
+
+    const uint32_t *cps = inline_cp;
     uint32_t len = 0;
-    ghostty_render_state_row_cells_get(render->cells,
-                                       GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN, &len);
+    uint32_t bg = 0;
+    if (r == GHOSTTY_SUCCESS || written == 3) {
+      // RAW, HAS_STYLING and GRAPHEMES_BUF succeeded; written == 3 means BG_COLOR had no value.
+      len = (uint32_t)(graphemes.len < INLINE_GRAPHEME_CAP ? graphemes.len : INLINE_GRAPHEME_CAP);
+      if (r == GHOSTTY_SUCCESS) bg = argb(bg_rgb);
+    } else if (written == 2 && r == GHOSTTY_OUT_OF_SPACE && graphemes.len > 0) {
+      // Grapheme exceeds inline_cp; grow scratch buffer and fetch GRAPHEMES_BUF + BG_COLOR.
+      size_t need = graphemes.len;
+      if (need > SIZE_MAX / sizeof(uint32_t)) return false;
+      if (need > render->grapheme_cap) {
+        uint32_t *p = realloc(render->grapheme, need * sizeof(uint32_t));
+        if (p == NULL) return false;
+        render->grapheme = p;
+        render->grapheme_cap = need;
+      }
+      graphemes = (GhosttyCodepointBuffer){.ptr = render->grapheme, .cap = render->grapheme_cap};
+      void *tail_vals[] = {&graphemes, &bg_rgb};
+      size_t tail_written = 0;
+      GhosttyResult tr = ghostty_render_state_row_cells_get_multi(render->cells, 2, cell_keys + 2,
+                                                                  tail_vals, &tail_written);
+      if (tr == GHOSTTY_SUCCESS || tail_written == 1) {
+        size_t actual = graphemes.len < need ? graphemes.len : need;
+        len = actual > UINT32_MAX ? UINT32_MAX : (uint32_t)actual;
+        if (tr == GHOSTTY_SUCCESS) bg = argb(bg_rgb);
+      }
+      cps = render->grapheme;
+    } else if (written < 3) {
+      if (ghostty_render_state_row_cells_get(render->cells,
+                                             GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR,
+                                             &bg_rgb) == GHOSTTY_SUCCESS) {
+        bg = argb(bg_rgb);
+      }
+    }
+
     uint32_t codepoint = 0;
     uint16_t extra = 0;
     if (len > 0) {
-      if (len > render->grapheme_cap) {
-        uint32_t *p = realloc(render->grapheme, len * sizeof(uint32_t));
-        if (p == NULL) return false;
-        render->grapheme = p;
-        render->grapheme_cap = len;
-      }
-      GhosttyCodepointBuffer graphemes = {.ptr = render->grapheme, .cap = render->grapheme_cap};
-      if (ghostty_render_state_row_cells_get(render->cells,
-                                             GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF,
-                                             &graphemes) != GHOSTTY_SUCCESS) {
-        graphemes.len = 0;
-      }
-      // Only what was written, which is all of the cell's codepoints: the buffer holds len
-      if (graphemes.len < len) len = (uint32_t)graphemes.len;
-    }
-    if (len > 0) {
-      codepoint = render->grapheme[0];
+      codepoint = cps[0];
       extra = (uint16_t)(len - 1 > 0xffff ? 0xffff : len - 1);
       if (extra > 0) {
         if (!buf_reserve(&render->extras, (size_t)extra * 4)) return false;
         for (uint16_t i = 0; i < extra; i++) {
-          put_u32(render->extras.ptr + render->extras.len, render->grapheme[i + 1]);
+          put_u32(render->extras.ptr + render->extras.len, cps[i + 1]);
           render->extras.len += 4;
         }
       }
     }
 
-    GhosttyCell raw = 0;
-    ghostty_render_state_row_cells_get(render->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW,
-                                       &raw);
     GhosttyCellWide wide = GHOSTTY_CELL_WIDE_NARROW;
     ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide);
     uint16_t attrs = (uint16_t)(((uint32_t)wide & 0x3) << 12);
     if (marks != NULL) attrs |= (uint16_t)((uint32_t)marks[count] << MARK_SHIFT);
 
     // Colours resolve through the palette; no value means the default colour
-    GhosttyColorRgb c;
-    uint32_t fg = 0, bg = 0;
-    if (ghostty_render_state_row_cells_get(render->cells,
-                                           GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR,
-                                           &c) == GHOSTTY_SUCCESS) {
-      bg = argb(c);
-    }
-    bool styled = false;
-    ghostty_render_state_row_cells_get(render->cells,
-                                       GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_HAS_STYLING, &styled);
+    uint32_t fg = 0;
     if (styled) {
-      if (ghostty_render_state_row_cells_get(render->cells,
-                                             GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR,
-                                             &c) == GHOSTTY_SUCCESS) {
-        fg = argb(c);
-      }
       GhosttyStyle style = {0};
-      ghostty_render_state_row_cells_get(render->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE,
-                                         &style);
-      if (style.flags & GHOSTTY_STYLE_FLAG_BOLD) attrs |= 1u << 0;
-      if (style.flags & GHOSTTY_STYLE_FLAG_ITALIC) attrs |= 1u << 1;
-      if (style.flags & GHOSTTY_STYLE_FLAG_FAINT) attrs |= 1u << 2;
-      if (style.flags & GHOSTTY_STYLE_FLAG_BLINK) attrs |= 1u << 3;
-      if (style.flags & GHOSTTY_STYLE_FLAG_INVERSE) attrs |= 1u << 4;
-      if (style.flags & GHOSTTY_STYLE_FLAG_INVISIBLE) attrs |= 1u << 5;
-      if (style.flags & GHOSTTY_STYLE_FLAG_STRIKETHROUGH) attrs |= 1u << 6;
-      if (style.flags & GHOSTTY_STYLE_FLAG_OVERLINE) attrs |= 1u << 7;
-      attrs |= (uint16_t)(((uint32_t)GHOSTTY_STYLE_UNDERLINE(style) & 0x7) << 8);
+      GhosttyColorRgb fg_rgb = {0};
+      void *style_vals[] = {&style, &fg_rgb};
+      size_t style_written = 0;
+      GhosttyResult sr = ghostty_render_state_row_cells_get_multi(render->cells, 2, style_keys,
+                                                                  style_vals, &style_written);
+      if (sr == GHOSTTY_SUCCESS) fg = argb(fg_rgb);
+      if (style_written >= 1) {
+        if (style.flags & GHOSTTY_STYLE_FLAG_BOLD) attrs |= 1u << 0;
+        if (style.flags & GHOSTTY_STYLE_FLAG_ITALIC) attrs |= 1u << 1;
+        if (style.flags & GHOSTTY_STYLE_FLAG_FAINT) attrs |= 1u << 2;
+        if (style.flags & GHOSTTY_STYLE_FLAG_BLINK) attrs |= 1u << 3;
+        if (style.flags & GHOSTTY_STYLE_FLAG_INVERSE) attrs |= 1u << 4;
+        if (style.flags & GHOSTTY_STYLE_FLAG_INVISIBLE) attrs |= 1u << 5;
+        if (style.flags & GHOSTTY_STYLE_FLAG_STRIKETHROUGH) attrs |= 1u << 6;
+        if (style.flags & GHOSTTY_STYLE_FLAG_OVERLINE) attrs |= 1u << 7;
+        attrs |= (uint16_t)(((uint32_t)GHOSTTY_STYLE_UNDERLINE(style) & 0x7) << 8);
+      }
     }
 
     uint8_t *p = render->frame.ptr + render->frame.len;
@@ -1740,10 +1789,6 @@ static bool put_row(AppineVtRender *render, uint16_t y, const uint8_t *marks) {
   if (!buf_reserve(&render->frame, render->extras.len)) return false;
   memcpy(render->frame.ptr + render->frame.len, render->extras.ptr, render->extras.len);
   render->frame.len += render->extras.len;
-
-  GhosttyRenderStateRowSelection sel = GHOSTTY_INIT_SIZED(GhosttyRenderStateRowSelection);
-  bool selected = ghostty_render_state_row_get(render->rows, GHOSTTY_RENDER_STATE_ROW_DATA_SELECTION,
-                                               &sel) == GHOSTTY_SUCCESS;
 
   uint8_t *h = render->frame.ptr + row_at;
   put_u16(h, y);
@@ -1974,29 +2019,52 @@ const uint8_t *appine_vt_frame_end(AppineVtRender *render, size_t *len) {
     render->frame.len += IMAGE_BYTES;
   }
 
+  bool has_marks = snap->marked && render->marks_nonempty;
+  bool marks_changed =
+      snap->marked && (render->marks_nonempty || render->marks_sent_nonempty) &&
+      memcmp(render->marks, render->marks_sent, render->marks_cells) != 0;
+
   uint16_t count = 0;
-  if (ghostty_render_state_get(render->state, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR,
+  if ((dirty != GHOSTTY_RENDER_STATE_DIRTY_FALSE || marks_changed) &&
+      ghostty_render_state_get(render->state, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR,
                                &render->rows) == GHOSTTY_SUCCESS) {
-    uint16_t y = 0;
-    while (ghostty_render_state_row_iterator_next(render->rows)) {
-      const uint8_t *marks =
-          snap->marked && y < snap->height ? render->marks + (size_t)y * snap->cols : NULL;
-      bool row_changed = dirty == GHOSTTY_RENDER_STATE_DIRTY_FULL;
-      if (!row_changed && dirty != GHOSTTY_RENDER_STATE_DIRTY_FALSE) {
-        ghostty_render_state_row_get(render->rows, GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY,
-                                     &row_changed);
+    if (dirty == GHOSTTY_RENDER_STATE_DIRTY_FULL || marks_changed) {
+      uint16_t y = 0;
+      while (ghostty_render_state_row_iterator_next(render->rows)) {
+        const uint8_t *marks =
+            has_marks && y < snap->height ? render->marks + (size_t)y * snap->cols : NULL;
+        bool row_changed = dirty == GHOSTTY_RENDER_STATE_DIRTY_FULL;
+        if (!row_changed && dirty != GHOSTTY_RENDER_STATE_DIRTY_FALSE) {
+          ghostty_render_state_row_get(render->rows, GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY,
+                                       &row_changed);
+        }
+        if (!row_changed && marks_changed && y < snap->height) {
+          row_changed = memcmp(render->marks + (size_t)y * snap->cols,
+                               render->marks_sent + (size_t)y * snap->cols, snap->cols) != 0;
+        }
+        if (row_changed) {
+          if (!put_row(render, y, marks)) return NULL;
+          count++;
+        }
+        y++;
       }
-      if (!row_changed && marks != NULL) {
-        row_changed = memcmp(marks, render->marks_sent + (size_t)y * snap->cols, snap->cols) != 0;
-      }
-      if (row_changed) {
+    } else {
+      // Incremental frame with unchanged search marks: skip clean rows inside libghostty-vt.
+      // Safe because new_render_state sets overscan.above = 0, so out_y equals viewport y
+      // (with y == snap->height for the overscan row below).
+      uint16_t y = 0;
+      while (ghostty_render_state_row_iterator_next_dirty(render->rows, &y)) {
+        const uint8_t *marks =
+            has_marks && y < snap->height ? render->marks + (size_t)y * snap->cols : NULL;
         if (!put_row(render, y, marks)) return NULL;
         count++;
       }
-      y++;
     }
   }
-  if (snap->marked) memcpy(render->marks_sent, render->marks, render->marks_cells);
+  if (marks_changed) {
+    memcpy(render->marks_sent, render->marks, render->marks_cells);
+    render->marks_sent_nonempty = render->marks_nonempty;
+  }
   // put_row may have moved the buffer
   put_u16(render->frame.ptr + 24, count);
   ghostty_render_state_clean(render->state);
@@ -2278,6 +2346,7 @@ static void mark_match(AppineVt *vt, AppineVtRender *render, const GhosttySelect
     if (to >= vt->cols) to = vt->cols - 1;
     uint8_t *row = render->marks + (size_t)(y - top) * vt->cols;
     for (uint16_t x = from; x <= to; x++) row[x] = mark;
+    if (from <= to && mark != MARK_NONE) render->marks_nonempty = true;
   }
 }
 
@@ -2297,11 +2366,17 @@ static bool mark_matches(AppineVt *vt, AppineVtRender *render) {
       render->marks = NULL;
       render->marks_sent = NULL;
       render->marks_cells = 0;
+      render->marks_nonempty = false;
+      render->marks_sent_nonempty = false;
       return false;
     }
     render->marks_cells = cells;
+    render->marks_nonempty = false;
+    render->marks_sent_nonempty = false;
+  } else if (render->marks_nonempty) {
+    memset(render->marks, MARK_NONE, cells);
+    render->marks_nonempty = false;
   }
-  memset(render->marks, MARK_NONE, cells);
   GhosttyGridRef first;
   GhosttyPointCoordinate top;
   if (vt->search == NULL || !viewport_ref(vt, 0, 0, &first) || !screen_point(vt, &first, &top)) {
