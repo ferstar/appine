@@ -145,7 +145,10 @@ struct appine_cpu {
      * TAG_SHIFT) */
     uint32_t dbt_tag;
     /* The following fields are used internally by Tier 1 */
-    uint64_t dbt_reason;
+    uint32_t dbt_fp_loaded; /* non-zero while host V0–V31/FPCR/FPSR hold guest state */
+    /* Active hardware watchpoint count (kept before tlb for 1-instruction Tier 1 checks);
+     * watchpoints themselves are in watch[] below */
+    uint32_t nwatch;
     uint64_t dbt_site;
     void *dbt_jump_cache;
     void *dbt_rs; /* top of the shadow return stack (a 1 KB-aligned ring in the Tier 1 instance) */
@@ -168,11 +171,10 @@ struct appine_cpu {
      * breakpoints runs only in Tier 0; with watchpoints, watched pages stay out of tlb
      * (appine_tlb_fill), and Tier 1 falls back to Tier 0 when accessing them. tlb must be flushed
      * after the watchpoints change */
-    uint32_t nbrk, nwatch;
+    uint32_t nbrk;
     /* PSTATE.DIT (0 or 1): read and written by MSR and MRS DIT; bit 24 of pstate in signal frames
      * and ptrace. When entering guest code the host thread's DIT follows it (appine_sync_dit) */
     uint32_t dit;
-    uint32_t reserved;
     uint64_t brk[APPINE_HW_SLOTS];
     struct appine_watch watch[APPINE_HW_SLOTS];
     /* 2 MiB superpage data TLB, populated from L2 superpage entries when nwatch == 0 and flushed

@@ -90,9 +90,11 @@ struct regs {
  * as with R_INTERP, Tier 0 executes this one instruction */
 enum { R_CODE, R_CHAIN, R_CHAIN_FWD, R_LOOKUP, R_INTERP, R_SVC, R_KICK, R_UNGROUP };
 
-/* The other kind of stub besides exit stubs: on a TLB miss it enters the refill routine and exits
- * only if the refill fails (R_INTERP or R_UNGROUP) */
+/* The other kinds of stub besides exit stubs: STUB_REFILL enters the refill routine on a TLB miss
+ * and exits only if the refill fails; STUB_LOAD_FP lazily activates host FP/SIMD state on the
+ * first FP/SIMD block entry of a run */
 #define STUB_REFILL (R_UNGROUP + 1)
+#define STUB_LOAD_FP (STUB_REFILL + 1)
 
 /* The most words one stub takes: a link stub takes 5 words (6 when the pc does not fit in 48
  * bits), an exit stub 4 (5), a refill stub 5 */
@@ -153,6 +155,15 @@ _Static_assert((STLB_OFF & 0xfff) == 0 && (STLB_OFF >> 12) <= 0xfff,
 _Static_assert(offsetof(struct appine_cpu, dbt_rs) < TLB_OFF, "dbt_rs is also read and written directly with ldr/str");
 _Static_assert(offsetof(struct appine_cpu, dbt_jump_cache) < TLB_OFF,
                "fields that generated code reads and writes directly with ldr/str must precede the TLB");
+_Static_assert(offsetof(struct appine_cpu, dbt_fp_loaded) < TLB_OFF,
+               "dbt_fp_loaded is read and written directly with ldr/str");
+_Static_assert(offsetof(struct appine_cpu, nwatch) < TLB_OFF,
+               "nwatch is read directly with ldr in refill and fast-loop prologues");
+
+static inline unsigned jc_index(uint64_t pc)
+{
+    return (unsigned)((pc >> 2) & (JC_SIZE - 1));
+}
 
 struct slot {
     uint64_t pc;
@@ -275,6 +286,7 @@ struct appine_dbt {
     size_t used_words;
     size_t routine_words;
     uint32_t *enter;
+    uint32_t *load_fp;   /* lazily saves host d8–d15/FPCR and loads guest V0–V31/FPCR/FPSR */
     uint32_t *exit;
     uint32_t *exit_stub; /* entry exit stubs jump to (emit_link_stub), followed directly by exit */
     uint32_t *exit_full; /* same, for pcs that do not fit in 48 bits */
@@ -470,6 +482,7 @@ enum {
     TO_MEMOP_MEMMOVE,
     TO_MEMOP_MEMCMP,
     TO_MEMOP_MEMCHR,
+    TO_LOAD_FP,
 };
 
 /* The most bytes and the most accesses one group of accesses sharing a check may cover, and the
@@ -618,6 +631,8 @@ static inline uint32_t *routine(const struct appine_dbt *d, unsigned to)
         return d->memop_memcmp;
     case TO_MEMOP_MEMCHR:
         return d->memop_memchr;
+    case TO_LOAD_FP:
+        return d->load_fp;
     default:
         return d->refill[to - TO_REFILL_READ];
     }

@@ -241,7 +241,7 @@ static uint32_t *emit_probe(struct xlate *x, unsigned a, unsigned addend, bool w
  * page base in the addend. A hit for this tag then yields an untagged host address. A different top
  * byte at the same slot misses. Bits 55:48 must still be zero at both ends of the access.
  *
- * Borrows the x0–x4 slots in the cpu struct to save host x0–x4: while translated code runs these
+ * Borrows the x0–x5 slots in the cpu struct to save host x0–x5: while translated code runs these
  * slots do not hold the guest's values, and the exit routine writes them again.
  */
 static uint32_t *emit_refill(struct xlate *x, bool write)
@@ -256,9 +256,7 @@ static uint32_t *emit_refill(struct xlate *x, bool write)
     /* With watchpoints (set by ptrace), do not fill from the page table: watched pages must not
      * enter the TLB. Tier 0 executes this instruction instead; it checks the watchpoints and fills
      * the TLB by appine_tlb_fill's rules, so unwatched pages hit as usual afterwards */
-    size_t nwatch = offsetof(struct appine_cpu, nwatch);
-    emit_add_const(x, 0, CTX, (int64_t)(nwatch & ~(size_t)0xfff));
-    emit(x, enc_ldr_w(0, 0, nwatch & 0xfff));
+    emit(x, enc_ldr_w(0, CTX, offsetof(struct appine_cpu, nwatch)));
     emit_to_fail(x, &f, enc_cbnz_x(0));
     emit(x, enc_ldr_w(3, T1, 0));
     emit(x, enc_ubfx(3, 3, 0, REFILL_REASON_SHIFT));
@@ -894,16 +892,27 @@ static void emit_set_fpcr_if_changed(struct xlate *x, unsigned cur, unsigned tar
     patch_branch(x->wdelta, same, here(x));
 }
 
-/* The enter and exit routines: placed at the start of the code cache, so that every exit stub can
- * reach them with one b */
+/* Write target to FPSR only when it differs from cur (clobbers cur, leaves NZCV untouched). */
+static void emit_set_fpsr_if_changed(struct xlate *x, unsigned cur, unsigned target)
+{
+    emit(x, enc_eor_lsr(cur, cur, target, 0));
+    uint32_t *same = here(x);
+    emit(x, enc_cbz_x(cur));
+    emit(x, enc_msr_fpsr(target));
+    patch_branch(x->wdelta, same, here(x));
+}
+
+/* The enter, lazy FP load, and exit routines: placed at the start of the code cache, so that
+ * every block and exit stub can reach them with one b */
 void dbt_emit_routines(struct appine_dbt *d)
 {
     struct xlate routines = {.d = d, .buf = d->cache, .wdelta = d->rw_delta, .st = d->st}, *x = &routines;
     size_t x0 = offsetof(struct appine_cpu, x), v0 = offsetof(struct appine_cpu, v);
 
-    /* uint64_t enter(struct appine_cpu *cpu, uint32_t *code): save the callee-saved registers
-     * (including d8–d15) and the host FPCR. Frame layout: x29/x30, the five pairs of x27–x19, 8
-     * unused bytes, host FPCR (+104), d8–d15 (+112) */
+    /* uint64_t enter(struct appine_cpu *cpu, uint32_t *code): save host callee-saved GPRs and
+     * reserve frame slots for host FPCR (+104) and d8–d15 (+112..175). Host FP/SIMD state is not
+     * touched until the first FP/SIMD block invokes d->load_fp, so integer-only runs skip saving
+     * and restoring 512 B of V0–V31, d8–d15, FPCR and FPSR. */
     d->enter = here(x);
     emit(x, enc_stp_x_pre(29, 30, 31, -FRAME_BYTES));
     emit(x, enc_stp_x(27, 28, 31, 16));
@@ -911,26 +920,35 @@ void dbt_emit_routines(struct appine_dbt *d)
     emit(x, enc_stp_x(23, 24, 31, 48));
     emit(x, enc_stp_x(21, 22, 31, 64));
     emit(x, enc_stp_x(19, 20, 31, 80));
-    for (unsigned r = 8; r < 16; r += 2)
-        emit(x, enc_stp_d(r, r + 1, 31, (int)(112 + 8 * (r - 8))));
     emit(x, enc_mov(CTX, 0));
     emit(x, enc_mov(T0, 1));
-    emit(x, enc_mrs_fpcr(T1));
-    emit(x, enc_str_x(T1, 31, 104));
-    /* The guest's FP state stays in host registers throughout translated code (the engine/dbt map).
-     * Skip the serializing msr fpcr when guest and host FPCR already match. */
-    emit(x, enc_ldr_x(T2, CTX, offsetof(struct appine_cpu, fpcr)));
-    emit_set_fpcr_if_changed(x, T1, T2);
-    emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, fpsr)));
-    emit(x, enc_msr_fpsr(T1));
+    emit(x, enc_str_w(31, CTX, offsetof(struct appine_cpu, dbt_fp_loaded)));
     emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, nzcv)));
     emit(x, enc_msr_nzcv(T1));
-    emit_add_const(x, T1, CTX, (int64_t)v0);
-    for (unsigned q = 0; q < 32; q += 2)
-        emit(x, enc_ldp_q(q, q + 1, T1, (int)(16 * q)));
     emit_add_const(x, T1, CTX, (int64_t)x0);
     move_guest_regs(x, T1, false);
     emit(x, enc_ldr_x(SP_HOST, CTX, offsetof(struct appine_cpu, sp)));
+    emit(x, enc_br(T0));
+
+    /* Lazy FP/SIMD activation: T0 = resume address in block, host sp = enter's stack frame.
+     * Saves host d8–d15 and FPCR into enter's frame, loads guest FPCR/FPSR (skipping serializing
+     * msr when unchanged) and V0–V31, marks dbt_fp_loaded = 1, and resumes. Preserves all guest
+     * GPRs, SP_HOST and NZCV. */
+    d->load_fp = here(x);
+    for (unsigned r = 8; r < 16; r += 2)
+        emit(x, enc_stp_d(r, r + 1, 31, (int)(112 + 8 * (r - 8))));
+    emit(x, enc_mrs_fpcr(T1));
+    emit(x, enc_str_x(T1, 31, 104));
+    emit(x, enc_ldr_x(T2, CTX, offsetof(struct appine_cpu, fpcr)));
+    emit_set_fpcr_if_changed(x, T1, T2);
+    emit(x, enc_mrs_fpsr(T1));
+    emit(x, enc_ldr_x(T2, CTX, offsetof(struct appine_cpu, fpsr)));
+    emit_set_fpsr_if_changed(x, T1, T2);
+    emit_add_const(x, T1, CTX, (int64_t)v0);
+    for (unsigned q = 0; q < 32; q += 2)
+        emit(x, enc_ldp_q(q, q + 1, T1, (int)(16 * q)));
+    emit(x, enc_movz(T1, 1, 0));
+    emit(x, enc_str_w(T1, CTX, offsetof(struct appine_cpu, dbt_fp_loaded)));
     emit(x, enc_br(T0));
 
     /* The two entries used by stubs: T1 points to the adr in the stub, and the pc is in the data
@@ -949,24 +967,28 @@ void dbt_emit_routines(struct appine_dbt *d)
     d->exit = here(x);
     emit(x, enc_str_x(T0, CTX, offsetof(struct appine_cpu, pc)));
     emit(x, enc_str_x(T1, CTX, offsetof(struct appine_cpu, dbt_site)));
-    emit(x, enc_str_x(T2, CTX, offsetof(struct appine_cpu, dbt_reason)));
     emit(x, enc_mrs_nzcv(T0));
     emit(x, enc_str_x(T0, CTX, offsetof(struct appine_cpu, nzcv)));
     emit_add_const(x, T1, CTX, (int64_t)x0);
     move_guest_regs(x, T1, true);
     emit(x, enc_str_x(SP_HOST, CTX, offsetof(struct appine_cpu, sp)));
+    emit(x, enc_ldr_w(T0, CTX, offsetof(struct appine_cpu, dbt_fp_loaded)));
+    uint32_t *skip_fp = here(x);
+    emit(x, enc_cbz_x(T0));
+    emit(x, enc_str_w(31, CTX, offsetof(struct appine_cpu, dbt_fp_loaded)));
     emit_add_const(x, T1, CTX, (int64_t)v0);
     for (unsigned q = 0; q < 32; q += 2)
         emit(x, enc_stp_q(q, q + 1, T1, (int)(16 * q)));
     emit(x, enc_mrs_fpsr(T0));
     emit(x, enc_str_x(T0, CTX, offsetof(struct appine_cpu, fpsr)));
-    /* Restore host FPCR only when enter changed it (translated code never alters host FPCR). */
+    /* Restore host FPCR only when load_fp changed it (translated code never alters host FPCR). */
     emit(x, enc_ldr_x(T0, 31, 104));
     emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, fpcr)));
     emit_set_fpcr_if_changed(x, T1, T0);
-    emit(x, enc_mov(0, T2));
     for (unsigned r = 8; r < 16; r += 2)
         emit(x, enc_ldp_d(r, r + 1, 31, (int)(112 + 8 * (r - 8))));
+    patch_branch(x->wdelta, skip_fp, here(x));
+    emit(x, enc_mov(0, T2));
     emit(x, enc_ldp_x(19, 20, 31, 80));
     emit(x, enc_ldp_x(21, 22, 31, 64));
     emit(x, enc_ldp_x(23, 24, 31, 48));

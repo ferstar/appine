@@ -107,6 +107,42 @@ struct fresh {
     uint32_t nguest;
 };
 
+/* Whether insn may touch host V0–V31, FPCR or FPSR when executed inline by Tier 1 */
+static inline bool insn_uses_fp(uint32_t insn)
+{
+    unsigned top = FIELD(insn, 28, 25);
+    if ((top & 7) == 7)
+        return true; /* SIMD&FP data processing */
+    if ((top == 0x4 || top == 0x6 || top == 0xc || top == 0xe) && BIT(insn, 26))
+        return true; /* SIMD&FP load/store */
+    if ((insn & 0xffd00000) == 0xd5100000 && FIELD(insn, 20, 5) == SYSREG_FPSR)
+        return true; /* MRS/MSR FPSR */
+    return false;
+}
+
+/* Whether an instruction always terminates a translated block */
+static inline bool insn_is_terminator(uint32_t insn)
+{
+    if ((insn & 0x7c000000) == 0x14000000) /* B / BL */
+        return true;
+    uint32_t rb = insn & 0xfffffc1f;
+    if (rb == 0xd61f0000 || rb == 0xd63f0000 || rb == 0xd65f0000) /* BR / BLR / RET */
+        return true;
+    return (insn & 0xffe0001f) == 0xd4000001 || (insn & 0xffe0001f) == 0xd4200000; /* SVC / BRK */
+}
+
+static bool scan_block_uses_fp(struct xlate *x)
+{
+    for (unsigned i = 0; i < x->limit; i++) {
+        uint32_t insn = fetch_guest(x, i);
+        if (insn_uses_fp(insn))
+            return true;
+        if (insn_is_terminator(insn))
+            return false;
+    }
+    return false;
+}
+
 /*
  * Without the lock: translate the block starting at pc into the thread's scratch area (or copy a
  * template), recording the result in t->prep. Translation takes the longest, and when translating
@@ -153,6 +189,8 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
 
     struct appine_dbt_stats before = t->stats;
     struct xlate *x = t->xlate;
+    bool force_fp = false;
+retry_prepare:
     x->d = d;
     x->buf = t->scratch;
     x->wdelta = 0;
@@ -184,12 +222,7 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     emit_to_stub(x, enc_cbnz_x(T0), FIX_IMM19, R_KICK, pc);
     _Static_assert(ENTRY_CHECK_WORDS == 2, "the length of the block entry check");
 
-    uint32_t fl_nguest = 0;
-    if (!memop_kind) {
-        fl_nguest = dbt_try_fast_loop(x);
-        if (fl_nguest)
-            p->guest1 = x->src1;
-    }
+    bool uses_fp = force_fp || scan_block_uses_fp(x);
 
     if (memop_kind) {
         /* Try the in-cache same-page fast path first (avoiding exit/enter and V0-V31 spill/reload
@@ -237,6 +270,36 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
         }
     }
 
+    /* Lazily activate host FP/SIMD state on the first FP/SIMD block entry of this run (placed
+     * after the integer-only memop gate and before any fast loop or guest body). */
+    if (uses_fp) {
+        emit(x, enc_ldr_w(T0, CTX, offsetof(struct appine_cpu, dbt_fp_loaded)));
+        if (x->nstubs < MAX_STUBS)
+            x->stubs[x->nstubs] = (struct stub){.reason = STUB_LOAD_FP, .resume = here(x) + 1};
+        if (x->nfixups < MAX_FIXUPS)
+            x->fixups[x->nfixups] = (struct fixup){here(x), FIX_IMM19, x->nstubs};
+        x->nstubs++;
+        x->nfixups++;
+        emit(x, enc_cbz_x(T0));
+    }
+
+    uint32_t fl_nguest = 0;
+    if (!memop_kind) {
+        fl_nguest = dbt_try_fast_loop(x);
+        if (fl_nguest) {
+            if (!uses_fp && fl_nguest > x->limit) {
+                for (unsigned i = x->limit; i < fl_nguest; i++) {
+                    if (insn_uses_fp(x->words[i])) {
+                        force_fp = true;
+                        t->stats = before;
+                        goto retry_prepare;
+                    }
+                }
+            }
+            p->guest1 = x->src1;
+        }
+    }
+
     uint32_t nguest = 0;
     for (;; nguest++) {
         uint64_t va = pc + 4ull * nguest;
@@ -274,6 +337,11 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
         s->addr = here(x);
         if (s->reason == STUB_REFILL) {
             emit_refill_stub(x, s);
+            continue;
+        }
+        if (s->reason == STUB_LOAD_FP) {
+            emit(x, enc_adr(T0, (intptr_t)s->resume - (intptr_t)here(x)));
+            emit_to_routine(x, TO_LOAD_FP);
             continue;
         }
         bool link = s->reason == R_CHAIN || s->reason == R_CHAIN_FWD;
@@ -1419,8 +1487,24 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
         /* Sample before lookup and execution: a block may be retired while still running,
          * before its old conditional side exit reaches the dispatcher. */
         uint64_t retire_gen = __atomic_load_n(&d->retire_gen, __ATOMIC_ACQUIRE);
-        unsigned found; /* shared blocks cannot link to private blocks (LINK_SHARED) */
-        uint32_t *code = dbt_table_lookup(d, c, c->pc, &found);
+        unsigned found = 0; /* shared blocks cannot link to private blocks (LINK_SHARED) */
+        uint32_t *code = NULL;
+        bool jc_hit = false;
+        if (!patch_site) {
+            /* Fast path (e.g., syscall re-entry): probe thread-local jump cache before
+             * dbt_table_lookup, skipping SEQ_CST dbt_lookup_seq and shared d->table probe on hits.
+             * Full flushes cleared t->jc via dbt_thread_catch_up; retired blocks still exit via
+             * their forwarding stubs (R_CHAIN) and refresh t->jc below. */
+            const struct slot *js = &t->jc[jc_index(c->pc)];
+            if (LIKELY(js->pc == c->pc && js->code != NULL)) {
+                code = js->code;
+                jc_hit = true;
+            } else {
+                fill_jump_cache = true;
+            }
+        }
+        if (!code)
+            code = dbt_table_lookup(d, c, c->pc, &found);
         if (!code && __atomic_load_n(&d->page_parked[page_bucket(c->pc >> APPINE_PAGE_SHIFT)],
                                      __ATOMIC_RELAXED)) {
             lock_dbt(d, &t->stats);
@@ -1516,16 +1600,22 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             patch_site = NULL;
         }
         if (!code) { /* cannot fetch: let Tier 0 report the precise fault */
+            fill_jump_cache = false;
             enum appine_exit r = appine_interp_step(c);
             if (r != APPINE_EXIT_NONE)
                 return r;
             continue;
         }
-        if (fill_jump_cache) {
-            t->jc[(c->pc >> 2) & (JC_SIZE - 1)] = (struct slot){c->pc, code};
-            t->jc_dirty = true;
-            fill_jump_cache = false;
+        if (!jc_hit) {
+            unsigned ji = jc_index(c->pc);
+            if (fill_jump_cache) {
+                t->jc[ji] = (struct slot){c->pc, code};
+                fill_jump_cache = false;
+            } else if (UNLIKELY(t->jc[ji].pc == c->pc && t->jc[ji].code != code)) {
+                t->jc[ji].code = code;
+            }
         }
+        t->jc_dirty = true; /* translated code's d->lookup may also fill t->jc */
 
         uint64_t reason = enter(c, code);
         switch (reason & REASON_MASK) {

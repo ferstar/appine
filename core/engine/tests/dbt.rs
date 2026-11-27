@@ -6407,3 +6407,286 @@ fn stolen_rd_write_only_and_read_modify_write() {
         }
     }
 }
+
+#[test]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
+fn lazy_fp_state_across_blocks_exits_and_fpsr_fpcr() {
+    fn host_fpcr() -> u64 {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, fpcr", out(reg) v, options(nomem, nostack)) };
+        v
+    }
+    fn host_fpsr() -> u64 {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, fpsr", out(reg) v, options(nomem, nostack)) };
+        v
+    }
+    fn set_host_fpsr(v: u64) {
+        unsafe { core::arch::asm!("msr fpsr, {}", in(reg) v, options(nomem, nostack)) };
+    }
+
+    const FADD_D0_D1_D2: u32 = 0x1e62_2820; // fadd d0, d1, d2
+    const FDIV_D3_D1_D2: u32 = 0x1e62_1823; // fdiv d3, d1, d2 (raises IXC on 1.0/3.0)
+    const FMOV_X0_D0: u32 = 0x9e66_0000; // fmov x0, d0
+    const MRS_FPSR_X2: u32 = 0xd53b_4422; // mrs x2, fpsr
+    const MSR_FPSR_X3: u32 = 0xd51b_4423; // msr fpsr, x3
+    const MSR_FPCR_X4: u32 = 0xd51b_4404; // msr fpcr, x4
+    const LDR_Q4_X5: u32 = 0x3dc0_00a4; // ldr q4, [x5]
+    const STR_Q0_X5: u32 = 0x3d80_00a0; // str q0, [x5]
+    const FZ: u64 = 1 << 24;
+    const IXC: u64 = 1 << 4;
+
+    let orig_fpcr = host_fpcr();
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let mut g_t1 = Guest::with_data();
+        let mut g_t0 = Guest::with_data();
+        let mut dbt = Dbt::with_regs(regs).expect("tier 1");
+
+        // 1. Integer-only block -> SVC must preserve untouched guest V0..V31, FPCR, FPSR, NZCV
+        //    even when host FPSR differs from guest FPSR.
+        let f_int_only = CODE + 0x100;
+        // 2. Integer -> forward B -> FP block -> forward B -> integer -> SVC
+        let f_int_to_fp = CODE + 0x140;
+        let f_fp_mid = CODE + 0x180;
+        let f_int_tail = CODE + 0x1c0;
+        // 3. Integer -> FP -> R_INTERP (MSR FPCR change + MSR FPSR) -> FP -> SVC
+        let f_interp_mix = CODE + 0x200;
+        // 4. Integer -> MRS FPSR (must lazily load guest FPSR) -> SVC
+        let f_mrs_fpsr = CODE + 0x240;
+        // 5. Loop: integer -> FP -> back-edge (R_KICK after kick) -> SVC
+        let f_kick_loop = CODE + 0x280;
+        let f_kick_fp = CODE + 0x2c0;
+        // 6. SIMD load/store block (no SIMD DP, only LDR/STR Q) -> SVC
+        let f_simd_ldst = CODE + 0x300;
+
+        for g in [&mut g_t1, &mut g_t0] {
+            g.code(f_int_only, &[ADD_X1_1, SVC]);
+            g.code(f_int_to_fp, &[ADD_X1_1, b(f_int_to_fp + 4, f_fp_mid)]);
+            g.code(
+                f_fp_mid,
+                &[
+                    FADD_D0_D1_D2,
+                    FDIV_D3_D1_D2,
+                    FMOV_X0_D0,
+                    b(f_fp_mid + 12, f_int_tail),
+                ],
+            );
+            g.code(f_int_tail, &[ADD_X1_1, SVC]);
+            g.code(
+                f_interp_mix,
+                &[
+                    FADD_D0_D1_D2,
+                    MSR_FPCR_X4, // changes FPCR -> R_INTERP
+                    FADD_D0_D1_D2,
+                    MSR_FPSR_X3, // writes FPSR -> R_INTERP (or inline)
+                    MRS_FPSR_X2,
+                    FMOV_X0_D0,
+                    SVC,
+                ],
+            );
+            g.code(f_mrs_fpsr, &[ADD_X1_1, MRS_FPSR_X2, SVC]);
+            g.code(
+                f_kick_loop,
+                &[
+                    SUB_X0_1,
+                    b(f_kick_loop + 4, f_kick_fp),
+                ],
+            );
+            g.code(
+                f_kick_fp,
+                &[
+                    FADD_D0_D1_D2,
+                    cbnz_x0(f_kick_fp + 4, f_kick_loop),
+                    SVC,
+                ],
+            );
+            g.code(f_simd_ldst, &[LDR_Q4_X5, STR_Q0_X5, SVC]);
+        }
+
+        // Case 1: integer-only run preserves all V0-V31, FPCR, FPSR even with different host FPSR.
+        set_host_fpsr(IXC);
+        for g in [&mut g_t1, &mut g_t0] {
+            let s = g.cpu.state_mut();
+            s.x[1] = 10;
+            s.fpcr = orig_fpcr ^ FZ;
+            s.fpsr = 0x1; // IOC only (different from host IXC)
+            s.nzcv = 0xa000_0000;
+            for i in 0..32 {
+                s.v[i] = [0x1111_0000 + i as u64, 0x2222_0000 + i as u64];
+            }
+            s.pc = f_int_only;
+        }
+        assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
+        assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
+        assert_eq!(host_fpcr(), orig_fpcr);
+        assert_eq!(g_t1.cpu.state().x[1], g_t0.cpu.state().x[1]);
+        assert_eq!(g_t1.cpu.state().v, g_t0.cpu.state().v);
+        assert_eq!(g_t1.cpu.state().fpsr, 0x1);
+        assert_eq!(g_t1.cpu.state().fpcr, orig_fpcr ^ FZ);
+        assert_eq!(g_t1.cpu.state().nzcv, 0xa000_0000);
+
+        // Case 2: integer -> forward B -> FP -> forward B -> integer -> SVC (cold + warm linked).
+        for round in 0..2 {
+            set_host_fpsr(if round == 0 { 0 } else { 0x0800_0001 });
+            for g in [&mut g_t1, &mut g_t0] {
+                let s = g.cpu.state_mut();
+                s.x[1] = 100;
+                s.fpcr = orig_fpcr;
+                s.fpsr = 0;
+                s.nzcv = 0x5000_0000;
+                s.v[0] = [0, 0];
+                s.v[1] = [1.0_f64.to_bits(), 0];
+                s.v[2] = [3.0_f64.to_bits(), 0];
+                s.v[3] = [0, 0];
+                s.v[15] = [0xdead_beef_cafe_0001, 0x0123_4567_89ab_cdef];
+                s.pc = f_int_to_fp;
+            }
+            assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
+            assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
+            assert_eq!(host_fpcr(), orig_fpcr);
+            assert_eq!(g_t1.cpu.state().x[0], g_t0.cpu.state().x[0]);
+            assert_eq!(g_t1.cpu.state().x[1], 102);
+            assert_eq!(g_t1.cpu.state().v[0], g_t0.cpu.state().v[0]);
+            assert_eq!(g_t1.cpu.state().v[3], g_t0.cpu.state().v[3]);
+            assert_eq!(g_t1.cpu.state().v[15], g_t0.cpu.state().v[15]);
+            assert_eq!(g_t1.cpu.state().fpsr, g_t0.cpu.state().fpsr);
+            assert_ne!(g_t1.cpu.state().fpsr & IXC, 0, "fdiv 1/3 must raise IXC");
+            assert_eq!(g_t1.cpu.state().nzcv, 0x5000_0000);
+        }
+
+        // Case 3: FP -> R_INTERP (MSR FPCR change) -> FP -> MSR/MRS FPSR -> SVC.
+        for g in [&mut g_t1, &mut g_t0] {
+            let s = g.cpu.state_mut();
+            s.fpcr = orig_fpcr;
+            s.fpsr = 0;
+            s.nzcv = 0x9000_0000;
+            s.v[1] = [1, 0]; // subnormal
+            s.v[2] = [0, 0];
+            s.x[4] = orig_fpcr ^ FZ;
+            s.x[3] = 0x0800_0005; // QC | OFC | IOC
+            s.pc = f_interp_mix;
+        }
+        assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
+        assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
+        assert_eq!(host_fpcr(), orig_fpcr);
+        assert_eq!(g_t1.cpu.state().x[0], g_t0.cpu.state().x[0]);
+        assert_eq!(g_t1.cpu.state().x[2], g_t0.cpu.state().x[2]);
+        assert_eq!(g_t1.cpu.state().fpcr, orig_fpcr ^ FZ);
+        assert_eq!(g_t1.cpu.state().fpsr, 0x0800_0005);
+        assert_eq!(g_t1.cpu.state().nzcv, 0x9000_0000);
+
+        // Case 4: integer block containing MRS FPSR must read guest FPSR, not stale host FPSR.
+        set_host_fpsr(0);
+        for g in [&mut g_t1, &mut g_t0] {
+            let s = g.cpu.state_mut();
+            s.fpsr = 0x17;
+            s.fpcr = orig_fpcr;
+            s.pc = f_mrs_fpsr;
+        }
+        assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
+        assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
+        assert_eq!(g_t1.cpu.state().x[2], 0x17);
+        assert_eq!(g_t1.cpu.state().fpsr, 0x17);
+
+        // Case 5: R_KICK mid-FP-loop must flush live guest V registers cleanly and resume accurately.
+        {
+            let f_live_kick = CODE + 0x340;
+            // Loop adding d2 (1.0) into d0 and incrementing x0 forever until kicked.
+            let fadd_d0_d0_d2 = 0x1e62_2800u32; // fadd d0, d0, d2
+            let add_x0_1 = 0x9100_0400u32; // add x0, x0, #1
+            g_t1.code(
+                f_live_kick,
+                &[fadd_d0_d0_d2, add_x0_1, b(f_live_kick + 8, f_live_kick)],
+            );
+            let s = g_t1.cpu.state_mut();
+            s.x[0] = 0;
+            s.fpcr = orig_fpcr;
+            s.fpsr = 0;
+            s.v[0] = [0.0_f64.to_bits(), 0];
+            s.v[2] = [1.0_f64.to_bits(), 0];
+            s.pc = f_live_kick;
+            let kicker = g_t1.cpu.kicker();
+            let t = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                unsafe { kicker.kick() };
+            });
+            assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Kick);
+            t.join().unwrap();
+            assert_eq!(host_fpcr(), orig_fpcr);
+            let iters = g_t1.cpu.state().x[0];
+            let d0 = f64::from_bits(g_t1.cpu.state().v[0][0]);
+            assert!(iters > 0, "loop should have executed before R_KICK");
+            assert_eq!(
+                d0, iters as f64,
+                "R_KICK must flush live V0 ({regs:?}): d0={d0}, iters={iters}"
+            );
+        }
+
+        // Case 6: SIMD load/store-only block lazily loads and flushes V registers.
+        for g in [&mut g_t1, &mut g_t0] {
+            let s = g.cpu.state_mut();
+            s.x[5] = DATA;
+            s.v[0] = [0x1122_3344_5566_7788, 0x99aa_bbcc_ddee_ff00];
+            s.v[4] = [0, 0];
+            s.pc = f_simd_ldst;
+        }
+        assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
+        assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
+        assert_eq!(g_t1.cpu.state().v[4], g_t0.cpu.state().v[4]);
+        assert_eq!(g_t1.data(0, 0), 0x1122_3344_5566_7788);
+        assert_eq!(g_t1.data(0, 8), 0x99aa_bbcc_ddee_ff00);
+        let _ = host_fpsr();
+    }
+    set_host_fpsr(0);
+}
+
+#[test]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
+fn dispatcher_jump_cache_reuse_retirement_and_flush() {
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let mut g = Guest::new();
+        let mut dbt = Dbt::with_regs(regs).expect("tier 1");
+
+        // Two consecutive SVCs so the second entry resumes directly at CODE + 8 via t->jc.
+        let p0 = CODE + 0x100;
+        let p1 = p0 + 8;
+        g.code(p0, &[movz_x0(10), SVC, movz_x0(20), SVC]);
+
+        // Warm both entries into t->jc.
+        for _ in 0..4 {
+            assert_eq!(g.run_at(&mut dbt, p0), 10);
+            assert_eq!(g.cpu.state().pc, p1);
+            assert!(matches!(dbt.run(&mut g.cpu), Exit::Svc { imm: 0 }));
+            assert_eq!(g.cpu.state().x[0], 20);
+        }
+        let blocks_warm = dbt.stats().blocks;
+
+        // Retire p1 via content-based invalidation: stale t->jc entry must hit forwarding stub,
+        // retranslate p1, refresh t->jc, and run the updated instruction on subsequent entries.
+        g.code(p1, &[movz_x0(30), SVC]);
+        dbt.invalidate(&g.cpu, p1, 4);
+        for _ in 0..4 {
+            assert_eq!(g.run_at(&mut dbt, p0), 10);
+            assert_eq!(g.cpu.state().pc, p1);
+            assert!(matches!(dbt.run(&mut g.cpu), Exit::Svc { imm: 0 }));
+            assert_eq!(g.cpu.state().x[0], 30);
+        }
+        assert_eq!(dbt.stats().blocks, blocks_warm + 1);
+
+        // Full flush clears t->jc via dbt_thread_catch_up; updated code at p0 and p1 must run.
+        g.code(p0, &[movz_x0(40), SVC, movz_x0(50), SVC]);
+        dbt.flush();
+        for _ in 0..3 {
+            assert_eq!(g.run_at(&mut dbt, p0), 40);
+            assert_eq!(g.cpu.state().pc, p1);
+            assert!(matches!(dbt.run(&mut g.cpu), Exit::Svc { imm: 0 }));
+            assert_eq!(g.cpu.state().x[0], 50);
+        }
+    }
+}

@@ -322,13 +322,15 @@ int appine_guard_selftest(void)
     return f.signo;
 }
 
-/* After jumping back from the handler: restore the host's FPCR, release the locks still held,
- * and unblock this signal (it is blocked while the handler runs, and siglongjmp does not restore
- * the signal mask) */
-static enum appine_exit recover(struct guard *g)
+/* After jumping back from the handler: restore the host's FPCR, clear any lazy Tier 1 FP-loaded
+ * flag, release the locks still held, and unblock this signal (it is blocked while the handler
+ * runs, and siglongjmp does not restore the signal mask) */
+static enum appine_exit recover(struct guard *g, struct appine_cpu *cpu)
 {
     if (read_fpcr() != g->fpcr)
         write_fpcr(g->fpcr);
+    if (cpu)
+        cpu->dbt_fp_loaded = 0;
     while (g->nlocks) {
         g->nlocks--;
         g->locks[g->nlocks].release(g->locks[g->nlocks].lock);
@@ -363,13 +365,14 @@ static struct guard *current_or_new(void)
 enum appine_exit appine_guard_run(enum appine_exit (*fn)(void *, struct appine_cpu *), void *ctx,
                                   struct appine_cpu *cpu)
 {
-    /* Still needed after siglongjmp returns: keep it in memory, not only in a register that may be
+    /* Still needed after siglongjmp returns: keep in memory, not only in registers that may be
      * clobbered */
     struct guard *volatile g = current_or_new();
+    struct appine_cpu *volatile vcpu = cpu;
     if (!g)
         return fn(ctx, cpu);
     if (sigsetjmp(g->env, 0))
-        return recover(g);
+        return recover(g, vcpu);
     g->fpcr = read_fpcr();
     g->depth = 0;
     g->nlocks = 0;
