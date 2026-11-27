@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full verification: 10 claims checked by 2 independent verifiers across `lib.rs` and `net.rs` — 8 confirmed and 2 partial, both corrected below; no bugs found)
 >
-> Maintained: 2026-11-24 (targeted verification only since the full mapping; latest change: per-page private copy detection and pagemap availability)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: hybrid futex/eventfd Event, stack-buffered poll, HostEpoll, swapped_pages, and zero-scratch/vectored socket sendmsg/recvmsg)
 
 ## Responsibilities
 
@@ -19,8 +19,9 @@ and Linux (glibc), the only hosts it builds for, returning raw host errnos:
   copies, `fallocate`, the fsync family, `flock`, `ioctl`, `statvfs`, fd limits, randomness;
 - host statistics: process memory usage, host meminfo, CPU set and sysfs, per-thread CPU time and
   context switches;
-- waiting: `poll`/`ppoll`, `Event` (eventfd), `Edges` (edge-triggered host epoll on one fd), `Watch`
-  (level-triggered host epoll over many fds);
+- waiting: `poll`/`ppoll`, `Event` (hybrid futex + eventfd), `Edges` (edge-triggered host epoll on
+  one fd), `Watch` (level-triggered host epoll over many fds), `HostEpoll` (host epoll for guest
+  epoll backing);
 - threads and time: tid, thread names, CPU clocks, affinity, nice, ioprio, clocks, the kernel's
   timezone, a read-only `adjtimex`, and where the host mapped its vDSO and vvar pages;
 - networking: nonblocking host sockets, interfaces, routes, source selection, DNS resolution;
@@ -37,11 +38,14 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   mapped (what `unmap` takes).
 - `MemoryUsage` (RssAnon — VmRSS before Linux 4.5 —, RssShmem, VmSwap), `MemInfo` (a subset of
   host `/proc/meminfo`), `FsStats` (statvfs; block size `f_frsize` or `f_bsize`).
-- `Event` — wakes one thread from another: an eventfd (`EFD_CLOEXEC|EFD_NONBLOCK`); `signal`,
-  `clear`, `is_signaled`, `fd`.
+- `Event` — wakes one thread from another via a hybrid atomic state word (`SYS_futex`) + eventfd
+  (`EFD_CLOEXEC|EFD_NONBLOCK`): `signal`, `clear`, `is_signaled`, `wait`, `poll_with`, `fd`.
 - `Edges` — a host epoll with `EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLET` on one fd; `take()` returns
   read/write edge booleans (several arrivals between calls fold into one).
 - `Watch` — a level-triggered host epoll over many fds (raw ICMP taps), with an errors-only mode.
+- `HostEpoll` — a host epoll (`EPOLL_CLOEXEC`) used by guest epolls to monitor host-backed
+  descriptors in O(ready): `new`, `add`, `modify`, `remove`, `wait_now` (64-slot stack buffer with
+  heap fallback), `fd`.
 - `ClockWatch` — a timerfd on the host's `CLOCK_REALTIME`, armed at 2^40 s with
   `TFD_TIMER_ABSTIME|TFD_TIMER_CANCEL_ON_SET`; Linux cancels it when the wall clock is set and when
   the device resumes (`timerfd_resume`); `take()` reads `ECANCELED`, re-arms and reports a jump.
@@ -56,7 +60,7 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 - Memory: `map_anonymous(len, reserve)`, `map_inaccessible`, `unmap`, `discard`, `remove`,
   `advise`, `map_file`,
   `map_file_read_only`, `map_file_over`, `msync`, `populate`, `page_size`, `resident_pages`, `page_residency`,
-  `touched_pages`, `has_private_pages`, `cachestat`.
+  `touched_pages`, `swapped_pages`, `private_pages`, `has_private_pages`, `pagemap_readable`, `cachestat`.
 - Statistics: `memory_usage`, `memory_info`, `ram_and_swap`, `host_meminfo`, `host_vmstat`,
   `host_swaps`, `statvfs`,
   `fd_limit`, `raise_fd_limit`, `host_cpus`, `cpu_sysfs`, `thread_cpu_clock`,
@@ -64,11 +68,12 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 - Files: `open_dir`, `open_at`, `stat_at`, `fstat`, `chmod_at`, `unlink_at`, `set_times_at`,
   `set_times_fd`, `read`, `write`, `pread`, `pwrite`, `fallocate`, `lseek`, `copy_file`, `fsync`,
   `sync_file_range`, `syncfs`, `flock`, `ioctl`, `dup`, `memfd`, `fill_random`, `drain`, `isatty`.
-- Waiting and threads: `poll`, `Event`, `Edges`, `Watch`, `ClockWatch`, `gettid`, `set_thread_name`,
+- Waiting and threads: `poll`, `Event`, `Edges`, `Watch`, `HostEpoll`, `ClockWatch`, `gettid`, `set_thread_name`,
   `set_thread_affinity`, `set_thread_nice`, `set_thread_ioprio`, `thread_ioprio`, `clock_gettime`,
   `clock_getres`, `timezone`, `host_vdso` (`HostVdso`), `adjtimex_query`, `RawMode`, `sigwinch_notifier`, `stop_notifier`.
 - Network (`net`): `socket`, `close`, `bind`, `connect`, `listen`, `accept`, `sockname`,
-  `setsockopt`, `getsockopt`, `get_filter`, `shutdown`, `sendmsg`, `recvmsg`, `interfaces`, `routes`,
+  `setsockopt`, `getsockopt`, `get_filter`, `shutdown`, `sendmsg`, `sendmsg_iov`, `recvmsg`,
+  `recvmsg_opt`, `recvmsg_iov`, `interfaces`, `routes`,
   `tx_queue_len`, `source_for`, `sockaddr`, `dns_query`, `preload_android_resolver` (Android).
 
 ## Data flow / lifecycle
@@ -98,6 +103,7 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   hints (`MADV_NORMAL`, `MADV_RANDOM`, `MADV_SEQUENTIAL`, `MADV_WILLNEED`), all on host-page-aligned
   ranges; residency comes from `mincore` (`resident_pages`, `page_residency`)
   or `/proc/self/pagemap` (`touched_pages`, present or swapped bits — zram pages count as touched;
+  `swapped_pages`, counting swapped 4K pages in bounded 64K-host-page windows;
   `private_pages` and `has_private_pages`, per-page and aggregate checks for present non-file or
   swapped pages; `pagemap_readable` selects guest write tracking when entries are unavailable), all in 4K units (pages within one 16K host page
   share a result, so `resident_pages` may count 4K pages just outside the range); `cachestat` maps
@@ -127,10 +133,27 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 
 ### Waiting, threads, CPUs, time
 
-- `poll` uses `ppoll` with nanosecond timeouts (seconds clamped to `i32::MAX`), allocates per call
-  and returns `EINTR` to the caller, which treats it as a wakeup. The kernel's waits drop the BKL
-  around one `poll` of host fds plus the thread's `Event`.
-- `Event::signal` writes 1 (ignoring overflow), `clear` reads until empty.
+- `poll` uses `ppoll` with nanosecond timeouts (seconds clamped to `i32::MAX`), uses a 16-slot stack
+  `pollfd` buffer (heap fallback above 16 fds), zeroes every caller `revents` before `ppoll` so
+  error returns never leave stale bits, and returns `EINTR` to the caller, which treats it as a
+  wakeup.
+- `Event` tracks signal and waiter state in an atomic word (`EVENT_SIGNALED`, `EVENT_FUTEX_WAIT`,
+  `EVENT_FD_WAIT`, `EVENT_FD_PINNED`, `EVENT_FD_DIRTY`) paired with a lazy-use eventfd.
+  `is_signaled` is an `Acquire` load with no syscall. `signal` sets `EVENT_SIGNALED` (`SeqCst`),
+  wakes `SYS_futex(FUTEX_WAKE_PRIVATE, 1)` only when `EVENT_FUTEX_WAIT` is set, and writes 1 to the
+  eventfd (marking `EVENT_FD_DIRTY`) only when `EVENT_FD_WAIT` or `EVENT_FD_PINNED` is set.
+  `wait(timeout)` parks on the state word via `SYS_futex(FUTEX_WAIT_PRIVATE)` without touching the
+  eventfd, preserves remaining time across spurious `rc == 0`/`EAGAIN` retries, and leaves
+  `EVENT_SIGNALED` set. `poll_with(fds, timeout)` returns immediately (with a zero-timeout poll of
+  `fds`) if already signalled, otherwise sets `EVENT_FD_WAIT`, zeroes caller `revents`, runs `ppoll`
+  over a 9-slot stack `pollfd` buffer (heap fallback above 8 host fds), drains the eventfd once on
+  `POLLIN`, and returns `(ready_host_fds, signaled)` without clearing `EVENT_SIGNALED`. `clear`
+  drains the eventfd with a single 8-byte read only when `EVENT_FD_DIRTY` or `EVENT_FD_PINNED` is
+  set and clears `EVENT_SIGNALED`; `fd()` sets `EVENT_FD_PINNED` (mirroring a pending signal to the
+  eventfd) for external pollers.
+- `HostEpoll` wraps `epoll_create1(EPOLL_CLOEXEC)` and exposes its raw `fd()` (readable whenever any
+  registered host descriptor is ready) plus non-blocking `wait_now` into caller-supplied
+  `(data, events)` slices.
 - `host_cpus` snapshots the process's affinity once (first N CPUs, N = `available_parallelism`
   capped at 64; fallback `0..n`), taken at kernel creation; guest CPU i is `host_cpus()[i]`.
   `cpu_sysfs` reads host CPU sysfs files (unreadable → `None`).
@@ -156,8 +179,13 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 
 - Sockets are created `SOCK_NONBLOCK|SOCK_CLOEXEC` (`accept4` likewise); addresses, options and
   control bytes pass through raw (shared arm64 Linux ABI; `sockaddr` writes the Linux layout);
-  `sendmsg` always adds `MSG_NOSIGNAL`; `recvmsg` clamps the address to 128 bytes and forwards
-  caller `flags` unchanged (returning the full datagram length when the caller passes `MSG_TRUNC`);
+  `sendmsg` and `unsafe sendmsg_iov` (vectored, 64-slot stack `iovec` buffer with heap fallback)
+  always add `MSG_NOSIGNAL`; `recvmsg_opt` and `unsafe recvmsg_iov` (64-slot stack `iovec` buffer
+  with heap fallback) clamp the address to 128 bytes, forward caller `flags` unchanged (returning
+  the full datagram length when the caller passes `MSG_TRUNC`), and skip address/control setup when
+  `!need_addr` or `control_len == 0` (using a dedicated fast path when both are omitted, and a
+  512-byte stack buffer for `0 < control_len <= 512` before heap fallback); `recvmsg` delegates to
+  `recvmsg_opt` with `need_addr = true`;
   `getsockopt` sizes its buffer by optlen in bytes, so options whose
   optlen means something else need their own call: `get_filter` sizes `SO_GET_FILTER`'s buffer by
   its count of 8-byte instructions; `accept` and `sockname` do not clamp, which is safe because only
@@ -188,7 +216,7 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 
 ### Outbound
 
-- `libc` (syscalls, epoll, eventfd, getifaddrs, termios, sigaction), `libandroid` loaded dynamically on Android (DNS),
+- `libc` (syscalls, futex, epoll, eventfd, getifaddrs, termios, sigaction), `libandroid` loaded dynamically on Android (DNS),
   host files (`/proc/self/status`, `/proc/self/pagemap`, `/proc/meminfo`, `/proc/vmstat`,
   `/proc/swaps`, `/proc/net/route*`,
   `/proc/self/task/*`, `/sys/devices/system/cpu`, `/sys/class/net`, `/etc/resolv.conf`), Rust std
@@ -205,6 +233,8 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 - `getsockopt` relies on the host reading optlen as a byte count; an option whose optlen means
   anything else (`SO_GET_FILTER`'s instruction count) needs a call of its own, or the host writes
   past the buffer.
+- `net::sendmsg_iov` and `net::recvmsg_iov` are `unsafe` and require caller-validated host buffers
+  that remain valid for the duration of the syscall.
 
 ## Confirmed bugs / technical debt
 
