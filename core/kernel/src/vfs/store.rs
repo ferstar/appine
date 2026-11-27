@@ -651,6 +651,7 @@ impl Store {
                 ..Cache::default()
             }),
             commits,
+            store_id,
             objects_dir,
             reaper: Reaper::default(),
             // Meta can outlive Store. Its syncfs descriptor must not retain the store's flock.
@@ -667,6 +668,8 @@ impl Store {
             flushes: AtomicU64::new(0),
             #[cfg(test)]
             accessed_stats: AtomicU64::new(0),
+            #[cfg(test)]
+            host_stats: AtomicU64::new(0),
         });
         let reaper = {
             let (meta, db) = (meta.clone(), dir.join("meta.db"));
@@ -885,7 +888,8 @@ impl Store {
         )?;
         self.exec("DELETE FROM shared WHERE ino NOT IN (SELECT ino FROM inodes WHERE nlink > 0)")?;
         if !released.is_empty() {
-            self.update(|c| c.clear(c.generation));
+            let old = self.update(|c| c.take_clear(c.generation));
+            drop(old);
         }
         let orphans = query(
             "SELECT ino, mode FROM inodes
@@ -968,7 +972,7 @@ impl Store {
     /// Looks up `name` in directory `parent`.
     pub fn lookup(&self, parent: Ino, name: &[u8]) -> Result<Option<Ino>, Errno> {
         let generation = self.cache_generation();
-        if let Some(hit) = self.cached(|c| c.dentries.get(&parent)?.get(name).copied()) {
+        if let Some(hit) = self.cached(|c| c.lookup(parent, name)) {
             return Ok(hit);
         }
         self.begin_read()?;
@@ -979,13 +983,8 @@ impl Store {
             .optional()
             .map_err(db_err)?;
         if generation.is_some_and(|g| self.may_fill(g)) {
-            self.update(|c| {
-                c.entries += 1;
-                c.dentries
-                    .entry(parent)
-                    .or_default()
-                    .insert(name.to_vec(), found);
-            });
+            let evicted = self.update(|c| c.insert_dentry(parent, name.to_vec(), found));
+            drop(evicted);
         }
         Ok(found)
     }
@@ -994,7 +993,7 @@ impl Store {
     /// needs the absolute path, see `display_path` in `syscall::fs`, hence the caching).
     pub fn name_of(&self, parent: Ino, ino: Ino) -> Result<Option<Vec<u8>>, Errno> {
         let generation = self.cache_generation();
-        if let Some(hit) = self.cached(|c| c.names.get(&parent)?.get(&ino).cloned()) {
+        if let Some(hit) = self.cached(|c| c.name_of(parent, ino).cloned()) {
             return Ok(hit);
         }
         self.begin_read()?;
@@ -1007,25 +1006,120 @@ impl Store {
             .optional()
             .map_err(db_err)?;
         if generation.is_some_and(|g| self.may_fill(g)) {
-            self.update(|c| {
-                c.entries += 1;
-                c.names
+            let evicted = self.update(|c| {
+                if c.hot
+                    .names
                     .entry(parent)
                     .or_default()
-                    .insert(ino, found.clone());
+                    .insert(ino, found.clone())
+                    .is_none()
+                {
+                    c.hot.entries += 1;
+                }
+                c.rotate_if_needed()
             });
+            drop(evicted);
         }
         Ok(found)
     }
 
     /// Reads metadata. A regular file's size and mtime are taken from the host object file (its
-    /// times from the database while it is held).
+    /// times from the database while it is held), cached in [`Cache`] when safe.
     pub fn stat(&self, ino: Ino) -> Result<Stat, Errno> {
+        let generation = self.cache_generation();
         let (mut st, data) = self.row(ino)?;
         if st.kind() == mode::S_IFREG {
-            fill_from_host(&mut st, &self.meta.objects_dir, data)?;
+            if let Some(obj) = self.cached_object_stat(ino, data) {
+                apply_object_stat(&mut st, obj, data);
+                return Ok(st);
+            }
+            let before_users = self.meta.commits.users_state();
+            let obj = stat_host_object(&self.meta, data.object)?;
+            apply_object_stat(&mut st, obj, data);
+            if let Some(g) = generation {
+                self.record_object_stat(ino, data, obj, g, before_users);
+            }
         }
         Ok(st)
+    }
+
+    fn cached_object_stat(&self, ino: Ino, data: Data) -> Option<ObjectStat> {
+        if data.held.is_some() {
+            return self
+                .cached(|c| c.held_size(ino))
+                .map(|(size, blocks)| ObjectStat {
+                    size,
+                    blocks,
+                    atime_ns: 0,
+                    mtime_ns: 0,
+                    ctime_ns: 0,
+                });
+        }
+        let users = self.meta.commits.users_state();
+        if users as u32 > 1 || self.has_host_writers() {
+            return None;
+        }
+        self.cached(|c| {
+            (c.object_stat_state == users)
+                .then(|| c.object_stat(ino))
+                .flatten()
+        })
+    }
+
+    fn record_object_stat(
+        &self,
+        ino: Ino,
+        data: Data,
+        obj: ObjectStat,
+        generation: u64,
+        before_users: u64,
+    ) {
+        if self.writing.get() || !self.may_fill(generation) {
+            return;
+        }
+        if data.held.is_some() {
+            let evicted = self.update(|c| {
+                if c.generation != generation {
+                    return None;
+                }
+                if c.hot
+                    .held_sizes
+                    .insert(ino, (obj.size, obj.blocks))
+                    .is_none()
+                {
+                    c.hot.entries += 1;
+                }
+                c.rotate_if_needed()
+            });
+            drop(evicted);
+            return;
+        }
+        if before_users as u32 > 1
+            || self.meta.commits.users_state() != before_users
+            || self.has_host_writers()
+            || self.writable_maps.borrow().contains(&ino)
+        {
+            return;
+        }
+        let evicted = self.update(|c| {
+            if c.generation != generation {
+                return (None, None);
+            }
+            let stale = if c.object_stat_state != before_users {
+                c.object_stat_state = before_users;
+                Some((
+                    std::mem::take(&mut c.hot.object_stats),
+                    std::mem::take(&mut c.cold.object_stats),
+                ))
+            } else {
+                None
+            };
+            if c.hot.object_stats.insert(ino, obj).is_none() {
+                c.hot.entries += 1;
+            }
+            (stale, c.rotate_if_needed())
+        });
+        drop(evicted);
     }
 
     /// Metadata of an open regular file: size and mtime are taken from the open object, which also
@@ -1050,6 +1144,8 @@ impl Store {
         let mut writers = HOST_WRITERS.lock().unwrap_or_else(PoisonError::into_inner);
         writers.push(entry);
         HOST_WRITERS_COUNT.store(writers.len(), Ordering::SeqCst);
+        drop(writers);
+        self.object_modified(ino);
         Ok(())
     }
 
@@ -1081,12 +1177,7 @@ impl Store {
 
     /// Whether the Files app currently holds any host object in this store open for writing.
     fn has_host_writers(&self) -> bool {
-        HOST_WRITERS_COUNT.load(Ordering::Acquire) != 0
-            && HOST_WRITERS
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .iter()
-                .any(|(s, _, _)| *s == self.store_id)
+        has_host_writers(self.store_id)
     }
 
     /// Metadata in the database (without touching the host; a regular file's size and times are
@@ -1126,17 +1217,20 @@ impl Store {
     fn with_row<R>(&self, ino: Ino, f: impl FnOnce(&(Stat, Data)) -> R) -> Result<R, Errno> {
         let generation = self.cache_generation();
         let mut f = Some(f);
-        if let Some(hit) = self.cached(|c| c.rows.get(&ino).map(|row| f.take().unwrap()(row))) {
+        if let Some(hit) = self.cached(|c| c.row(ino).map(|row| f.take().unwrap()(row))) {
             return Ok(hit);
         }
         self.begin_read()?;
         let row = self.query_row(ino)?;
         let out = f.take().unwrap()(&row);
         if generation.is_some_and(|g| self.may_fill(g)) {
-            self.update(|c| {
-                c.entries += 1;
-                c.rows.insert(ino, row);
+            let evicted = self.update(|c| {
+                if c.hot.rows.insert(ino, row).is_none() {
+                    c.hot.entries += 1;
+                }
+                c.rotate_if_needed()
             });
+            drop(evicted);
         }
         Ok(out)
     }
@@ -1227,7 +1321,7 @@ impl Store {
     /// Reads a symlink's target.
     pub fn readlink(&self, ino: Ino) -> Result<Vec<u8>, Errno> {
         let generation = self.cache_generation();
-        if let Some(hit) = self.cached(|c| c.targets.get(&ino).cloned()) {
+        if let Some(hit) = self.cached(|c| c.target(ino).cloned()) {
             return Ok(hit);
         }
         self.begin_read()?;
@@ -1240,10 +1334,13 @@ impl Store {
             .ok_or(Errno::ENOENT)?
             .ok_or(Errno::EINVAL)?;
         if generation.is_some_and(|g| self.may_fill(g)) {
-            self.update(|c| {
-                c.entries += 1;
-                c.targets.insert(ino, target.clone());
+            let evicted = self.update(|c| {
+                if c.hot.targets.insert(ino, target.clone()).is_none() {
+                    c.hot.entries += 1;
+                }
+                c.rotate_if_needed()
             });
+            drop(evicted);
         }
         Ok(target)
     }
@@ -1251,7 +1348,7 @@ impl Store {
     /// A directory's parent directory; the root directory's parent is itself.
     pub fn parent(&self, dir: Ino) -> Result<Ino, Errno> {
         let generation = self.cache_generation();
-        if let Some(hit) = self.cached(|c| c.parents.get(&dir).copied()) {
+        if let Some(hit) = self.cached(|c| c.parent(dir)) {
             return Ok(hit);
         }
         self.begin_read()?;
@@ -1263,10 +1360,13 @@ impl Store {
             .map_err(db_err)?
             .ok_or(Errno::ENOENT)?;
         if generation.is_some_and(|g| self.may_fill(g)) {
-            self.update(|c| {
-                c.entries += 1;
-                c.parents.insert(dir, parent);
+            let evicted = self.update(|c| {
+                if c.hot.parents.insert(dir, parent).is_none() {
+                    c.hot.entries += 1;
+                }
+                c.rotate_if_needed()
             });
+            drop(evicted);
         }
         Ok(parent)
     }
@@ -1306,7 +1406,7 @@ impl Store {
     /// Lists a directory's contents, sorted by name, without `.` and `..`.
     pub fn readdir(&self, dir: Ino) -> Result<Vec<DirEntry>, Errno> {
         let generation = self.cache_generation();
-        if let Some(hit) = self.cached(|c| c.listings.get(&dir).cloned()) {
+        if let Some(hit) = self.cached(|c| c.listing(dir).cloned()) {
             return Ok(hit);
         }
         let mut stmt = self
@@ -1327,10 +1427,15 @@ impl Store {
             .map_err(db_err)?;
         let list: Vec<DirEntry> = rows.collect::<Result<_, _>>().map_err(db_err)?;
         if generation.is_some_and(|g| self.may_fill(g)) {
-            self.update(|c| {
-                c.entries += list.len() + 1;
-                c.listings.insert(dir, list.clone());
+            let evicted = self.update(|c| {
+                let weight = list.len() + 1;
+                let old = c.hot.listings.insert(dir, list.clone());
+                if old.is_none() {
+                    c.hot.entries += weight;
+                }
+                (old, c.rotate_if_needed())
             });
+            drop(evicted);
         }
         Ok(list)
     }
@@ -1766,7 +1871,8 @@ impl Store {
         };
         let hit = all.contains_key(&ino);
         if generation.is_some_and(|g| self.may_fill(g)) {
-            self.update(|c| c.file_caps = Some(all));
+            let old = self.update(|c| c.file_caps.replace(all));
+            drop(old);
         }
         Ok(hit)
     }
@@ -2239,6 +2345,7 @@ impl Store {
         }
         self.statement(|s| {
             set()?;
+            s.object_modified(ino);
             s.write_atime(ino, read_atime()?)
         })
     }
@@ -2360,12 +2467,8 @@ impl Store {
             if c.generation != commits || c.relatime_state != users {
                 return false;
             }
-            let atime = match c.last_relatime {
-                Some((last, atime)) if last == ino => atime,
-                _ => match c.relatime_fresh.get(&ino) {
-                    Some(&atime) => atime,
-                    None => return false,
-                },
+            let Some(atime) = c.relatime(ino) else {
+                return false;
             };
             now.saturating_sub(atime) < day_ns
         })
@@ -2381,20 +2484,25 @@ impl Store {
             return;
         }
         let commits = self.meta.commits.get();
-        self.update(|c| {
-            if c.generation != commits || c.entries > Cache::MAX_ENTRIES {
-                c.clear(commits);
-            }
-            if c.relatime_state != before_users {
-                c.relatime_fresh.clear();
+        let evicted = self.update(|c| {
+            let cleared = (c.generation != commits).then(|| c.take_clear(commits));
+            let stale = if c.relatime_state != before_users {
                 c.last_relatime = None;
                 c.relatime_state = before_users;
-            }
-            if c.relatime_fresh.insert(ino, atime).is_none() {
-                c.entries += 1;
+                Some((
+                    std::mem::take(&mut c.hot.relatime_fresh),
+                    std::mem::take(&mut c.cold.relatime_fresh),
+                ))
+            } else {
+                None
+            };
+            if c.hot.relatime_fresh.insert(ino, atime).is_none() {
+                c.hot.entries += 1;
             }
             c.last_relatime = Some((ino, atime));
+            (cleared, stale, c.rotate_if_needed())
         });
+        drop(evicted);
     }
 
     /// A held regular file keeps its timestamps in SQLite across sharing and copy-up. Sample
@@ -2581,7 +2689,8 @@ impl Store {
             if !self.db().is_autocommit() {
                 let _ = self.exec("ROLLBACK");
             }
-            self.update(|c| c.clear(c.generation));
+            let old = self.update(|c| c.take_clear(c.generation));
+            drop(old);
             *self.changed_backings.borrow_mut() = None;
             self.rollback_tmpfiles(0);
             let _ = self.remove_lost_objects();
@@ -2597,14 +2706,16 @@ impl Store {
         // whole too. It must also be bumped before objects are handed to the background thread
         // for deletion: the thread judges by the counter whether this commit is durable
         // ([`Meta::sync_metadata`])
-        self.update(|c| {
+        let old = self.update(|c| {
             let before = self.meta.commits.bump();
             if before == c.generation {
                 c.generation = before + 1;
+                None
             } else {
-                c.clear(before + 1);
+                Some(c.take_clear(before + 1))
             }
         });
+        drop(old);
         self.reap_later(doomed);
         Ok(())
     }
@@ -2697,8 +2808,9 @@ impl Store {
     /// count when query results may be filled into the cache (not inside an operation).
     fn cache_generation(&self) -> Option<u64> {
         let now = self.meta.commits.get();
-        if self.cached(|c| c.generation != now || c.entries > Cache::MAX_ENTRIES) {
-            self.update(|c| c.clear(now));
+        if self.cached(|c| c.generation != now) {
+            let old = self.update(|c| c.take_clear(now));
+            drop(old);
         }
         (!self.writing.get()).then_some(now)
     }
@@ -2730,13 +2842,8 @@ impl Store {
         self.fills
             .borrow_mut()
             .retain(|f| !matches!(f, Fill::Name(d, n, _) if *d == dir && n == name));
-        self.update(|c| {
-            if let Some(d) = c.dentries.get_mut(&dir) {
-                d.remove(name);
-            }
-            c.listings.remove(&dir);
-            c.names.remove(&dir);
-        });
+        let dropped = self.update(|c| c.touch_name(dir, name));
+        drop(dropped);
     }
 
     /// The row of inode `ino` changed (as above).
@@ -2744,38 +2851,22 @@ impl Store {
         self.fills
             .borrow_mut()
             .retain(|f| !matches!(f, Fill::Row(st) if st.ino == ino));
-        self.update(|c| {
-            c.rows.remove(&ino);
-            c.targets.remove(&ino);
-            c.parents.remove(&ino);
-            c.relatime_fresh.remove(&ino);
-            if c.last_relatime.is_some_and(|(i, _)| i == ino) {
-                c.last_relatime = None;
-            }
-        });
+        self.update(|c| c.touch_ino(ino));
     }
 
     /// Marks regular file `ino`'s host object as modified outside SQLite (data write, truncate,
-    /// fallocate, copy, writable shared mapping, or host-only mtime update) so cached `relatime`
-    /// state is re-checked on the next read.
+    /// fallocate, copy, writable shared mapping, or host-only mtime update) so cached regular-file
+    /// host stats and `relatime` state are re-checked on the next read.
     pub(crate) fn object_modified(&self, ino: Ino) {
-        let present = self.cached(|c| {
-            c.last_relatime.is_some_and(|(i, _)| i == ino)
-                || (!c.relatime_fresh.is_empty() && c.relatime_fresh.contains_key(&ino))
-        });
-        if present {
-            self.update(|c| {
-                c.relatime_fresh.remove(&ino);
-                if c.last_relatime.is_some_and(|(i, _)| i == ino) {
-                    c.last_relatime = None;
-                }
-            });
+        if self.cached(|c| c.has_object_or_relatime(ino)) {
+            self.update(|c| c.invalidate_object(ino));
         }
     }
 
     /// File capabilities changed: invalidates the cached set.
     fn touch_file_caps(&self) {
-        self.update(|c| c.file_caps = None);
+        let old = self.update(|c| c.file_caps.take());
+        drop(old);
     }
 
     /// Puts `fill` into the cache after the operation succeeds.
@@ -2802,17 +2893,20 @@ impl Store {
     }
 
     /// Changes the cache: holds the write lock, waiting for threads reading the cache without the
-    /// BKL to finish.
+    /// BKL to finish. Values returned from `f` (such as evicted tables) are dropped by the caller
+    /// after the write lock is released.
     fn update<R>(&self, f: impl FnOnce(&mut Cache) -> R) -> R {
         self.check_owner();
-        let _guard = self
+        let guard = self
             .meta
             .lock
             .write()
             .unwrap_or_else(PoisonError::into_inner);
         // SAFETY: the write lock is held, so no other thread is reading; f does not call back into
         // Store's methods
-        f(unsafe { &mut *self.meta.cache.get() })
+        let out = f(unsafe { &mut *self.meta.cache.get() });
+        drop(guard);
+        out
     }
 
     /// The part needed to read the cache without the BKL ([`Meta`]).
@@ -3460,12 +3554,19 @@ impl Drop for Op<'_> {
             return;
         }
         if !fills.is_empty() && s.cache_generation_any() {
-            s.update(|c| {
+            let evicted = s.update(|c| {
                 for f in fills {
-                    c.entries += 1;
                     match f {
                         Fill::Name(dir, name, ino) => {
-                            c.dentries.entry(dir).or_default().insert(name, Some(ino));
+                            if c.hot
+                                .dentries
+                                .entry(dir)
+                                .or_default()
+                                .insert(name, ino)
+                                .is_none()
+                            {
+                                c.hot.entries += 1;
+                            }
                         }
                         Fill::Row(st) => {
                             let ino = st.ino;
@@ -3473,11 +3574,15 @@ impl Drop for Op<'_> {
                                 atime: Some(st.atime_ns),
                                 ..Data::own(ino)
                             };
-                            c.rows.insert(ino, (st, data));
+                            if c.hot.rows.insert(ino, (st, data)).is_none() {
+                                c.hot.entries += 1;
+                            }
                         }
                     }
                 }
+                c.rotate_if_needed()
             });
+            drop(evicted);
         }
     }
 }
@@ -3510,6 +3615,8 @@ pub(crate) struct Meta {
     cache: UnsafeCell<Cache>,
     /// The commit counter at the start of the `lock` file (module docs).
     commits: Commits,
+    /// The store's identity (`(st_dev, st_ino)` of `objects/`), matching [`HOST_WRITERS`].
+    store_id: (u64, u64),
     /// The `objects` directory (a host `O_PATH`), so stat-ing an object by inode number need not
     /// resolve the whole path.
     objects_dir: OwnedFd,
@@ -3538,6 +3645,9 @@ pub(crate) struct Meta {
     /// Host object stat calls made from [`Store::accessed`] (for tests).
     #[cfg(test)]
     accessed_stats: AtomicU64,
+    /// Host object `fstatat` calls made from [`Store::stat`] and [`Reader::stat`] (for tests).
+    #[cfg(test)]
+    host_stats: AtomicU64,
 }
 
 impl Meta {
@@ -3598,7 +3708,7 @@ impl Meta {
         (cache.generation == self.commits.get()).then_some(Reader {
             _guard: guard,
             cache,
-            objects_dir: &self.objects_dir,
+            meta: self,
         })
     }
 }
@@ -3608,39 +3718,106 @@ impl Meta {
 pub(crate) struct Reader<'a> {
     _guard: RwLockReadGuard<'a, ()>,
     cache: &'a Cache,
-    objects_dir: &'a OwnedFd,
+    meta: &'a Meta,
 }
 
 impl Reader<'_> {
     /// [`Store::lookup`].
     pub fn lookup(&self, parent: Ino, name: &[u8]) -> Option<Option<Ino>> {
-        self.cache.dentries.get(&parent)?.get(name).copied()
+        self.cache.lookup(parent, name)
     }
 
     /// [`Store::kind`].
     pub fn kind(&self, ino: Ino) -> Option<u32> {
-        Some(self.cache.rows.get(&ino)?.0.kind())
+        Some(self.cache.row(ino)?.0.kind())
     }
 
-    /// [`Store::readlink`]: None if it is not a symlink.
+    /// [`Store::attrs`]: cached database row without host object metadata or cloning.
+    pub fn attrs(&self, ino: Ino) -> Option<&Stat> {
+        Some(&self.cache.row(ino)?.0)
+    }
+
+    /// [`Store::readlink`]: None if it is not a symlink or not cached.
     pub fn readlink(&self, ino: Ino) -> Option<&[u8]> {
-        self.cache.targets.get(&ino).map(Vec::as_slice)
+        self.cache.target(ino).map(Vec::as_slice)
     }
 
     /// [`Store::parent`].
     pub fn parent(&self, dir: Ino) -> Option<Ino> {
-        self.cache.parents.get(&dir).copied()
+        self.cache.parent(dir)
     }
 
-    /// [`Store::stat`]. Stats the object while holding the read lock: if the inode number is
-    /// reused after deletion, the result is not half from the old file and half from the new one.
-    /// None on a host error.
-    pub fn stat(&self, ino: Ino) -> Option<Stat> {
-        let (mut st, data) = self.cache.rows.get(&ino)?.clone();
-        if st.kind() == mode::S_IFREG {
-            fill_from_host(&mut st, self.objects_dir, data).ok()?;
+    /// [`Store::stat`]. Returns cached regular-file host metadata when valid; on a miss, snapshots
+    /// the row and releases the cache read lock before calling host `fstatat` so BKL writers
+    /// waiting on the write lock are never stalled behind host I/O. None on a miss or host error.
+    pub fn stat(self, ino: Ino) -> Option<Stat> {
+        let (mut st, data) = self.cache.row(ino)?.clone();
+        if st.kind() != mode::S_IFREG {
+            return Some(st);
         }
+        if let Some(obj) = self.cached_object_stat(ino, data) {
+            apply_object_stat(&mut st, obj, data);
+            return Some(st);
+        }
+        // Snapshot what host fstatat needs and release Meta::lock.read() before touching the host.
+        let meta = self.meta;
+        let gen_before = self.cache.generation;
+        drop(self);
+        let obj = stat_host_object(meta, data.object).ok()?;
+        if meta.commits.get() != gen_before {
+            return None;
+        }
+        apply_object_stat(&mut st, obj, data);
         Some(st)
+    }
+
+    fn cached_object_stat(&self, ino: Ino, data: Data) -> Option<ObjectStat> {
+        if data.held.is_some() {
+            return self.cache.held_size(ino).map(|(size, blocks)| ObjectStat {
+                size,
+                blocks,
+                atime_ns: 0,
+                mtime_ns: 0,
+                ctime_ns: 0,
+            });
+        }
+        let users = self.meta.commits.users_state();
+        if users as u32 > 1
+            || self.cache.object_stat_state != users
+            || has_host_writers(self.meta.store_id)
+        {
+            return None;
+        }
+        self.cache.object_stat(ino)
+    }
+}
+
+/// Whether the Files app currently holds any host object in store `store_id` open for writing.
+fn has_host_writers(store_id: (u64, u64)) -> bool {
+    HOST_WRITERS_COUNT.load(Ordering::Acquire) != 0
+        && HOST_WRITERS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|(s, _, _)| *s == store_id)
+}
+
+fn stat_host_object(meta: &Meta, object: Ino) -> Result<ObjectStat, Errno> {
+    #[cfg(test)]
+    meta.host_stats.fetch_add(1, Ordering::Relaxed);
+    let mut name = [0u8; 21];
+    let host = appine_hal::stat_at(meta.objects_dir.as_raw_fd(), object_name(object, &mut name))
+        .map_err(Errno)?;
+    Ok(ObjectStat::from_host(&host))
+}
+
+fn apply_object_stat(st: &mut Stat, obj: ObjectStat, data: Data) {
+    st.size = obj.size;
+    st.blocks = Some(obj.blocks);
+    if data.held.is_none() {
+        st.atime_ns = data.atime.unwrap_or(obj.atime_ns);
+        st.mtime_ns = obj.mtime_ns;
+        st.ctime_ns = obj.ctime_ns;
     }
 }
 
@@ -3748,14 +3925,36 @@ impl Data {
     }
 }
 
-/// The metadata cache. Its entries correspond to the database contents at commit count
-/// `generation`.
+/// Cached host metadata of a regular file's backing object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObjectStat {
+    size: u64,
+    blocks: u64,
+    atime_ns: i64,
+    mtime_ns: i64,
+    ctime_ns: i64,
+}
+
+impl ObjectStat {
+    fn from_host(host: &libc::stat) -> ObjectStat {
+        ObjectStat {
+            size: host.st_size as u64,
+            blocks: host.st_blocks as u64,
+            atime_ns: timestamp_ns(host.st_atime, host.st_atime_nsec),
+            mtime_ns: timestamp_ns(host.st_mtime, host.st_mtime_nsec),
+            ctime_ns: timestamp_ns(host.st_ctime, host.st_ctime_nsec),
+        }
+    }
+}
+
+/// One generation of positive metadata cache tables. When `hot` reaches [`Cache::GEN_MAX_ENTRIES`],
+/// it rotates into `cold` and the previous `cold` generation is returned to be dropped outside
+/// `Meta::lock.write()`.
 #[derive(Default)]
-struct Cache {
-    generation: u64,
+struct CacheGen {
     entries: usize,
-    /// Directory → name → inode (None means it does not exist).
-    dentries: Map<Ino, Map<Vec<u8>, Option<Ino>>>,
+    /// Directory → name → inode (positive entries; negative dentries live in [`NegDentries`]).
+    dentries: Map<Ino, Map<Vec<u8>, Ino>>,
     rows: Map<Ino, (Stat, Data)>,
     targets: Map<Ino, Vec<u8>>,
     parents: Map<Ino, Ino>,
@@ -3764,29 +3963,266 @@ struct Cache {
     names: Map<Ino, Map<Ino, Option<Vec<u8>>>>,
     /// Complete listings of directories (readdir).
     listings: Map<Ino, Vec<DirEntry>>,
+    /// Cached host metadata for unheld regular files valid at `Cache::object_stat_state`.
+    object_stats: Map<Ino, ObjectStat>,
+    /// Cached host `(size, blocks)` for held regular files (immutable while held).
+    held_sizes: Map<Ino, (u64, u64)>,
+    /// Inodes whose guest atime is already known to be strictly newer than their mtime and ctime,
+    /// storing that `atime_ns`, valid at `Cache::relatime_state`.
+    relatime_fresh: Map<Ino, i64>,
+}
+
+/// One generation of negative dentries (directory → missing names), capped independently so
+/// negative lookup storms cannot evict hot positive metadata.
+#[derive(Default)]
+struct NegDentries {
+    entries: usize,
+    dentries: Map<Ino, Map<Vec<u8>, ()>>,
+}
+
+/// The metadata cache. Its entries correspond to the database contents at commit count
+/// `generation`. Positive entries use two generations (`hot` and `cold`) so exceeding the fill
+/// budget drops only the older half outside `Meta::lock.write()` instead of wiping the whole cache.
+#[derive(Default)]
+struct Cache {
+    generation: u64,
+    hot: CacheGen,
+    cold: CacheGen,
+    neg_hot: NegDentries,
+    neg_cold: NegDentries,
     /// Inodes with file capabilities (`security.capability`) ([`Store::has_file_caps`]); None
-    /// means not looked up yet. Writing a file has to check it, so the whole set is cached
-    /// together and invalidated with the commit count.
+    /// means not looked up yet. Kept across generation rotations so the set stays complete.
     file_caps: Option<Map<Ino, ()>>,
     /// Connection state (`Commits::users_state`) when `relatime_fresh` entries were verified.
     relatime_state: u64,
     /// Single-entry fast slot for the most recently verified `relatime_fresh` inode.
     last_relatime: Option<(Ino, i64)>,
-    /// Inodes whose guest atime is already known to be strictly newer than their mtime and ctime,
-    /// storing that `atime_ns`. Cleared on inode mutations, host object modifications, foreign
-    /// commits, or another connection opening the store.
-    relatime_fresh: Map<Ino, i64>,
+    /// Connection state (`Commits::users_state`) when `object_stats` entries were verified.
+    object_stat_state: u64,
 }
 
 impl Cache {
-    /// The limit on the number of entries: beyond it the whole cache is cleared.
+    /// Total positive entry budget across `hot` and `cold`.
     const MAX_ENTRIES: usize = 1 << 17;
+    /// Per-generation fill budget before rotating `hot` into `cold`.
+    const GEN_MAX_ENTRIES: usize = Self::MAX_ENTRIES / 2;
+    /// Per-generation fill budget for negative dentries (up to 16,384 across `neg_hot` + `neg_cold`).
+    const NEG_GEN_MAX_ENTRIES: usize = 1 << 13;
 
-    fn clear(&mut self, generation: u64) {
-        *self = Cache {
-            generation,
-            ..Cache::default()
-        };
+    fn take_clear(&mut self, generation: u64) -> Cache {
+        std::mem::replace(
+            self,
+            Cache {
+                generation,
+                ..Cache::default()
+            },
+        )
+    }
+
+    fn rotate_if_needed(&mut self) -> Option<CacheGen> {
+        if self.hot.entries >= Self::GEN_MAX_ENTRIES {
+            Some(std::mem::replace(
+                &mut self.cold,
+                std::mem::take(&mut self.hot),
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn rotate_neg_if_needed(&mut self) -> Option<NegDentries> {
+        if self.neg_hot.entries >= Self::NEG_GEN_MAX_ENTRIES {
+            Some(std::mem::replace(
+                &mut self.neg_cold,
+                std::mem::take(&mut self.neg_hot),
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn lookup(&self, parent: Ino, name: &[u8]) -> Option<Option<Ino>> {
+        if let Some(&ino) = self.hot.dentries.get(&parent).and_then(|d| d.get(name)) {
+            return Some(Some(ino));
+        }
+        if let Some(&ino) = self.cold.dentries.get(&parent).and_then(|d| d.get(name)) {
+            return Some(Some(ino));
+        }
+        if self
+            .neg_hot
+            .dentries
+            .get(&parent)
+            .is_some_and(|d| d.contains_key(name))
+            || self
+                .neg_cold
+                .dentries
+                .get(&parent)
+                .is_some_and(|d| d.contains_key(name))
+        {
+            return Some(None);
+        }
+        None
+    }
+
+    fn insert_dentry(
+        &mut self,
+        parent: Ino,
+        name: Vec<u8>,
+        found: Option<Ino>,
+    ) -> (Option<CacheGen>, Option<NegDentries>) {
+        match found {
+            Some(ino) => {
+                if self
+                    .hot
+                    .dentries
+                    .entry(parent)
+                    .or_default()
+                    .insert(name, ino)
+                    .is_none()
+                {
+                    self.hot.entries += 1;
+                }
+                (self.rotate_if_needed(), None)
+            }
+            None => {
+                if self
+                    .neg_hot
+                    .dentries
+                    .entry(parent)
+                    .or_default()
+                    .insert(name, ())
+                    .is_none()
+                {
+                    self.neg_hot.entries += 1;
+                }
+                (None, self.rotate_neg_if_needed())
+            }
+        }
+    }
+
+    fn row(&self, ino: Ino) -> Option<&(Stat, Data)> {
+        self.hot.rows.get(&ino).or_else(|| self.cold.rows.get(&ino))
+    }
+
+    fn target(&self, ino: Ino) -> Option<&Vec<u8>> {
+        self.hot
+            .targets
+            .get(&ino)
+            .or_else(|| self.cold.targets.get(&ino))
+    }
+
+    fn parent(&self, dir: Ino) -> Option<Ino> {
+        self.hot
+            .parents
+            .get(&dir)
+            .or_else(|| self.cold.parents.get(&dir))
+            .copied()
+    }
+
+    fn name_of(&self, parent: Ino, ino: Ino) -> Option<&Option<Vec<u8>>> {
+        self.hot
+            .names
+            .get(&parent)
+            .and_then(|m| m.get(&ino))
+            .or_else(|| self.cold.names.get(&parent).and_then(|m| m.get(&ino)))
+    }
+
+    fn listing(&self, dir: Ino) -> Option<&Vec<DirEntry>> {
+        self.hot
+            .listings
+            .get(&dir)
+            .or_else(|| self.cold.listings.get(&dir))
+    }
+
+    fn object_stat(&self, ino: Ino) -> Option<ObjectStat> {
+        self.hot
+            .object_stats
+            .get(&ino)
+            .or_else(|| self.cold.object_stats.get(&ino))
+            .copied()
+    }
+
+    fn held_size(&self, ino: Ino) -> Option<(u64, u64)> {
+        self.hot
+            .held_sizes
+            .get(&ino)
+            .or_else(|| self.cold.held_sizes.get(&ino))
+            .copied()
+    }
+
+    fn relatime(&self, ino: Ino) -> Option<i64> {
+        if let Some((last, atime)) = self.last_relatime
+            && last == ino
+        {
+            return Some(atime);
+        }
+        self.hot
+            .relatime_fresh
+            .get(&ino)
+            .or_else(|| self.cold.relatime_fresh.get(&ino))
+            .copied()
+    }
+
+    fn has_object_or_relatime(&self, ino: Ino) -> bool {
+        self.last_relatime.is_some_and(|(i, _)| i == ino)
+            || (!self.hot.relatime_fresh.is_empty() && self.hot.relatime_fresh.contains_key(&ino))
+            || (!self.cold.relatime_fresh.is_empty() && self.cold.relatime_fresh.contains_key(&ino))
+            || (!self.hot.object_stats.is_empty() && self.hot.object_stats.contains_key(&ino))
+            || (!self.cold.object_stats.is_empty() && self.cold.object_stats.contains_key(&ino))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn touch_name(
+        &mut self,
+        dir: Ino,
+        name: &[u8],
+    ) -> (
+        [Option<Vec<DirEntry>>; 2],
+        [Option<Map<Ino, Option<Vec<u8>>>>; 2],
+    ) {
+        if let Some(d) = self.hot.dentries.get_mut(&dir) {
+            d.remove(name);
+        }
+        if let Some(d) = self.cold.dentries.get_mut(&dir) {
+            d.remove(name);
+        }
+        if let Some(d) = self.neg_hot.dentries.get_mut(&dir) {
+            d.remove(name);
+        }
+        if let Some(d) = self.neg_cold.dentries.get_mut(&dir) {
+            d.remove(name);
+        }
+        (
+            [
+                self.hot.listings.remove(&dir),
+                self.cold.listings.remove(&dir),
+            ],
+            [self.hot.names.remove(&dir), self.cold.names.remove(&dir)],
+        )
+    }
+
+    fn touch_ino(&mut self, ino: Ino) {
+        for g in [&mut self.hot, &mut self.cold] {
+            g.rows.remove(&ino);
+            g.targets.remove(&ino);
+            g.parents.remove(&ino);
+            g.object_stats.remove(&ino);
+            g.held_sizes.remove(&ino);
+            g.relatime_fresh.remove(&ino);
+        }
+        if self.last_relatime.is_some_and(|(i, _)| i == ino) {
+            self.last_relatime = None;
+        }
+    }
+
+    fn invalidate_object(&mut self, ino: Ino) {
+        for g in [&mut self.hot, &mut self.cold] {
+            g.object_stats.remove(&ino);
+            g.relatime_fresh.remove(&ino);
+        }
+        if self.last_relatime.is_some_and(|(i, _)| i == ino) {
+            self.last_relatime = None;
+        }
     }
 }
 
@@ -4270,7 +4706,7 @@ mod tests {
         let (ino, host) = s.create_file(ROOT, b"file", 0o600, 0, 0).unwrap();
         let atime = open_atime(&host).unwrap();
         s.cached(|c| {
-            let (st, data) = &c.rows[&ino];
+            let (st, data) = c.row(ino).unwrap();
             assert_eq!((st.atime_ns, data.atime), (atime, Some(atime)));
         });
         s.commit().unwrap();
@@ -4648,7 +5084,10 @@ mod tests {
         assert_eq!(newer(ROOT, times(ROOT), op), (true, true));
         // Regular file: write and truncate change the object, and the ctime follows; chmod changes
         // only the ctime
-        let op = &mut || file.write_all(b"data").unwrap();
+        let op = &mut || {
+            file.write_all(b"data").unwrap();
+            s.object_modified(f);
+        };
         assert_eq!(newer(f, times(f), op), (true, true));
         let op = &mut || s.truncate(f, 1).unwrap();
         assert_eq!(newer(f, times(f), op), (true, true));
@@ -6372,5 +6811,279 @@ mod tests {
             "closed unlinked O_TMPFILE object must be reaped"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn regular_file_stat_cache_hits_and_invalidates_on_mutations() {
+        let (s, dir) = temp_store("stat-cache-mutations");
+        let tick = || std::thread::sleep(Duration::from_millis(25));
+        let host_stats = |s: &Store| s.meta.host_stats.load(Ordering::Relaxed);
+
+        let (f, mut file) = s.create_file(ROOT, b"f", 0o644, 0, 0).unwrap();
+        file.write_all(b"hello").unwrap();
+        s.object_modified(f);
+
+        // First Store::stat misses object_stats and populates it.
+        let before = host_stats(&s);
+        let st1 = s.stat(f).unwrap();
+        assert_eq!(st1.size, 5);
+        assert_eq!(host_stats(&s), before + 1);
+
+        // Warm Store::stat and Reader::stat hit cached object_stats with zero host fstatat calls.
+        let before = host_stats(&s);
+        for _ in 0..20 {
+            assert_eq!(s.stat(f).unwrap(), st1);
+            assert_eq!(s.meta().reader().unwrap().stat(f).unwrap(), st1);
+        }
+        assert_eq!(host_stats(&s), before, "warm stat must skip host fstatat");
+
+        // 1. Write + object_modified invalidates cached object_stats.
+        tick();
+        file.write_all(b" world").unwrap();
+        s.object_modified(f);
+        // Reader::stat miss drops the read lock and fetches fresh host stat without BKL.
+        let before = host_stats(&s);
+        let r_st = s.meta().reader().unwrap().stat(f).unwrap();
+        assert_eq!(r_st.size, 11);
+        assert!(r_st.mtime_ns > st1.mtime_ns);
+        assert_eq!(host_stats(&s), before + 1);
+        // Store::stat re-populates the cache; subsequent reads are warm hits again.
+        let st2 = s.stat(f).unwrap();
+        assert_eq!(st2.size, 11);
+        let before = host_stats(&s);
+        assert_eq!(s.meta().reader().unwrap().stat(f).unwrap(), st2);
+        assert_eq!(host_stats(&s), before);
+
+        // 2. Store::truncate invalidates cached object_stats.
+        tick();
+        s.truncate(f, 3).unwrap();
+        let st3 = s.stat(f).unwrap();
+        assert_eq!(st3.size, 3);
+        assert!(st3.mtime_ns > st2.mtime_ns);
+
+        // 3. set_mode (chmod) and set_owner bump ctime and invalidate cached object_stats.
+        tick();
+        s.set_mode(f, 0o600).unwrap();
+        let st4 = s.stat(f).unwrap();
+        assert_eq!(st4.mode & 0o7777, 0o600);
+        assert!(st4.ctime_ns > st3.ctime_ns);
+        tick();
+        s.set_owner(f, Some(1000), Some(1000), false).unwrap();
+        let st5 = s.stat(f).unwrap();
+        assert_eq!((st5.uid, st5.gid), (1000, 1000));
+        assert!(st5.ctime_ns > st4.ctime_ns);
+
+        // 4. set_times (both mtime-only and explicit atime+mtime) invalidates cached object_stats.
+        tick();
+        s.set_times(f, None, Some(FileTime::At(4_000_000_000)))
+            .unwrap();
+        let st6 = s.stat(f).unwrap();
+        assert_eq!(st6.mtime_ns, 4_000_000_000);
+        assert!(st6.ctime_ns > st5.ctime_ns);
+        tick();
+        s.set_times(
+            f,
+            Some(FileTime::At(2_000_000_000)),
+            Some(FileTime::At(5_000_000_000)),
+        )
+        .unwrap();
+        let st7 = s.stat(f).unwrap();
+        assert_eq!(st7.mtime_ns, 5_000_000_000);
+        assert!(st7.ctime_ns > st6.ctime_ns);
+
+        // 5. Held (shared) files cache (size, blocks) and skip host fstatat; unshare invalidates.
+        let (g, _) = s.create_file(ROOT, b"g", 0o644, 0, 0).unwrap();
+        s.share(f, g).unwrap();
+        let before = host_stats(&s);
+        let h1 = s.stat(g).unwrap();
+        assert_eq!(h1.size, 3);
+        assert_eq!(host_stats(&s), before + 1);
+        let before = host_stats(&s);
+        for _ in 0..10 {
+            assert_eq!(s.stat(g).unwrap(), h1);
+            assert_eq!(s.meta().reader().unwrap().stat(g).unwrap(), h1);
+        }
+        assert_eq!(
+            host_stats(&s),
+            before,
+            "warm held stat must skip host fstatat"
+        );
+        s.make_private(g, None).unwrap();
+        let mut gw = s.open_object(g, true).unwrap();
+        gw.write_all(b"abcdef").unwrap();
+        s.object_modified(g);
+        assert_eq!(s.stat(g).unwrap().size, 6);
+
+        // 6. Writable shared mapping disables stat caching for that inode even without object_modified.
+        let _pin = s.mapping_object(g, true).unwrap().unwrap();
+        let before = host_stats(&s);
+        assert_eq!(s.stat(g).unwrap().size, 6);
+        assert_eq!(host_stats(&s), before + 1);
+        gw.write_all(b"1234").unwrap();
+        // Deliberately do NOT call s.object_modified(g).
+        assert_eq!(s.stat(g).unwrap().size, 10);
+        assert_eq!(s.meta().reader().unwrap().stat(g).unwrap().size, 10);
+
+        drop((_pin, gw, file, s));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn regular_file_stat_cache_invalidates_on_host_writers_and_peers() {
+        let (a, dir) = temp_store("stat-cache-external");
+        let host_stats = |s: &Store| s.meta.host_stats.load(Ordering::Relaxed);
+
+        let home = a.mkdir(ROOT, b"home", 0o755, 0, 0).unwrap();
+        let alice = a.mkdir(home, b"alice", 0o755, 1000, 1000).unwrap();
+        let (f, mut file) = a.create_file(alice, b"doc.txt", 0o644, 1000, 1000).unwrap();
+        file.write_all(b"v1").unwrap();
+        a.object_modified(f);
+        a.commit().unwrap();
+
+        // Warm up object_stats on connection `a`.
+        assert_eq!(a.stat(f).unwrap().size, 2);
+        let before = host_stats(&a);
+        assert_eq!(a.meta().reader().unwrap().stat(f).unwrap().size, 2);
+        assert_eq!(host_stats(&a), before);
+
+        // 1. Multi-connection (`active_users > 1`): neither Store::stat nor Reader::stat caches
+        // regular-file host metadata while a peer connection is open.
+        {
+            let b = Store::open(&dir, &[]).unwrap();
+            assert_eq!(a.stat(f).unwrap().size, 2);
+            let before = host_stats(&a);
+            assert_eq!(a.stat(f).unwrap().size, 2);
+            assert_eq!(a.meta().reader().unwrap().stat(f).unwrap().size, 2);
+            assert_eq!(
+                host_stats(&a),
+                before + 2,
+                "multi-connection stats must not use cached object_stats"
+            );
+            let mut bf = b.open_number(f, libc::O_RDWR).unwrap();
+            bf.write_all(b"v2-longer").unwrap();
+            assert_eq!(a.meta().reader().unwrap().stat(f).unwrap().size, 9);
+            drop((bf, b));
+        }
+        assert_eq!(a.stat(f).unwrap().size, 9);
+        // Alone again: re-cached.
+        let before = host_stats(&a);
+        assert_eq!(a.meta().reader().unwrap().stat(f).unwrap().size, 9);
+        assert_eq!(host_stats(&a), before);
+
+        // 2. Peer opens, modifies the host object WITHOUT any SQLite commit, and closes:
+        // bumped open epoch in Commits word 1 invalidates `a`'s cached object_stats even though
+        // `commits` generation did not move.
+        {
+            let b = Store::open(&dir, &[]).unwrap();
+            let mut bf = b.open_number(f, libc::O_RDWR).unwrap();
+            bf.write_all(b"v2-no-sql-commit").unwrap();
+            drop((bf, b));
+        }
+        assert_eq!(a.meta().reader().unwrap().stat(f).unwrap().size, 16);
+        assert_eq!(a.stat(f).unwrap().size, 16);
+        let before = host_stats(&a);
+        assert_eq!(a.meta().reader().unwrap().stat(f).unwrap().size, 16);
+        assert_eq!(host_stats(&a), before);
+
+        // 3. DocumentsProvider writer (`HOST_WRITERS`) bypasses stat caching while fd is open.
+        let mut changes = Vec::new();
+        let mut host_fd = {
+            let b = Store::open(&dir, &[]).unwrap();
+            crate::vfs::browse::open_write(
+                &b,
+                b"/home/alice",
+                b"/home/alice/doc.txt",
+                false,
+                false,
+                &mut changes,
+            )
+            .unwrap()
+        };
+        assert_eq!(a.stat(f).unwrap().size, 16);
+        host_fd.write_all(b"v3-provider-write").unwrap();
+        assert_eq!(a.stat(f).unwrap().size, 17);
+        assert_eq!(a.meta().reader().unwrap().stat(f).unwrap().size, 17);
+        drop(host_fd);
+        {
+            let b = Store::open(&dir, &[]).unwrap();
+            crate::vfs::browse::written(&b, b"/home/alice", b"/home/alice/doc.txt", &mut changes)
+                .unwrap();
+        }
+        assert_eq!(a.stat(f).unwrap().size, 17);
+        let before = host_stats(&a);
+        assert_eq!(a.meta().reader().unwrap().stat(f).unwrap().size, 17);
+        assert_eq!(host_stats(&a), before);
+
+        // 4. Foreign SQLite commit invalidates the whole cache.
+        {
+            let b = Store::open(&dir, &[]).unwrap();
+            b.set_mode(f, 0o600).unwrap();
+            drop(b);
+        }
+        assert!(a.meta().reader().is_none());
+        assert_eq!(a.stat(f).unwrap().mode & 0o7777, 0o600);
+
+        drop((file, a));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_rotates_generations_incrementally_and_isolates_negative_dentries() {
+        let mut cache = Cache::default();
+
+        // Fill generation 0 to just below rotation, then push over GEN_MAX_ENTRIES.
+        for i in 0..Cache::GEN_MAX_ENTRIES {
+            let name = format!("f{i}").into_bytes();
+            let (pos, neg) = cache.insert_dentry(ROOT, name, Some(i as Ino + 10));
+            assert!(neg.is_none());
+            if i + 1 < Cache::GEN_MAX_ENTRIES {
+                assert!(pos.is_none());
+            } else {
+                assert!(pos.is_some());
+            }
+        }
+        // Generation 0 rotated into `cold` (retained warm), while `hot` is now empty.
+        assert_eq!(cache.hot.entries, 0);
+        assert_eq!(cache.cold.entries, Cache::GEN_MAX_ENTRIES);
+        assert_eq!(cache.lookup(ROOT, b"f0"), Some(Some(10)));
+        assert_eq!(
+            cache.lookup(ROOT, format!("f{}", Cache::GEN_MAX_ENTRIES - 1).as_bytes()),
+            Some(Some(Cache::GEN_MAX_ENTRIES as Ino + 9))
+        );
+
+        // Negative dentry storm must rotate independently without evicting any positive entries.
+        let mut neg_rotations = 0;
+        for i in 0..(Cache::NEG_GEN_MAX_ENTRIES * 2 + 100) {
+            let name = format!("missing{i}").into_bytes();
+            let (pos, neg) = cache.insert_dentry(ROOT, name, None);
+            assert!(pos.is_none());
+            if neg.is_some() {
+                neg_rotations += 1;
+            }
+        }
+        assert_eq!(neg_rotations, 2);
+        assert!(cache.neg_hot.entries < Cache::NEG_GEN_MAX_ENTRIES);
+        assert_eq!(cache.neg_cold.entries, Cache::NEG_GEN_MAX_ENTRIES);
+        // Oldest negative entries from generation 0 were evicted; newest remain cached.
+        assert_eq!(cache.lookup(ROOT, b"missing0"), None);
+        assert_eq!(
+            cache.lookup(
+                ROOT,
+                format!("missing{}", Cache::NEG_GEN_MAX_ENTRIES * 2 + 50).as_bytes()
+            ),
+            Some(None)
+        );
+        // Positive entries in `cold` are completely untouched by negative dentry eviction.
+        assert_eq!(cache.lookup(ROOT, b"f0"), Some(Some(10)));
+
+        // Fill generation 1 past GEN_MAX_ENTRIES: generation 0 drops, generation 1 stays warm.
+        for i in 0..Cache::GEN_MAX_ENTRIES {
+            let name = format!("g{i}").into_bytes();
+            let _ = cache.insert_dentry(ROOT, name, Some(1_000_000 + i as Ino));
+        }
+        assert_eq!(cache.lookup(ROOT, b"f0"), None);
+        assert_eq!(cache.lookup(ROOT, b"g0"), Some(Some(1_000_000)));
+        assert_eq!(cache.hot.entries, 0);
+        assert_eq!(cache.cold.entries, Cache::GEN_MAX_ENTRIES);
     }
 }

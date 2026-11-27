@@ -21,13 +21,13 @@ pub mod import;
 pub mod overlay;
 pub mod store;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::Path;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use crate::cell::RefCell;
-use crate::cred::{Cred, MAY_EXEC};
+use crate::cred::{Cred, MAY_EXEC, MAY_READ, MAY_WRITE, cap};
 use crate::errno::Errno;
 pub(crate) use crate::pseudo::PseudoNode;
 use store::{Ino, ROOT, Stat, Store, mode};
@@ -996,6 +996,22 @@ impl Mounts {
         self.get_attached(ROOT_MOUNT)
             .is_some_and(|m| m.flags & ms::NOSYMFOLLOW == 0)
     }
+
+    /// Whether the boot root mount or its superblock is read-only (for [`Cached::access`]).
+    fn root_readonly(&self) -> bool {
+        self.get_attached(ROOT_MOUNT)
+            .is_some_and(|m| m.flags & ms::RDONLY != 0)
+            || self
+                .sb_flags
+                .get(&ROOT_DEV)
+                .is_some_and(|f| f & ms::RDONLY != 0)
+    }
+
+    /// Whether the boot root mount has `MS_NOEXEC` set (for [`Cached::access`]).
+    fn root_noexec(&self) -> bool {
+        self.get_attached(ROOT_MOUNT)
+            .is_some_and(|m| m.flags & ms::NOEXEC != 0)
+    }
 }
 
 /// tmpfs accounts usage in pages; the page size (guest pages).
@@ -1443,6 +1459,15 @@ struct UnlinkedTmpfs {
     object: std::fs::File,
 }
 
+/// Credential fields needed by [`Cached::access`] in the initial user namespace (thread-safe
+/// snapshot without `Rc<UserNs>`).
+#[allow(dead_code)] // Wired into syscall::fast during integration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CachedCred {
+    pub(crate) fsuid: u32,
+    pub(crate) cap_effective: u64,
+}
+
 /// What no-BKL path resolution needs (`syscall::fast`): the store's metadata cache and the mount
 /// points.
 #[derive(Clone)]
@@ -1452,6 +1477,10 @@ pub(crate) struct Cached {
     /// The root filesystem's mount ([`ROOT_MOUNT`]) is still attached and not nosymfollow: only
     /// threads whose root and current directory are in it can resolve without the BKL.
     pub(crate) usable: bool,
+    /// `ROOT_MOUNT` or its superblock is read-only.
+    root_readonly: bool,
+    /// `ROOT_MOUNT` has `MS_NOEXEC`.
+    root_noexec: bool,
 }
 
 impl Cached {
@@ -1471,12 +1500,124 @@ impl Cached {
         match self.walk(&r, root, cwd, path, follow)? {
             // The no-BKL statx encoder takes only the basic stat bytes. Let the syscall
             // carry the inode flags through resolution when any statx attribute is set.
-            Ok(ino) => r
-                .stat(ino)
-                .filter(|st| st.flags & store::inode_flags::STATX == 0)
-                .map(Ok),
+            Ok(ino) => {
+                if r.attrs(ino)?.flags & store::inode_flags::STATX != 0 {
+                    return None;
+                }
+                r.stat(ino).map(Ok)
+            }
             Err(e) => Some(Err(e)),
         }
+    }
+
+    /// Resolves `path` without following a trailing symlink and copies up to `buf.len()` bytes of
+    /// its target into `buf` (truncated as `readlinkat(2)` does), returning the bytes copied.
+    /// Returns `None` on a cache miss, mount crossing, or empty path so the caller falls back to
+    /// the BKL path.
+    #[allow(dead_code)] // Wired into syscall::fast during integration.
+    pub(crate) fn readlink(
+        &self,
+        root: Ino,
+        cwd: Ino,
+        path: &[u8],
+        buf: &mut [u8],
+    ) -> Option<Result<usize, Errno>> {
+        if buf.is_empty() {
+            return Some(Err(Errno::EINVAL));
+        }
+        if path.is_empty() {
+            return None;
+        }
+        let r = self.meta.reader()?;
+        let ino = match self.walk(&r, root, cwd, path, false)? {
+            Ok(ino) => ino,
+            Err(e) => return Some(Err(e)),
+        };
+        if r.kind(ino)? != mode::S_IFLNK {
+            return Some(Err(Errno::EINVAL));
+        }
+        let target = r.readlink(ino)?;
+        let n = target.len().min(buf.len());
+        buf[..n].copy_from_slice(&target[..n]);
+        Some(Ok(n))
+    }
+
+    /// Resolves `path` and checks `amode` (`F_OK`/`R_OK`/`W_OK`/`X_OK`) using only the metadata
+    /// cache, for initial-user-namespace credentials `cred`. Returns `None` on a cache miss, mount
+    /// crossing, empty path, credentials lacking `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH`, or an
+    /// ACL/group check that needs the full BKL path.
+    #[allow(dead_code)] // Wired into syscall::fast during integration.
+    pub(crate) fn access(
+        &self,
+        root: Ino,
+        cwd: Ino,
+        path: &[u8],
+        amode: u32,
+        follow: bool,
+        cred: CachedCred,
+    ) -> Option<Result<(), Errno>> {
+        if amode & !7 != 0 {
+            return Some(Err(Errno::EINVAL));
+        }
+        if path.is_empty() {
+            return None;
+        }
+        let has_override = cred.cap_effective & (1 << cap::DAC_OVERRIDE) != 0;
+        let has_read_search = cred.cap_effective & (1 << cap::DAC_READ_SEARCH) != 0;
+        if !has_override && !has_read_search {
+            return None;
+        }
+        let r = self.meta.reader()?;
+        let ino = match self.walk(&r, root, cwd, path, follow)? {
+            Ok(ino) => ino,
+            Err(e) => return Some(Err(e)),
+        };
+        if amode == 0 {
+            return Some(Ok(()));
+        }
+        let st = r.attrs(ino)?;
+        // Regular-file execute on a noexec mount is EACCES (before immutable and DAC).
+        if amode & MAY_EXEC != 0 && st.kind() == mode::S_IFREG && self.root_noexec {
+            return Some(Err(Errno::EACCES));
+        }
+        // Immutable blocks W_OK with EPERM (before DAC and EROFS).
+        if amode & MAY_WRITE != 0 && st.flags & store::inode_flags::IMMUTABLE != 0 {
+            return Some(Err(Errno::EPERM));
+        }
+        // DAC check matching Cred::permission in the initial user namespace.
+        if st.kind() == mode::S_IFDIR {
+            let override_ok = has_override || (amode & MAY_WRITE == 0 && has_read_search);
+            if !override_ok {
+                if cred.fsuid == st.uid {
+                    if amode & !(st.mode >> 6) & 7 != 0 {
+                        return Some(Err(Errno::EACCES));
+                    }
+                } else {
+                    return None;
+                }
+            }
+        } else if has_override {
+            if amode & MAY_EXEC != 0 && st.mode & 0o111 == 0 {
+                if st.access_acl.is_some() {
+                    return None;
+                }
+                return Some(Err(Errno::EACCES));
+            }
+        } else if amode != MAY_READ {
+            if cred.fsuid == st.uid {
+                if amode & !(st.mode >> 6) & 7 != 0 {
+                    return Some(Err(Errno::EACCES));
+                }
+            } else {
+                return None;
+            }
+        }
+        // W_OK on a regular file, directory or symlink on a read-only mount/sb is EROFS (after DAC).
+        let special = !matches!(st.kind(), mode::S_IFREG | mode::S_IFDIR | mode::S_IFLNK);
+        if amode & MAY_WRITE != 0 && !special && self.root_readonly {
+            return Some(Err(Errno::EROFS));
+        }
+        Some(Ok(()))
     }
 
     /// Corresponds one to one with [`Vfs::walk_in`].
@@ -1542,8 +1683,8 @@ impl Cached {
                 // directory's are left to normal resolution (including trailing `/` like `link/`)
                 let sticky_shared = mode::S_ISVTX | 0o002;
                 if trailing
-                    && r.stat(dir)?.mode & sticky_shared == sticky_shared
-                    && r.stat(dir)?.uid != r.stat(node)?.uid
+                    && r.attrs(dir)?.mode & sticky_shared == sticky_shared
+                    && r.attrs(dir)?.uid != r.attrs(node)?.uid
                 {
                     return None;
                 }
@@ -1803,6 +1944,8 @@ impl Vfs {
             meta: store.meta().clone(),
             mounts: mounts.store_points(),
             usable: mounts.fast_usable(),
+            root_readonly: mounts.root_readonly(),
+            root_noexec: mounts.root_noexec(),
         };
         let sweep_bits = std::rc::Rc::new(std::cell::Cell::new(0));
         Ok(Vfs {
@@ -1916,7 +2059,8 @@ impl Vfs {
         path: &[u8],
         follow: bool,
     ) -> Result<Node, Errno> {
-        self.walk(ps, cred, root, cwd, path, follow)
+        self.store
+            .snapshot(|_| self.walk_in(ps, cred, root, cwd, path, follow, 0, true, false))
             .map(|(node, _)| node)
     }
 
@@ -1948,7 +2092,7 @@ impl Vfs {
         follow: bool,
     ) -> Result<Node, Errno> {
         self.store
-            .snapshot(|_| self.walk_in(ps, cred, root, cwd, path, follow, 0, false))
+            .snapshot(|_| self.walk_in(ps, cred, root, cwd, path, follow, 0, false, false))
             .map(|(node, _)| node)
     }
 
@@ -1966,7 +2110,7 @@ impl Vfs {
         flags: u64,
     ) -> Result<(Node, Option<WalkDentry>), Errno> {
         self.store
-            .snapshot(|_| self.walk_in(ps, cred, root, cwd, path, follow, flags, true))
+            .snapshot(|_| self.walk_in(ps, cred, root, cwd, path, follow, flags, true, true))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1980,6 +2124,7 @@ impl Vfs {
         follow: bool,
         flags: u64,
         touch: bool,
+        want_found: bool,
     ) -> Result<(Node, Option<WalkDentry>), Errno> {
         if path.is_empty() {
             return Err(Errno::ENOENT);
@@ -2002,23 +2147,19 @@ impl Vfs {
         // Under NO_XDEV a jump to the root (a symlink to an absolute path) before it is taken is
         // always EXDEV: nd_jump_root compares the current mount with the empty nd->root.mnt
         let mut root_set = path[0] == b'/' || flags & resolve::SCOPED != 0;
-        let mut found = None;
-        let mut pending = components(path);
+        let mut found: Option<WalkFound<'_>> = None;
+        let mut pending = WalkPending::new(path);
         let mut links = 0;
-        while let Some(step) = pending.pop_front() {
-            let comp = match step {
-                Step::TrailingSlash => {
-                    if !self.is_dir(ps, &dir)? {
-                        return Err(Errno::ENOTDIR);
-                    }
-                    self.may_search(ps, cred, &dir)?;
-                    continue;
+        while let Some(step) = pending.pop() {
+            let Some(comp) = pending.slice(step) else {
+                if !self.is_dir(ps, &dir)? {
+                    return Err(Errno::ENOTDIR);
                 }
-                Step::Name(comp) => comp,
+                self.may_search(ps, cred, &dir)?;
+                continue;
             };
             let last = pending.is_empty();
-            let trailing =
-                last || (pending.len() == 1 && matches!(pending[0], Step::TrailingSlash));
+            let trailing = last || pending.is_trailing_slash_only();
             if comp.len() > NAME_MAX {
                 return Err(Errno::ENAMETOOLONG);
             }
@@ -2050,9 +2191,9 @@ impl Vfs {
                 found = None;
                 continue;
             }
-            let node = match self.lookup_walk(ps, &dir, &comp, &pending) {
+            let node = match self.lookup_walk(ps, &dir, comp, &pending) {
                 Err(e) if e == Errno::ENOENT => {
-                    ps.missing(&dir, &comp);
+                    ps.missing(&dir, comp);
                     return Err(e);
                 }
                 r => r?,
@@ -2112,7 +2253,11 @@ impl Vfs {
                     if touch {
                         self.touch_mount(dir.mnt());
                     }
-                    found = if last { ps.follow_dentry(p) } else { None };
+                    found = if last && want_found {
+                        ps.follow_dentry(p).map(WalkFound::Owned)
+                    } else {
+                        None
+                    };
                     continue;
                 }
                 let target = self.readlink(ps, &node)?;
@@ -2129,16 +2274,15 @@ impl Vfs {
                     dir = root.clone();
                     found = None;
                 }
-                for c in components(&target).into_iter().rev() {
-                    pending.push_front(c);
-                }
+                pending.push_owned(target);
                 continue;
             }
-            found = Some(WalkDentry {
-                entry: (std::mem::replace(&mut dir, node), comp),
-                unlinked: false,
-            });
+            let prev = std::mem::replace(&mut dir, node);
+            if want_found {
+                found = Some(WalkFound::Step(prev, step));
+            }
         }
+        let found = found.map(|f| f.into_dentry(&pending));
         Ok((dir, found))
     }
 
@@ -2291,7 +2435,20 @@ impl Vfs {
         }
         let (dir, name) = match trimmed.iter().rposition(|&b| b == b'/') {
             Some(i) => (
-                self.walk_resolve(ps, cred, root, cwd, &trimmed[..=i], true, flags)?
+                self.store
+                    .snapshot(|_| {
+                        self.walk_in(
+                            ps,
+                            cred,
+                            root,
+                            cwd,
+                            &trimmed[..=i],
+                            true,
+                            flags,
+                            true,
+                            false,
+                        )
+                    })?
                     .0,
                 &trimmed[i + 1..],
             ),
@@ -2651,7 +2808,7 @@ impl Vfs {
         ps: &dyn Pseudo,
         dir: &Node,
         name: &[u8],
-        pending: &VecDeque<Step>,
+        pending: &WalkPending<'_>,
     ) -> Result<Node, Errno> {
         let Node::Fuse(mnt, f) = *dir else {
             return self.lookup(ps, dir, name);
@@ -2663,24 +2820,18 @@ impl Vfs {
             return Ok(self.mounted(Node::Fuse(mnt, res?)));
         }
         let mut extra = pending
-            .iter()
-            .map_while(|step| match step {
-                Step::Name(c)
-                    if !c.is_empty()
-                        && c.as_slice() != b"."
-                        && c.as_slice() != b".."
-                        && c.len() <= fuse::NAME_MAX =>
-                {
-                    Some(c)
-                }
-                _ => None,
+            .iter_next()
+            .map_while(|comp| {
+                comp.filter(|&c| {
+                    !c.is_empty() && c != b"." && c != b".." && c.len() <= fuse::NAME_MAX
+                })
             })
             .peekable();
         let q = if extra.peek().is_none() {
             fuse::Query::Lookup(f, name.to_vec())
         } else {
             let mut names = vec![name.to_vec()];
-            names.extend(extra.cloned());
+            names.extend(extra.map(<[u8]>::to_vec));
             fuse::Query::LookupWalk { mnt, dir: f, names }
         };
         Err(fuse::need(q))
@@ -3884,6 +4035,9 @@ impl Vfs {
             .borrow_mut()
             .sb_flags
             .insert(dev, flags & ms::PER_SB);
+        if dev == ROOT_DEV {
+            self.rebuild_cached();
+        }
     }
 
     /// The path in the filesystem of the part the mount sees (the fourth column of mountinfo:
@@ -5097,11 +5251,13 @@ impl Vfs {
     /// Rebuilds the mount-point cache used by no-BKL path resolution without bumping any
     /// namespace's poll event counter.
     fn rebuild_cached(&self) {
-        let (points, usable, expiring) = {
+        let (points, usable, root_readonly, root_noexec, expiring) = {
             let mounts = self.mounts.borrow();
             (
                 mounts.store_points(),
                 mounts.fast_usable(),
+                mounts.root_readonly(),
+                mounts.root_noexec(),
                 mounts.list.iter().filter(|m| m.expiring).count(),
             )
         };
@@ -5109,6 +5265,8 @@ impl Vfs {
         let mut cached = self.cached.borrow_mut();
         cached.mounts = points;
         cached.usable = usable;
+        cached.root_readonly = root_readonly;
+        cached.root_noexec = root_noexec;
     }
 
     /// The mount table changed in namespaces `nss`: rebuilds the no-BKL path cache (the caller
@@ -5207,17 +5365,19 @@ pub fn write_file_owned(
             None => store.mkdir(dir, c, 0o755, 0, 0)?,
         };
     }
-    let mut file = match store.lookup(dir, name)? {
+    let (ino, mut file) = match store.lookup(dir, name)? {
         Some(_) if !overwrite => return Ok(()),
         Some(ino) if store.kind(ino)? == mode::S_IFREG => {
             store.truncate(ino, 0)?;
-            store.open_object(ino, true)?
+            (ino, store.open_object(ino, true)?)
         }
         Some(_) => return Err(Errno::EEXIST),
-        None => store.create_file(dir, name, mode & 0o7777, uid, gid)?.1,
+        None => store.create_file(dir, name, mode & 0o7777, uid, gid)?,
     };
     file.write_all(data)
-        .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))
+        .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+    store.object_modified(ino);
+    Ok(())
 }
 
 /// Reads a regular file in the store (for the host to look at configuration files, such as the
@@ -5247,26 +5407,144 @@ fn open_config_file(store: &Store, path: &[u8]) -> Result<std::fs::File, Errno> 
     store.open_object(ino, false)
 }
 
-enum Step {
-    Name(Vec<u8>),
+#[derive(Clone, Copy)]
+enum WalkStep<'p> {
+    /// Component borrowed directly from the input path slice.
+    Borrowed(&'p [u8]),
+    /// Component slice into `WalkPending::bufs[buf]` from an expanded symlink target.
+    Symlink { buf: u16, start: u32, len: u32 },
     /// Synthetic step for a trailing `/` (forces a directory and follows a trailing symlink while
     /// preserving `WALK_TRAILING` for `fs.protected_symlinks`).
     TrailingSlash,
 }
 
-/// Components for path resolution: `.` is kept, and with a trailing `/` a [`Step::TrailingSlash`]
-/// is added so the preceding node must be a directory and a symlink in the last component is
-/// followed too (as on Linux) while still treated as trailing for `protected_symlinks`.
-fn components(path: &[u8]) -> VecDeque<Step> {
-    let mut comps: VecDeque<Step> = path
-        .split(|&b| b == b'/')
-        .filter(|c| !c.is_empty())
-        .map(|c| Step::Name(c.to_vec()))
-        .collect();
-    if path.ends_with(b"/") {
-        comps.push_back(Step::TrailingSlash);
+enum WalkFound<'p> {
+    Step(Node, WalkStep<'p>),
+    Owned(WalkDentry),
+}
+
+impl<'p> WalkFound<'p> {
+    fn into_dentry(self, pending: &WalkPending<'p>) -> WalkDentry {
+        match self {
+            WalkFound::Step(dir, step) => WalkDentry {
+                entry: (dir, pending.slice(step).unwrap_or_default().to_vec()),
+                unlinked: false,
+            },
+            WalkFound::Owned(d) => d,
+        }
     }
-    comps
+}
+
+/// Inline capacity of [`WalkPending`]; deeper paths spill into `overflow`.
+const WALK_INLINE: usize = 32;
+
+/// Stack-backed component queue for [`Vfs::walk_in`], stored in reverse order (next component on
+/// top) so ordinary path walks perform zero heap allocations. Paths exceeding `WALK_INLINE`
+/// components spill seamlessly into `overflow`, and symlink targets are retained in `bufs` without
+/// per-component copies.
+struct WalkPending<'p> {
+    inline: [WalkStep<'p>; WALK_INLINE],
+    inline_len: usize,
+    overflow: Vec<WalkStep<'p>>,
+    bufs: Vec<Vec<u8>>,
+}
+
+impl<'p> WalkPending<'p> {
+    fn new(path: &'p [u8]) -> Self {
+        let mut p = WalkPending {
+            inline: [WalkStep::TrailingSlash; WALK_INLINE],
+            inline_len: 0,
+            overflow: Vec::new(),
+            bufs: Vec::new(),
+        };
+        p.push_borrowed(path);
+        p
+    }
+
+    fn push_one(&mut self, step: WalkStep<'p>) {
+        if self.inline_len < WALK_INLINE {
+            self.inline[self.inline_len] = step;
+            self.inline_len += 1;
+        } else {
+            self.overflow.push(step);
+        }
+    }
+
+    fn push_borrowed(&mut self, path: &'p [u8]) {
+        if path.ends_with(b"/") {
+            self.push_one(WalkStep::TrailingSlash);
+        }
+        for c in path.rsplit(|&b| b == b'/').filter(|c| !c.is_empty()) {
+            self.push_one(WalkStep::Borrowed(c));
+        }
+    }
+
+    fn push_owned(&mut self, target: Vec<u8>) {
+        let buf = u16::try_from(self.bufs.len()).expect("symlink expansion exceeded MAX_SYMLINKS");
+        if target.ends_with(b"/") {
+            self.push_one(WalkStep::TrailingSlash);
+        }
+        let mut end = target.len();
+        while end > 0 {
+            while end > 0 && target[end - 1] == b'/' {
+                end -= 1;
+            }
+            if end == 0 {
+                break;
+            }
+            let mut start = end;
+            while start > 0 && target[start - 1] != b'/' {
+                start -= 1;
+            }
+            self.push_one(WalkStep::Symlink {
+                buf,
+                start: start as u32,
+                len: (end - start) as u32,
+            });
+            end = start;
+        }
+        self.bufs.push(target);
+    }
+
+    fn pop(&mut self) -> Option<WalkStep<'p>> {
+        if let Some(step) = self.overflow.pop() {
+            return Some(step);
+        }
+        self.inline_len = self.inline_len.checked_sub(1)?;
+        Some(self.inline[self.inline_len])
+    }
+
+    fn slice<'a>(&'a self, step: WalkStep<'p>) -> Option<&'a [u8]>
+    where
+        'p: 'a,
+    {
+        match step {
+            WalkStep::Borrowed(c) => Some(c),
+            WalkStep::Symlink { buf, start, len } => {
+                let s = start as usize;
+                Some(&self.bufs[buf as usize][s..s + len as usize])
+            }
+            WalkStep::TrailingSlash => None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inline_len == 0 && self.overflow.is_empty()
+    }
+
+    fn is_trailing_slash_only(&self) -> bool {
+        self.overflow.is_empty()
+            && self.inline_len == 1
+            && matches!(self.inline[0], WalkStep::TrailingSlash)
+    }
+
+    fn iter_next(&self) -> impl Iterator<Item = Option<&[u8]>> + '_ {
+        self.overflow
+            .iter()
+            .rev()
+            .chain(self.inline[..self.inline_len].iter().rev())
+            .map(|&step| self.slice(step))
+    }
 }
 
 /// Splits path components, dropping empty components and `.`.
@@ -7820,6 +8098,465 @@ pub(crate) mod tests {
         assert_eq!(init_ev.get(), i1 + 1);
         assert_eq!(ns2_ev.get(), n1 + 1);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn walk_in_handles_deep_paths_symlinks_dots_trailing_slashes_and_scopes() {
+        let (vfs, dir) = sample("walk-edge-cases");
+        let ps = &Empty;
+        let cred = &Cred::root();
+        let root = Node::ROOT;
+        let store = vfs.store();
+
+        // 1. Deep directory path (> WalkPending::INLINE = 32) exercises overflow spilling.
+        let mut parent = ROOT;
+        let mut deep_path = Vec::new();
+        for i in 0..40 {
+            let name = format!("d{i}");
+            parent = store.mkdir(parent, name.as_bytes(), 0o755, 0, 0).unwrap();
+            deep_path.push(b'/');
+            deep_path.extend_from_slice(name.as_bytes());
+        }
+        let (leaf_ino, _) = store.create_file(parent, b"leaf", 0o644, 0, 0).unwrap();
+        let mut leaf_path = deep_path.clone();
+        leaf_path.extend_from_slice(b"/leaf");
+        let (node, found) = vfs.walk(ps, cred, &root, &root, &leaf_path, true).unwrap();
+        assert_eq!(node, Node::Store(ROOT_MOUNT, leaf_ino));
+        assert_eq!(
+            found,
+            Some((Node::Store(ROOT_MOUNT, parent), b"leaf".to_vec()))
+        );
+        assert_eq!(
+            vfs.resolve(ps, cred, &root, &root, &leaf_path, true)
+                .unwrap(),
+            node
+        );
+
+        // 2. Exact MAX_SYMLINKS (40) succeeds; 41st returns ELOOP.
+        let chain_dir = store.mkdir(ROOT, b"chain", 0o755, 0, 0).unwrap();
+        let (target_ino, _) = store.create_file(chain_dir, b"l0", 0o644, 0, 0).unwrap();
+        for i in 1..=41 {
+            let name = format!("l{i}");
+            let target = format!("l{}", i - 1);
+            store
+                .symlink(chain_dir, name.as_bytes(), target.as_bytes(), 0, 0)
+                .unwrap();
+        }
+        let (n40, f40) = vfs
+            .walk(ps, cred, &root, &root, b"/chain/l40", true)
+            .unwrap();
+        assert_eq!(n40, Node::Store(ROOT_MOUNT, target_ino));
+        assert_eq!(
+            f40,
+            Some((Node::Store(ROOT_MOUNT, chain_dir), b"l0".to_vec()))
+        );
+        assert_eq!(
+            vfs.resolve(ps, cred, &root, &root, b"/chain/l41", true),
+            Err(Errno::ELOOP)
+        );
+
+        // 3. Multi-component symlinks, dots, trailing slashes, and scoped BENEATH / IN_ROOT.
+        let sub = store.mkdir(chain_dir, b"sub", 0o755, 0, 0).unwrap();
+        store.symlink(sub, b"up_dir", b"../sub/", 0, 0).unwrap();
+        store.symlink(sub, b"to_leaf", b"../l0", 0, 0).unwrap();
+        let chain_node = Node::Store(ROOT_MOUNT, chain_dir);
+        let sub_node = Node::Store(ROOT_MOUNT, sub);
+
+        // Trailing slash forces symlink follow even with follow = false, and requires directory.
+        assert_eq!(
+            vfs.resolve(ps, cred, &root, &root, b"/chain/sub/up_dir/", false)
+                .unwrap(),
+            sub_node
+        );
+        assert_eq!(
+            vfs.resolve(ps, cred, &root, &root, b"/chain/sub/to_leaf/", false),
+            Err(Errno::ENOTDIR)
+        );
+        assert_eq!(
+            vfs.resolve(ps, cred, &root, &root, b"/chain/sub/up_dir/./../l0", true)
+                .unwrap(),
+            Node::Store(ROOT_MOUNT, target_ino)
+        );
+
+        // Scoped walks: BENEATH blocks escaping start via .. or absolute symlink; IN_ROOT clamps.
+        assert_eq!(
+            vfs.walk_resolve(
+                ps,
+                cred,
+                &sub_node,
+                &sub_node,
+                b"up_dir",
+                true,
+                resolve::BENEATH
+            ),
+            Err(Errno::EXDEV)
+        );
+        assert_eq!(
+            vfs.walk_resolve(
+                ps,
+                cred,
+                &chain_node,
+                &chain_node,
+                b"sub/up_dir/",
+                true,
+                resolve::BENEATH
+            )
+            .map(|(n, _)| n),
+            Ok(sub_node.clone())
+        );
+        assert_eq!(
+            vfs.walk_resolve(
+                ps,
+                cred,
+                &sub_node,
+                &sub_node,
+                b"../.././up_dir",
+                false,
+                resolve::IN_ROOT
+            )
+            .map(|(n, _)| n),
+            Ok(Node::Store(
+                ROOT_MOUNT,
+                store.lookup(sub, b"up_dir").unwrap().unwrap()
+            ))
+        );
+
+        drop(vfs);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cached_readlink_and_access_match_full_semantics() {
+        let (vfs, dir) = sample("cached-readlink-access");
+        let ps = &Empty;
+        let root_cred = Cred::root();
+        let store = vfs.store();
+        let bin = store.lookup(ROOT, b"bin").unwrap().unwrap();
+        let (plain_ino, _) = store.create_file(bin, b"plain", 0o644, 0, 0).unwrap();
+        let (imm_ino, _) = store.create_file(bin, b"imm", 0o644, 0, 0).unwrap();
+        store
+            .set_flags(imm_ino, store::inode_flags::IMMUTABLE)
+            .unwrap();
+        let (owned_ro, _) = store
+            .create_file(bin, b"owned_ro", 0o400, 1000, 1000)
+            .unwrap();
+        let (other_file, _) = store.create_file(bin, b"other", 0o660, 2000, 2000).unwrap();
+        let fifo_ino = store
+            .mknod(bin, b"pipe", mode::S_IFIFO | 0o644, 0, 0, 0)
+            .unwrap();
+        store
+            .symlink(ROOT, b"dangling", b"/no/such/file", 0, 0)
+            .unwrap();
+        // File with extended access ACL (0o640 + named user 1000 r--, mask r--).
+        let (acl_ino, _) = store.create_file(bin, b"acl", 0o640, 0, 0).unwrap();
+        let acl_entries: [acl::AclEntry; 5] = [
+            (0x01, 6, u32::MAX),
+            (acl::ACL_USER, 4, 1000),
+            (0x04, 4, u32::MAX),
+            (0x10, 4, u32::MAX),
+            (0x20, 0, u32::MAX),
+        ];
+        store
+            .set_xattr(
+                acl_ino,
+                acl::ACL_ACCESS,
+                &acl::acl_encode(&acl_entries),
+                false,
+                false,
+            )
+            .unwrap();
+
+        // Warm the store cache by resolving all test paths and reading symlink targets.
+        for (p, follow) in [
+            (&b"/bin/busybox"[..], true),
+            (b"/bin/plain", true),
+            (b"/bin/imm", true),
+            (b"/bin/owned_ro", true),
+            (b"/bin/other", true),
+            (b"/bin/pipe", true),
+            (b"/bin/acl", true),
+            (b"/usr/bin/env", false),
+            (b"/usr/bin/rel", false),
+            (b"/bindir", false),
+            (b"/bindir/", false),
+            (b"/dangling", false),
+            (b"/dangling", true),
+            (b"/missing", true),
+        ] {
+            if let Ok(Node::Store(_, ino)) =
+                vfs.resolve(ps, &root_cred, &Node::ROOT, &Node::ROOT, p, follow)
+            {
+                let _ = store.attrs(ino);
+                let _ = store.readlink(ino);
+            }
+        }
+        let _ = store.lookup(ROOT, b"no");
+        let _ = (plain_ino, fifo_ino, owned_ro, other_file);
+
+        let cached = vfs.cached();
+        let mut buf = [0u8; 64];
+
+        // ---- Cached::readlink ----
+        assert_eq!(
+            cached.readlink(ROOT, ROOT, b"/usr/bin/env", &mut buf),
+            Some(Ok(b"/bin/busybox".len()))
+        );
+        assert_eq!(&buf[..b"/bin/busybox".len()], b"/bin/busybox");
+
+        // Truncated buffer copies exact prefix and returns buf.len().
+        let mut small = [0u8; 4];
+        assert_eq!(
+            cached.readlink(ROOT, ROOT, b"/usr/bin/env", &mut small),
+            Some(Ok(4))
+        );
+        assert_eq!(&small, b"/bin");
+
+        // Empty buffer -> EINVAL; empty path -> None (BKL fallback).
+        assert_eq!(
+            cached.readlink(ROOT, ROOT, b"/usr/bin/env", &mut []),
+            Some(Err(Errno::EINVAL))
+        );
+        assert_eq!(cached.readlink(ROOT, ROOT, b"", &mut buf), None);
+
+        // Non-symlink (regular file, directory, trailing slash on symlink to dir) -> EINVAL.
+        assert_eq!(
+            cached.readlink(ROOT, ROOT, b"/bin/busybox", &mut buf),
+            Some(Err(Errno::EINVAL))
+        );
+        assert_eq!(
+            cached.readlink(ROOT, ROOT, b"/bin", &mut buf),
+            Some(Err(Errno::EINVAL))
+        );
+        assert_eq!(
+            cached.readlink(ROOT, ROOT, b"/bindir/", &mut buf),
+            Some(Err(Errno::EINVAL))
+        );
+
+        // Dangling symlink is still readable; missing name -> ENOENT; mount point -> None.
+        assert_eq!(
+            cached.readlink(ROOT, ROOT, b"/dangling", &mut buf),
+            Some(Ok(b"/no/such/file".len()))
+        );
+        assert_eq!(
+            cached.readlink(ROOT, ROOT, b"/missing", &mut buf),
+            Some(Err(Errno::ENOENT))
+        );
+        assert_eq!(cached.readlink(ROOT, ROOT, b"/proc", &mut buf), None);
+        assert_eq!(
+            cached.readlink(ROOT, ROOT, b"/never-looked-up", &mut buf),
+            None
+        );
+
+        // ---- Cached::access ----
+        let root_fast = CachedCred {
+            fsuid: 0,
+            cap_effective: root_cred.cap_effective,
+        };
+        let read_search_only = CachedCred {
+            fsuid: 1000,
+            cap_effective: 1 << cap::DAC_READ_SEARCH,
+        };
+        let unpriv = CachedCred {
+            fsuid: 1000,
+            cap_effective: 0,
+        };
+
+        // Invalid amode, empty path, and credentials without searches_all.
+        assert_eq!(
+            cached.access(ROOT, ROOT, b"/bin/busybox", 8, true, root_fast),
+            Some(Err(Errno::EINVAL))
+        );
+        assert_eq!(cached.access(ROOT, ROOT, b"", 0, true, root_fast), None);
+        assert_eq!(
+            cached.access(ROOT, ROOT, b"/bin/busybox", 0, true, unpriv),
+            None
+        );
+
+        // Root with CAP_DAC_OVERRIDE: F_OK/R_OK/W_OK/X_OK on exec vs non-exec regular files.
+        assert_eq!(
+            cached.access(
+                ROOT,
+                ROOT,
+                b"/bin/busybox",
+                MAY_READ | MAY_WRITE | MAY_EXEC,
+                true,
+                root_fast
+            ),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            cached.access(
+                ROOT,
+                ROOT,
+                b"/bin/plain",
+                MAY_READ | MAY_WRITE,
+                true,
+                root_fast
+            ),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            cached.access(ROOT, ROOT, b"/bin/plain", MAY_EXEC, true, root_fast),
+            Some(Err(Errno::EACCES))
+        );
+        assert_eq!(
+            cached.access(
+                ROOT,
+                ROOT,
+                b"/bin",
+                MAY_READ | MAY_WRITE | MAY_EXEC,
+                true,
+                root_fast
+            ),
+            Some(Ok(()))
+        );
+
+        // Dangling symlink: follow=true -> ENOENT, follow=false (AT_SYMLINK_NOFOLLOW) -> Ok.
+        assert_eq!(
+            cached.access(ROOT, ROOT, b"/dangling", 0, true, root_fast),
+            Some(Err(Errno::ENOENT))
+        );
+        assert_eq!(
+            cached.access(
+                ROOT,
+                ROOT,
+                b"/dangling",
+                MAY_READ | MAY_WRITE | MAY_EXEC,
+                false,
+                root_fast
+            ),
+            Some(Ok(()))
+        );
+
+        // Immutable file: F_OK and R_OK ok, W_OK -> EPERM (before DAC).
+        assert_eq!(
+            cached.access(ROOT, ROOT, b"/bin/imm", 0, true, root_fast),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            cached.access(ROOT, ROOT, b"/bin/imm", MAY_READ, true, root_fast),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            cached.access(ROOT, ROOT, b"/bin/imm", MAY_WRITE, true, root_fast),
+            Some(Err(Errno::EPERM))
+        );
+        assert_eq!(
+            cached.access(
+                ROOT,
+                ROOT,
+                b"/bin/imm",
+                MAY_WRITE | MAY_EXEC,
+                true,
+                root_fast
+            ),
+            Some(Err(Errno::EPERM))
+        );
+
+        // Extended ACL on non-exec file with X_OK falls back to BKL.
+        assert_eq!(
+            cached.access(ROOT, ROOT, b"/bin/acl", MAY_EXEC, true, root_fast),
+            None
+        );
+
+        // CAP_DAC_READ_SEARCH only: R_OK allowed, owned W_OK denied by mode, non-owned W_OK -> None.
+        assert_eq!(
+            cached.access(
+                ROOT,
+                ROOT,
+                b"/bin/owned_ro",
+                MAY_READ,
+                true,
+                read_search_only
+            ),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            cached.access(
+                ROOT,
+                ROOT,
+                b"/bin/owned_ro",
+                MAY_WRITE,
+                true,
+                read_search_only
+            ),
+            Some(Err(Errno::EACCES))
+        );
+        assert_eq!(
+            cached.access(ROOT, ROOT, b"/bin/other", MAY_WRITE, true, read_search_only),
+            None
+        );
+
+        // MS_NOEXEC on ROOT_MOUNT denies X_OK on regular files (even ahead of IMMUTABLE),
+        // while directories and symlinks still allow X_OK.
+        vfs.update_mount(ROOT_MOUNT, |m| m.flags |= ms::NOEXEC);
+        let noexec_cached = vfs.cached();
+        assert_eq!(
+            noexec_cached.access(ROOT, ROOT, b"/bin/busybox", MAY_EXEC, true, root_fast),
+            Some(Err(Errno::EACCES))
+        );
+        assert_eq!(
+            noexec_cached.access(
+                ROOT,
+                ROOT,
+                b"/bin/imm",
+                MAY_WRITE | MAY_EXEC,
+                true,
+                root_fast
+            ),
+            Some(Err(Errno::EACCES))
+        );
+        assert_eq!(
+            noexec_cached.access(ROOT, ROOT, b"/bin", MAY_EXEC, true, root_fast),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            noexec_cached.access(ROOT, ROOT, b"/dangling", MAY_EXEC, false, root_fast),
+            Some(Ok(()))
+        );
+        vfs.update_mount(ROOT_MOUNT, |m| m.flags &= !ms::NOEXEC);
+
+        // Read-only superblock (ROOT_DEV) denies W_OK on reg/dir/symlink with EROFS (after DAC),
+        // while special files (FIFO) remain writable.
+        vfs.set_sb_flags(ROOT_DEV, ms::RDONLY);
+        let ro_cached = vfs.cached();
+        assert_eq!(
+            ro_cached.access(ROOT, ROOT, b"/bin/busybox", MAY_WRITE, true, root_fast),
+            Some(Err(Errno::EROFS))
+        );
+        assert_eq!(
+            ro_cached.access(ROOT, ROOT, b"/bin", MAY_WRITE, true, root_fast),
+            Some(Err(Errno::EROFS))
+        );
+        assert_eq!(
+            ro_cached.access(ROOT, ROOT, b"/dangling", MAY_WRITE, false, root_fast),
+            Some(Err(Errno::EROFS))
+        );
+        // DAC check precedes EROFS: W_OK | X_OK on non-exec 0644 file gives EACCES, not EROFS.
+        assert_eq!(
+            ro_cached.access(
+                ROOT,
+                ROOT,
+                b"/bin/plain",
+                MAY_WRITE | MAY_EXEC,
+                true,
+                root_fast
+            ),
+            Some(Err(Errno::EACCES))
+        );
+        // Special node (FIFO) is exempt from EROFS.
+        assert_eq!(
+            ro_cached.access(ROOT, ROOT, b"/bin/pipe", MAY_WRITE, true, root_fast),
+            Some(Ok(()))
+        );
+        // Mount crossing falls back to BKL.
+        assert_eq!(
+            ro_cached.access(ROOT, ROOT, b"/proc", 0, true, root_fast),
+            None
+        );
+
+        drop(vfs);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
