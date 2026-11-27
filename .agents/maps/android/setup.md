@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (full mapping, 15 claims independently checked across package verification, store publication, per-start setup, OpenRC, account selection and shell integration)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: independent per-start configuration write degradation on existing stores via `Rootfs.prepareStart`, marker read hardening, and sub-step isolation)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: single-session `withStore` batching across `prepareStart`, `configure`, `updateProfile` and OpenRC staging, unchanged-file write skipping, and `openrc-setup-done` precheck)
 
 ## Responsibilities
 
@@ -38,7 +38,8 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 
 - `Rootfs` — object: `Distro` (`ALPINE`, `DEBIAN`: label, download, mirrors, probe path),
   `Download` (urls, sha256, size), `Cancelled` and the private `Oversize` (both `IOException`s),
-  `Account` (name, uid, gid, home from `/etc/passwd`), `access` (a `ReentrantReadWriteLock`).
+  `Account` (name, uid, gid, home from `/etc/passwd`), `StartPreparation` (`browserReady`,
+  `openRcDone`), internal `StoreAccess` (session read/write abstraction), `access` (a `ReentrantReadWriteLock`).
   - `ALPINE`: labelled with the branch the APK bundles (`BuildConfig.ALPINE_BRANCH`); no download;
     mirrors are URLs ending in `/alpine` (dl-cdn, Tsinghua, USTC, Aliyun), probed at the branch's
     `main/aarch64/APKINDEX.tar.gz`.
@@ -81,10 +82,12 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 
 - `Rootfs.prepare(distro)` (with an optional store, used by the instrumentation tests), `download`,
   `fetch`, `tarball`, `deleteTarball`, `isReady`, `installed`, `importing`, `store`, `reset`, `access`.
-- Before every start: `prepareStart` (running `ensureNetworkConfig`, `ensureContainersConfig`,
-  `ensureLoginTools`, `ensureBashStartup`, `ensureGpuCommand`, `ensureBrowser` and `updateProfile`
-  in order, fatal on fresh imports and degrading each step independently on existing stores);
-  around boot: `ensureOpenRc`, `boot`, `PREFER_OSCLOCK`, `failedServices`.
+- Before every start: `prepareStart` (opening one `Native.withStore` session to run
+  `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureBashStartup`,
+  `ensureGpuCommand`, `ensureBrowser`, `updateProfile` and the Alpine `openrc-setup-done` precheck
+  in order, fatal on fresh imports, degrading each step independently on existing stores, and
+  returning `StartPreparation`); around boot: `ensureOpenRc`, `boot`, `PREFER_OSCLOCK`,
+  `failedServices`.
 - Mirrors: the service supplies `probeMirrors` to `prepare`. The default imports offline with official sources when the tarball is local.
 - Accounts: `loginAccount`, `regularAccounts`, `LoginRules.poll` (with `REFRESH_RULES`).
 - `scripts/fetch-rootfs [outdir]` (build-time download of the Alpine minirootfs and the bundled
@@ -163,12 +166,15 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 ### Before every start and boot
 
 - `ensureGpuCommand` installs `/usr/local/bin/appine-gpu` (0755) when missing, called before
-  kernel start only when Vulkan GPU is enabled. The launcher
+  kernel start only when Vulkan GPU is enabled, skipping asset reads and writes when a regular
+  file is already present. The launcher
   finds the packaged Alpine or Debian Venus manifest and execs the supplied command with
   `VK_DRIVER_FILES` set for that invocation.
 - `ensureBrowser` installs `xdg-open.sh` as `/usr/local/bin/xdg-open` (0755) on either distro.
-  It preserves custom launchers, replacing only the known previous Appine OSC helper by SHA-256.
-  Before every kernel start it refreshes the static `/usr/local/libexec/appine-open-url` (0755)
+  It preserves custom launchers, replacing only the known previous Appine OSC helper by SHA-256
+  and skipping asset reads and writes when a non-legacy regular file is already present.
+  Before every kernel start it refreshes the static `/usr/local/libexec/appine-open-url` (0755,
+  skipping the write when existing bytes match)
   and `/etc/appine/browser` (0644: current loopback port and capability, shared by guest users).
   The shim execs that client; `ConsolePty` sets `BROWSER` to the shim (android/vt).
   The login profile also exports that default when `BROWSER` is unset or empty and the shim is
@@ -179,21 +185,25 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   Each invocation rereads the configuration and sends one HTTP(S) URL without using a TTY or
   inherited tab token; success acknowledges Android intent acceptance, not page loading or login.
 - After import, `TerminalService.startKernel` calls `Rootfs.prepareStart` before opening the kernel
-  under the provider write lock: network configuration, container defaults, login tools, bash
-  startup files, GPU launcher (when enabled), browser endpoint/launcher and profile/rc-hook updates.
+  under the provider write lock: in one `Native.withStore` session it runs network configuration,
+  container defaults, login tools, bash startup files, GPU launcher (when enabled), browser
+  endpoint/launcher, profile/rc-hook updates and an Alpine `openrc-setup-done` precheck.
   On fresh imports (`importing = true`), the first I/O failure aborts startup. On existing stores
   (`importing = false`), each helper and independent sub-step (e.g., `doas.apk` vs `20-wheel.conf`,
   `/etc/skel` vs per-user bash homes, `appine-open-url`/`browser`/`xdg-open`, profile companion
-  writes, Debian bash vs zsh rc hooks) catches `IOException`, reports it to the caller's `onFailure`
+  writes, Debian bash vs zsh rc hooks, or opening the store itself) catches `IOException`, reports it to the caller's `onFailure`
   callback and continues so a symlinked directory, custom file or full disk cannot lock the user
-  out of a repair terminal. `ensureBrowser` returns whether `/etc/appine/browser` was written so
-  `TerminalService` can close an unconfigured `BrowserBridge`. Unreadable one-time markers
+  out of a repair terminal. `prepareStart` returns `StartPreparation(browserReady, openRcDone)` so
+  `TerminalService` can close an unconfigured `BrowserBridge` and skip calling `ensureOpenRc` on
+  normal Alpine starts when `openrc-setup-done` is already a regular file (an absent or obstructed
+  marker leaves `openRcDone` false for `ensureOpenRc` to handle). Unreadable one-time markers
   (`bash-startup-done`, `debian-bashrc-hook-done`, `zsh-rc-hook-done`) report to `onFailure` and
   skip their one-time migration rather than aborting startup or re-seeding user-deleted files;
   `ensureBashStartup` writes `bash-startup-done` only when every seeding write succeeded.
   The network file defaults to loopback only. The rootless Podman fragment selects host networking
   because pasta and slirp4netns require a TUN device. Both defaults preserve an existing file.
-- Alpine refreshes the bundled doas APK and upgrades the stock wheel rule to preserve ash's
+- Alpine refreshes the bundled doas APK (skipping the write when the existing file is
+  byte-identical) and upgrades the stock wheel rule to preserve ash's
   `ENV`. Once per store, `ensureBashStartup` seeds missing startup files in `/etc/skel` and in
   existing absolute homes for root and UID 1000–65533 bash accounts with valid ownership.
   Existing `.bash_profile`, `.bash_login` or `.profile` takes precedence. The marker lets a
@@ -406,8 +416,9 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 
 ### Outbound
 
-- `Native.importRootfs`, `syncRootfs`, `writeFile` (creates parent directories, does not follow
-  symlinks), `readFile` (null when missing), `loginRuleInputs`, `spawn` and `waitFor` (`android/native`);
+- `Native.importRootfs`, `syncRootfs`, `withStore`, `storeWriteFile`, `storeReadFile`,
+  `writeFile` (creates parent directories, does not follow symlinks), `readFile` (null when
+  missing), `loginRuleInputs`, `spawn` and `waitFor` (`android/native`);
   `HttpURLConnection` (system proxy); `BuildConfig` (Alpine branch); the bundled assets
   (`android/build`).
 

@@ -133,4 +133,161 @@ class StartConfigTest {
 
         assertTrue(h.bridge.closed)
     }
+
+    private class FakeStoreAccess : Rootfs.StoreAccess {
+        val files = linkedMapOf<String, ByteArray>()
+        val obstructed = mutableSetOf<String>()
+        val writes = mutableListOf<String>()
+        val mutatingWrites = mutableListOf<String>()
+
+        override fun readFile(path: String): ByteArray? {
+            if (path in obstructed) throw IOException("obstructed: $path")
+            return files[path]?.copyOf()
+        }
+
+        override fun writeFile(
+            path: String,
+            data: ByteArray,
+            mode: Int,
+            overwrite: Boolean,
+            uid: Int,
+            gid: Int,
+        ) {
+            writes.add(path)
+            if (path in obstructed) throw IOException("obstructed: $path")
+            if (!overwrite && path in files) return
+            files[path] = data.copyOf()
+            mutatingWrites.add(path)
+        }
+    }
+
+    @Test
+    fun prepareStartSkipsUnchangedAssetsAndPrechecksOpenRcMarker() {
+        val store = FakeStoreAccess()
+        val assetsRead = mutableListOf<String>()
+        val assets = mutableMapOf(
+            "doas.apk" to "doas-v1".toByteArray(),
+            "appine-open-url" to "open-url-v1".toByteArray(),
+            "xdg-open.sh" to "#!/bin/sh\nexec /usr/local/libexec/appine-open-url \"$1\"\n".toByteArray(),
+            "appine-gpu.sh" to "#!/bin/sh\nexec \"$@\"\n".toByteArray(),
+            "profile.sh" to "# current profile\n".toByteArray(),
+            "ashrc.sh" to "# ashrc\n".toByteArray(),
+            "bashrc.sh" to "# bashrc\n".toByteArray(),
+            "zshrc.sh" to "# zshrc\n".toByteArray(),
+        )
+        fun readAsset(name: String): ByteArray {
+            assetsRead.add(name)
+            return assets.getValue(name)
+        }
+
+        // Seed an already-configured Alpine store.
+        store.files["/etc/network/interfaces"] = "auto lo\niface lo inet loopback\n".toByteArray()
+        store.files["/etc/containers/containers.rootless.conf.d/appine.conf"] = "[containers]\nnetns = \"host\"\n".toByteArray()
+        store.files["/var/cache/appine/doas.apk"] = assets.getValue("doas.apk")
+        store.files["/var/lib/appine/bash-startup-done"] = ByteArray(0)
+        store.files["/usr/local/bin/appine-gpu"] = assets.getValue("appine-gpu.sh")
+        store.files["/usr/local/libexec/appine-open-url"] = assets.getValue("appine-open-url")
+        store.files["/usr/local/bin/xdg-open"] = assets.getValue("xdg-open.sh")
+        store.files["/etc/profile.d/appine.sh"] = assets.getValue("profile.sh")
+        store.files["/var/lib/appine/zsh-rc-hook-done"] = ByteArray(0)
+        store.files["/var/lib/appine/openrc-setup-done"] = ByteArray(0)
+
+        val prep = Rootfs.prepareStart(
+            access = store,
+            distro = Rootfs.Distro.ALPINE,
+            gpu = true,
+            browserConfiguration = "12345\ntoken-1\n",
+            importing = false,
+            readAsset = ::readAsset,
+        )
+
+        assertTrue(prep.browserReady)
+        assertTrue(prep.openRcDone)
+        // Only /etc/appine/browser actually wrote data; doas.apk, appine-open-url, xdg-open and
+        // appine-gpu skipped redundant writes, and xdg-open.sh / appine-gpu.sh were not even read.
+        assertEquals(listOf(BrowserBridge.CONFIG_PATH), store.mutatingWrites)
+        assertFalse(assetsRead.contains("xdg-open.sh"))
+        assertFalse(assetsRead.contains("appine-gpu.sh"))
+        assertEquals("12345\ntoken-1\n", store.files[BrowserBridge.CONFIG_PATH]?.decodeToString())
+
+        // After an app upgrade changes doas.apk and appine-open-url, both are refreshed.
+        store.mutatingWrites.clear()
+        assets["doas.apk"] = "doas-v2".toByteArray()
+        assets["appine-open-url"] = "open-url-v2".toByteArray()
+        val upgraded = Rootfs.prepareStart(
+            access = store,
+            distro = Rootfs.Distro.ALPINE,
+            gpu = true,
+            browserConfiguration = "23456\ntoken-2\n",
+            importing = false,
+            readAsset = ::readAsset,
+        )
+
+        assertTrue(upgraded.browserReady)
+        assertTrue(upgraded.openRcDone)
+        assertEquals(
+            listOf("/var/cache/appine/doas.apk", "/usr/local/libexec/appine-open-url", BrowserBridge.CONFIG_PATH),
+            store.mutatingWrites,
+        )
+        assertEquals("doas-v2", store.files["/var/cache/appine/doas.apk"]?.decodeToString())
+        assertEquals("open-url-v2", store.files["/usr/local/libexec/appine-open-url"]?.decodeToString())
+    }
+
+    @Test
+    fun prepareStartLeavesObstructedOpenRcMarkerToEnsureOpenRc() {
+        val store = FakeStoreAccess()
+        store.files["/var/lib/appine/bash-startup-done"] = ByteArray(0)
+        store.files["/var/lib/appine/zsh-rc-hook-done"] = ByteArray(0)
+        store.obstructed.add("/var/lib/appine/openrc-setup-done")
+        val failed = mutableListOf<String>()
+
+        val prep = Rootfs.prepareStart(
+            access = store,
+            distro = Rootfs.Distro.ALPINE,
+            gpu = false,
+            browserConfiguration = "12345\ntoken\n",
+            importing = false,
+            onFailure = { step, _ -> failed.add(step) },
+            readAsset = { "asset".toByteArray() },
+        )
+
+        assertTrue(prep.browserReady)
+        assertFalse(prep.openRcDone)
+        assertEquals(emptyList<String>(), failed)
+    }
+
+    @Test
+    fun prepareStartFailsFastOnImportAndDegradesOnExistingStore() {
+        val store = FakeStoreAccess()
+        store.files["/var/lib/appine/bash-startup-done"] = ByteArray(0)
+        store.files["/var/lib/appine/zsh-rc-hook-done"] = ByteArray(0)
+        store.obstructed.add("/var/cache/appine/doas.apk")
+        store.obstructed.add(BrowserBridge.CONFIG_PATH)
+
+        assertThrows(IOException::class.java) {
+            Rootfs.prepareStart(
+                access = store,
+                distro = Rootfs.Distro.ALPINE,
+                browserConfiguration = "12345\ntoken\n",
+                importing = true,
+                readAsset = { "asset".toByteArray() },
+            )
+        }
+        assertFalse("/usr/local/libexec/appine-open-url" in store.files)
+
+        val failed = mutableListOf<String>()
+        val prep = Rootfs.prepareStart(
+            access = store,
+            distro = Rootfs.Distro.ALPINE,
+            browserConfiguration = "12345\ntoken\n",
+            importing = false,
+            onFailure = { step, _ -> failed.add(step) },
+            readAsset = { "asset".toByteArray() },
+        )
+
+        assertFalse(prep.browserReady)
+        assertEquals(listOf("/var/cache/appine/doas.apk", BrowserBridge.CONFIG_PATH), failed)
+        assertTrue("/usr/local/libexec/appine-open-url" in store.files)
+        assertTrue("/usr/local/bin/xdg-open" in store.files)
+    }
 }

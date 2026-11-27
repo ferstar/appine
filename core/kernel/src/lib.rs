@@ -104,6 +104,54 @@ pub fn sync_store(store: &Path) -> Result<(), Errno> {
     appine_hal::syncfs(std::os::fd::AsRawFd::as_raw_fd(&dir)).map_err(Errno)
 }
 
+fn write_file_committed(
+    store: &Store,
+    path: &str,
+    data: &[u8],
+    mode: u32,
+    overwrite: bool,
+    uid: u32,
+    gid: u32,
+) -> Result<(), Errno> {
+    let r = vfs::write_file_owned(store, path.as_bytes(), data, mode, overwrite, uid, gid);
+    // Commit immediately so an error on a later step in a batched session cannot roll back an
+    // earlier independent write, and surface any commit failure (such as ENOSPC) on this step.
+    let commit = store.commit();
+    r.and(commit)
+}
+
+/// Opens the inode store once without spawning a background reaper thread and runs `f` on it
+/// (for batched host configuration reads and writes such as `Rootfs.prepareStart`).
+pub fn with_store<R>(store: &Path, f: impl FnOnce(&Store) -> Result<R, Errno>) -> Result<R, Errno> {
+    bug::host_call("with_store", || {
+        let store = Store::open_short(store)?;
+        f(&store)
+    })
+    .unwrap_or(Err(Errno::EIO))
+}
+
+/// Writes a file on an already-open [`Store`] (from [`with_store`]) and commits any metadata
+/// changes immediately without syncing the WAL. See [`vfs::write_file_owned`].
+pub fn write_file_in(
+    store: &Store,
+    path: &str,
+    data: &[u8],
+    mode: u32,
+    overwrite: bool,
+    uid: u32,
+    gid: u32,
+) -> Result<(), Errno> {
+    bug::host_call("write_file", || {
+        write_file_committed(store, path, data, mode, overwrite, uid, gid)
+    })
+    .unwrap_or(Err(Errno::EIO))
+}
+
+/// Reads a regular file on an already-open [`Store`] (from [`with_store`]). See [`vfs::read_file`].
+pub fn read_file_in(store: &Store, path: &str) -> Result<Vec<u8>, Errno> {
+    bug::host_call("read_file", || vfs::read_file(store, path.as_bytes())).unwrap_or(Err(Errno::EIO))
+}
+
 /// Writes a file in the inode store (for the host to prepare configuration files, such as
 /// `/etc/profile.d/appine.sh` on first start); `path` is a guest path, and new files belong to
 /// `uid` and `gid`. See [`vfs::write_file_owned`].
@@ -117,8 +165,8 @@ pub fn write_file(
     gid: u32,
 ) -> Result<(), Errno> {
     bug::host_call("write_file", || {
-        let store = Store::open(store, &[])?;
-        vfs::write_file_owned(&store, path.as_bytes(), data, mode, overwrite, uid, gid)
+        let store = Store::open_short(store)?;
+        write_file_committed(&store, path, data, mode, overwrite, uid, gid)
     })
     .unwrap_or(Err(Errno::EIO))
 }
@@ -127,7 +175,7 @@ pub fn write_file(
 /// a guest path. See [`vfs::read_file`].
 pub fn read_file(store: &Path, path: &str) -> Result<Vec<u8>, Errno> {
     bug::host_call("read_file", || {
-        let store = Store::open(store, &[])?;
+        let store = Store::open_short(store)?;
         vfs::read_file(&store, path.as_bytes())
     })
     .unwrap_or(Err(Errno::EIO))
@@ -140,7 +188,7 @@ pub fn read_file(store: &Path, path: &str) -> Result<Vec<u8>, Errno> {
 /// longer defers commits, so it is closed after every use rather than kept open.
 pub fn browse<R>(store: &Path, f: impl FnOnce(&Store) -> Result<R, Errno>) -> Result<R, Errno> {
     bug::host_call("browse", || {
-        let store = Store::open(store, &[])?;
+        let store = Store::open_short(store)?;
         f(&store)
     })
     .unwrap_or(Err(Errno::EIO))
@@ -158,7 +206,7 @@ pub fn browse_changing<R>(
 ) -> Result<R, Errno> {
     bug::host_call("browse", || {
         let mut changes = Vec::new();
-        let r = Store::open(store, &[]).and_then(|s| f(&s, &mut changes));
+        let r = Store::open_short(store).and_then(|s| f(&s, &mut changes));
         machine::store_changed(store, &changes);
         r
     })

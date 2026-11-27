@@ -4,6 +4,8 @@
 > See `.agents/decisions/android/native.md` for the paired decision history, including pre-split decisions for android/build and android/tests.
 >
 > Verified: 2026-11-26 (full refresh: 15 adversarial claims checked by independent verifier — 14 confirmed, 1 partial corrected below, 0 refuted; precision fixes and confirmed bugs/debts recorded)
+>
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: stack-scoped thread-local store sessions via `withStore`, `storeWriteFile` and `storeReadFile`)
 
 ## Responsibilities
 
@@ -16,7 +18,7 @@ Runtime JNI, app startup, Venus and the guest browser client span `Native.kt`, `
 
 ## Public entry points
 
-All 41 `@JvmStatic external` methods in `Native.kt` have matching `Java_io_github_mthli_appine_Native_…` symbols in Android-only `lib.rs`. Exactly 19 declare `@Throws(IOException::class)` — four rootfs calls, twelve browse calls (all except `browseWritten`), `start`, `openConsole`, `spawn`. Omitted result types mean `Unit`. `GpuService.runWorker` and `VtNative` are counted separately.
+All 44 `@JvmStatic external` methods in `Native.kt` have matching `Java_io_github_mthli_appine_Native_…` symbols in Android-only `lib.rs`. Exactly 22 declare `@Throws(IOException::class)` — seven rootfs calls, twelve browse calls (all except `browseWritten`), `start`, `openConsole`, `spawn`. Omitted result types mean `Unit`. `GpuService.runWorker` and `VtNative` are counted separately.
 
 ### Initialization and rootfs
 
@@ -25,6 +27,9 @@ All 41 `@JvmStatic external` methods in `Native.kt` have matching `Java_io_githu
 | `private init(verbose: Boolean)` | `Native` loads `appine` and passes `BuildConfig.DEBUG`. |
 | `importRootfs(store: String, tarball: String)` | Import tar.gz into a new store in an empty directory. |
 | `syncRootfs(store: String)` | Sync the store's host filesystem before rename. |
+| `withStore(store: String, action: LongConsumer)` | Open one short-lived store session without a background reaper thread, bind a thread-local handle for the synchronous callback, always release the handle before dropping the store, and preserve any Java exception thrown by `action`. |
+| `storeWriteFile(session: Long, path: String, data: ByteArray, mode: Int, overwrite: Boolean, uid: Int = 0, gid: Int = 0)` | Write on an active thread-local `withStore` session (`EBADF` if closed, cross-thread or re-entrant), committing metadata per write without WAL sync. Same mode, ownership and overwrite rules as `writeFile`. |
+| `storeReadFile(session: Long, path: String): ByteArray?` | Read a regular file on an active thread-local `withStore` session, returning null on `ENOENT` and `IOException` on other errnos (`EBADF` if invalid). |
 | `writeFile(store: String, path: String, data: ByteArray, mode: Int, overwrite: Boolean, uid: Int = 0, gid: Int = 0)` | Cast mode and IDs to `u32`. New files take these IDs and low 12 mode bits. Skip existing entries unless overwriting. A rewritten regular file keeps owner and mode. |
 | `readFile(store: String, path: String): ByteArray?` | Return regular-file bytes, null on `ENOENT`, `IOException` for other errnos. |
 

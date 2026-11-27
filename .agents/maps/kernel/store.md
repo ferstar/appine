@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (namespace and cache, object sharing and lifetimes, transaction and recovery ordering, import and provider authorization checked against the store and its callers)
 >
-> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: cache regular-file host stats and held sizes, release `Meta::lock.read()` on `Reader::stat` misses guarded by `Meta::mutations`, and two-generation cache rotation)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: `Store::open_short` without a background reaper thread for host calls and `with_store`/`write_file_in`/`read_file_in` batched configuration wrappers)
 
 ## Responsibilities
 
@@ -23,8 +23,8 @@ provides:
 - importing a rootfs tarball, and a path-based browse API for the host.
 
 Root: `core/kernel/src/vfs/store.rs`, `vfs/import.rs`, `vfs/browse.rs`, and the host wrappers in
-`core/kernel/src/lib.rs` (`import_rootfs`, `sync_store`, `browse`, `browse_changing`,
-`write_file`, `read_file`).
+`core/kernel/src/lib.rs` (`import_rootfs`, `sync_store`, `with_store`, `write_file_in`,
+`read_file_in`, `browse`, `browse_changing`, `write_file`, `read_file`).
 
 Outside the module: path resolution, the no-BKL resolver and namespace and metadata syscalls
 (`kernel/vfs`), opening host objects/memfds (`kernel/files`), file I/O and moving open files to an unshared object (`kernel/fileio`), mounts
@@ -73,7 +73,8 @@ provider and rootfs installation UI (`android`).
 ## Public entry points
 
 - **Lifecycle**: `Store::create(dir)` (new store, `EEXIST` if one exists), `Store::open(dir,
-  volatile)`, `Drop` (final commit, reaper join), `guard_with_bkl`.
+  volatile)`, `Store::open_short(dir)` (short-lived host open with no volatile dirs and no
+  background reaper thread), `Drop` (final commit, reaper join or inline reap), `guard_with_bkl`.
 - **Reads**: `lookup`, `name_of`, `stat`, `stat_open`, `attrs`, `kind`, `readlink`, `parent`,
   `tree_root`, `readdir`, xattr reads, `has_file_caps`, `fs_stats`; `snapshot` (one read transaction);
   `Meta::reader` (no-BKL).
@@ -87,9 +88,10 @@ provider and rootfs installation UI (`android`).
   `set_mode`, `set_owner`, `set_owner_mode`, `set_flags`/`set_flags_open`, `remove_privs`, xattr writes, `set_mtime`,
   `set_times`, `set_times_open`, `accessed`, `object_modified`; `transaction`.
 - **Durability**: `commit`, `commit_due`, `set_waker`, `Meta::sync_metadata`, `Meta::sync_all`.
-- **Host-facing**: `import_rootfs`, `sync_store`, `browse` (stat, list, open, text sniffing,
-  search), `browse_changing` (create, import a file, remove, rename, move, open for writing, written),
-  `take_changed_dirs`.
+- **Host-facing**: `import_rootfs`, `sync_store`, `with_store`, `write_file_in` (commits metadata
+  immediately without WAL sync to isolate batched steps), `read_file_in`, `write_file`,
+  `read_file`, `browse` (stat, list, open, text sniffing, search), `browse_changing` (create,
+  import a file, remove, rename, move, open for writing, written), `take_changed_dirs`.
 
 ## Data flow / lifecycle
 
@@ -239,7 +241,10 @@ provider and rootfs installation UI (`android`).
 
 ### Reaper and checkpoints
 
-- Each store connection, including a short-lived host connection, starts and joins its own reaper.
+- Long-lived store connections (`Store::create`, `Store::open`) start and join their own reaper;
+  short-lived host connections (`Store::open_short`, used by `with_store`, `write_file`,
+  `read_file`, `browse` and `browse_changing`) skip spawning a reaper thread, rely on SQLite's
+  auto-checkpoint and reap any doomed objects inline after WAL sync.
   A failed WAL sync leaves the objects queued. The retry delay doubles from 50 ms to 1 s.
   A successful external `Meta::sync_metadata` or `Meta::sync_all` wakes a pending retry immediately.
   On shutdown the reaper bypasses the delay and exits if the final sync fails. When unlinking an

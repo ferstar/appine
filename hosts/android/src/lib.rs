@@ -25,7 +25,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, Once, PoisonError};
 
+use appine_kernel::errno::Errno;
 use appine_kernel::vfs::browse;
+use appine_kernel::vfs::store::Store;
 use appine_kernel::{ExitStatus, HostRoute, Machine, MachineOptions, Power, Stdio, Tier};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString};
@@ -182,6 +184,88 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_syncRootfs<'l>(
     })
 }
 
+/// Opens the store once without a background reaper thread and passes a thread-local session
+/// handle to `action` (`LongConsumer.accept(long)`).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_withStore<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    store: JString<'l>,
+    action: JObject<'l>,
+) {
+    guarded!("Native.withStore", throws env, (), {
+        let Some(store) = string(&mut env, &store) else {
+            return;
+        };
+        let r = appine_kernel::with_store(store.as_ref(), |s| {
+            let guard = StoreSessionGuard::new(s);
+            env.call_method(&action, "accept", "(J)V", &[guard.id.into()])
+                .map(drop)
+                .map_err(|_| Errno::EIO)
+        });
+        if let Err(e) = r
+            && !env.exception_check().unwrap_or(true)
+        {
+            throw(&mut env, format!("cannot open {store}: {e}"));
+        }
+    })
+}
+
+/// Writes a file on an active [`Java_io_github_mthli_appine_Native_withStore`] session.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_storeWriteFile<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    session: jlong,
+    path: JString<'l>,
+    data: JByteArray<'l>,
+    mode: jint,
+    overwrite: jboolean,
+    uid: jint,
+    gid: jint,
+) {
+    guarded!("Native.storeWriteFile", throws env, (), {
+        let Some(path) = string(&mut env, &path) else {
+            return;
+        };
+        let Ok(data) = env.convert_byte_array(&data) else {
+            return;
+        };
+        let r = with_store_session(session, |s| {
+            appine_kernel::write_file_in(
+                s,
+                &path,
+                &data,
+                mode as u32,
+                overwrite != 0,
+                uid as u32,
+                gid as u32,
+            )
+        });
+        if let Err(e) = r {
+            throw(&mut env, format!("cannot write {path}: {e}"));
+        }
+    })
+}
+
+/// Reads a regular file on an active [`Java_io_github_mthli_appine_Native_withStore`] session.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_storeReadFile<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    session: jlong,
+    path: JString<'l>,
+) -> jbyteArray {
+    guarded!("Native.storeReadFile", throws env, std::ptr::null_mut(), {
+        let Some(path) = string(&mut env, &path) else {
+            return std::ptr::null_mut();
+        };
+        let r = with_store_session(session, |s| appine_kernel::read_file_in(s, &path));
+        read_file_result(&mut env, &path, r)
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_writeFile<'l>(
     mut env: JNIEnv<'l>,
@@ -231,18 +315,95 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_readFile<'l>(
         let (Some(store), Some(path)) = (string(&mut env, &store), string(&mut env, &path)) else {
             return std::ptr::null_mut();
         };
-        match appine_kernel::read_file(store.as_ref(), &path) {
-            Ok(data) => env
-                .byte_array_from_slice(&data)
-                .map(JByteArray::into_raw)
-                .unwrap_or(std::ptr::null_mut()),
-            Err(appine_kernel::errno::Errno::ENOENT) => std::ptr::null_mut(),
-            Err(e) => {
-                throw(&mut env, format!("cannot read {path}: {e}"));
-                std::ptr::null_mut()
-            }
-        }
+        let r = appine_kernel::read_file(store.as_ref(), &path);
+        read_file_result(&mut env, &path, r)
     })
+}
+
+fn read_file_result(env: &mut JNIEnv<'_>, path: &str, result: Result<Vec<u8>, Errno>) -> jbyteArray {
+    match result {
+        Ok(data) => env
+            .byte_array_from_slice(&data)
+            .map(JByteArray::into_raw)
+            .unwrap_or(std::ptr::null_mut()),
+        Err(Errno::ENOENT) => std::ptr::null_mut(),
+        Err(e) => {
+            throw(env, format!("cannot read {path}: {e}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Active stack-scoped [`Store`] session bound to the opening thread for the duration of
+/// [`Java_io_github_mthli_appine_Native_withStore`].
+struct ActiveStoreSession {
+    store: *const Store,
+    in_use: bool,
+}
+
+static NEXT_STORE_SESSION: AtomicI64 = AtomicI64::new(1);
+
+thread_local! {
+    static STORE_SESSIONS: std::cell::RefCell<BTreeMap<jlong, ActiveStoreSession>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
+struct StoreSessionGuard {
+    id: jlong,
+}
+
+impl StoreSessionGuard {
+    fn new(store: &Store) -> Self {
+        let id = NEXT_STORE_SESSION.fetch_add(1, Ordering::Relaxed);
+        STORE_SESSIONS.with(|sessions| {
+            sessions.borrow_mut().insert(
+                id,
+                ActiveStoreSession {
+                    store: std::ptr::from_ref(store),
+                    in_use: false,
+                },
+            );
+        });
+        Self { id }
+    }
+}
+
+impl Drop for StoreSessionGuard {
+    fn drop(&mut self) {
+        STORE_SESSIONS.with(|sessions| {
+            sessions.borrow_mut().remove(&self.id);
+        });
+    }
+}
+
+fn with_store_session<R>(handle: jlong, f: impl FnOnce(&Store) -> Result<R, Errno>) -> Result<R, Errno> {
+    let ptr = STORE_SESSIONS.with(|sessions| {
+        let mut map = sessions.borrow_mut();
+        let entry = map.get_mut(&handle)?;
+        if entry.in_use {
+            return None;
+        }
+        entry.in_use = true;
+        Some(entry.store)
+    });
+    let Some(ptr) = ptr else {
+        return Err(Errno::EBADF);
+    };
+    struct BusyGuard(jlong);
+    impl Drop for BusyGuard {
+        fn drop(&mut self) {
+            STORE_SESSIONS.with(|sessions| {
+                if let Some(entry) = sessions.borrow_mut().get_mut(&self.0) {
+                    entry.in_use = false;
+                }
+            });
+        }
+    }
+    let _busy = BusyGuard(handle);
+    // SAFETY: `StoreSessionGuard` removes `handle` from this thread's map before the `Store` on
+    // `Native_withStore`'s stack is dropped, `STORE_SESSIONS` is thread-local so no other thread
+    // can observe `ptr`, and `in_use` prevents re-entrant access on the same handle.
+    f(unsafe { &*ptr })
 }
 
 // ---- The host browsing the store (DocumentsProvider, the android/documents map) ----

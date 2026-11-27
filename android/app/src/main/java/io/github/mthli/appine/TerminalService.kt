@@ -785,6 +785,7 @@ class TerminalService : Service() {
     private fun startKernel(tier: Int, gpu: Boolean, importing: Boolean): StartedKernel {
         val store = Rootfs.store(this).path
         val distro = Rootfs.installed(this) ?: Rootfs.Distro.ALPINE
+        var openRcDone = false
         val browser = prepareStartBridge(
             importing = importing,
             onFailure = { step, e ->
@@ -797,7 +798,7 @@ class TerminalService : Service() {
                 }
             },
             configure = { bridge, onFailure ->
-                Rootfs.prepareStart(
+                val prep = Rootfs.prepareStart(
                     context = this,
                     store = store,
                     distro = distro,
@@ -806,6 +807,8 @@ class TerminalService : Service() {
                     importing = importing,
                     onFailure = onFailure,
                 )
+                openRcDone = prep.openRcDone
+                prep.browserReady
             },
         )
         var handle = 0L
@@ -814,11 +817,12 @@ class TerminalService : Service() {
             handle = Rootfs.access.write { Native.start(store, tier, gpu) }
             val gpuAvailable = gpu && Native.hasGpu(handle)
             var setupError: String? = null
-            val booted = distro == Rootfs.Distro.ALPINE && Rootfs.ensureOpenRc(this, handle, store) { e ->
-                if (importing) throw e
-                Log.w(TAG, "OpenRC setup will retry at the next start", e)
-                setupError = e.message ?: e.toString()
-            }
+            val booted = distro == Rootfs.Distro.ALPINE && !openRcDone &&
+                Rootfs.ensureOpenRc(this, handle, store) { e ->
+                    if (importing) throw e
+                    Log.w(TAG, "OpenRC setup will retry at the next start", e)
+                    setupError = e.message ?: e.toString()
+                }
             return StartedKernel(handle, browser, booted, gpuAvailable, setupError)
         } catch (e: Throwable) {
             browser?.close()

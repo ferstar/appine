@@ -450,7 +450,7 @@ impl Store {
         if dir.join("meta.db").exists() {
             return Err(Errno::EEXIST);
         }
-        let mut store = Self::connect_with_lock(dir, COMMIT_DELAY, lock)?;
+        let mut store = Self::connect_with_lock(dir, COMMIT_DELAY, lock, true)?;
         let now = now_ns();
         store
             .db()
@@ -468,14 +468,31 @@ impl Store {
     /// empties the directories in `volatile` (paths relative to the root directory, such as
     /// `dev/shm`: on Linux they are tmpfs) and cleans up deleted inodes left by the last run.
     pub fn open(dir: &Path, volatile: &[&[u8]]) -> Result<Store, Errno> {
-        Self::open_with_delay(dir, volatile, COMMIT_DELAY)
+        Self::open_with_options(dir, volatile, COMMIT_DELAY, true)
     }
 
+    /// Opens an existing store for short-lived host work (configuration reads/writes and the Files
+    /// app browse API) without spawning a background `objects-reaper` thread; any doomed objects
+    /// are reaped inline after WAL sync, and SQLite keeps its own auto-checkpoint.
+    pub fn open_short(dir: &Path) -> Result<Store, Errno> {
+        Self::open_with_options(dir, &[], COMMIT_DELAY, false)
+    }
+
+    #[cfg(test)]
     fn open_with_delay(dir: &Path, volatile: &[&[u8]], delay: Duration) -> Result<Store, Errno> {
+        Self::open_with_options(dir, volatile, delay, true)
+    }
+
+    fn open_with_options(
+        dir: &Path,
+        volatile: &[&[u8]],
+        delay: Duration,
+        with_reaper: bool,
+    ) -> Result<Store, Errno> {
         if !dir.join("meta.db").exists() {
             return Err(Errno::ENOENT);
         }
-        Self::connect(dir, delay)?.finish_open(
+        Self::connect_with_options(dir, delay, with_reaper)?.finish_open(
             volatile,
             #[cfg(test)]
             |_, _| Ok(()),
@@ -592,12 +609,26 @@ impl Store {
             .map_err(io_err)
     }
 
+    #[cfg(test)]
     fn connect(dir: &Path, delay: Duration) -> Result<Store, Errno> {
-        let lock = Self::open_lock(dir)?;
-        Self::connect_with_lock(dir, delay, lock)
+        Self::connect_with_options(dir, delay, true)
     }
 
-    fn connect_with_lock(dir: &Path, delay: Duration, lock: File) -> Result<Store, Errno> {
+    fn connect_with_options(
+        dir: &Path,
+        delay: Duration,
+        with_reaper: bool,
+    ) -> Result<Store, Errno> {
+        let lock = Self::open_lock(dir)?;
+        Self::connect_with_lock(dir, delay, lock, with_reaper)
+    }
+
+    fn connect_with_lock(
+        dir: &Path,
+        delay: Duration,
+        lock: File,
+        with_reaper: bool,
+    ) -> Result<Store, Errno> {
         let mut db = Connection::open(dir.join("meta.db")).map_err(db_err)?;
         db.pragma_update(None, "journal_mode", "WAL")
             .map_err(db_err)?;
@@ -672,12 +703,14 @@ impl Store {
             #[cfg(test)]
             host_stats: AtomicU64::new(0),
         });
-        let reaper = {
+        let reaper = if with_reaper {
             let (meta, db) = (meta.clone(), dir.join("meta.db"));
             std::thread::Builder::new()
                 .name("objects-reaper".into())
                 .spawn(move || reap(meta, db))
                 .ok()
+        } else {
+            None
         };
         if reaper.is_some() {
             // SAFETY: the Meta the hook gets is held by both the Store and the background thread;
@@ -7171,6 +7204,59 @@ mod tests {
         assert_eq!((st.mode & 0o7777, st.size), (0o600, 5));
 
         drop((file, s));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_short_skips_reaper_and_batches_host_writes_with_single_sync() {
+        let (s, dir) = temp_store("open-short-batch");
+        // Seed one file so meta.db-wal exists when the store reopens exclusively.
+        let (_, mut f) = s.create_file(ROOT, b"seed", 0o644, 0, 0).unwrap();
+        f.write_all(b"seed").unwrap();
+        drop(f);
+        drop(s);
+
+        crate::with_store(&dir, |store| {
+            assert!(store.reaper.is_none(), "open_short must not spawn a reaper thread");
+            let syncs_after_open = store.meta.syncs.load(Ordering::Relaxed);
+            assert_eq!(syncs_after_open, 1, "exclusive open syncs metadata once");
+
+            crate::write_file_in(store, "/etc/a", b"alpha", 0o644, false, 0, 0)?;
+            crate::write_file_in(store, "/etc/b", b"beta", 0o755, true, 1000, 1000)?;
+            // No-op overwrite=false on an existing file does not disturb content or sync.
+            crate::write_file_in(store, "/etc/a", b"changed", 0o644, false, 0, 0)?;
+            assert_eq!(crate::read_file_in(store, "/etc/a")?, b"alpha");
+            assert_eq!(crate::read_file_in(store, "/etc/b")?, b"beta");
+            assert_eq!(crate::read_file_in(store, "/etc/missing"), Err(Errno::ENOENT));
+
+            // A failing step (obstructed path) must leave prior committed writes intact.
+            let etc = store.lookup(ROOT, b"etc")?.unwrap();
+            store.symlink(etc, b"blocked", b"/nonexistent", 0, 0)?;
+            store.commit()?;
+            assert_eq!(
+                crate::write_file_in(store, "/etc/blocked/file", b"x", 0o644, true, 0, 0),
+                Err(Errno::ENOTDIR)
+            );
+            crate::write_file_in(store, "/etc/c", b"gamma", 0o644, true, 0, 0)?;
+
+            // All writes committed without extra WAL fdatasyncs.
+            assert_eq!(store.meta.syncs.load(Ordering::Relaxed), syncs_after_open);
+            assert!(store.pending.get().is_none());
+
+            // Unlinking a file still reaps its host object inline without a reaper thread.
+            let doomed_ino = store.lookup(etc, b"c")?.unwrap();
+            assert!(dir.join("objects").join(doomed_ino.to_string()).exists());
+            store.unlink(etc, b"c")?;
+            store.commit()?;
+            assert!(!dir.join("objects").join(doomed_ino.to_string()).exists());
+            Ok(())
+        })
+        .unwrap();
+
+        // Reopen and verify all prior steps persisted cleanly.
+        assert_eq!(crate::read_file(&dir, "/etc/a").unwrap(), b"alpha");
+        assert_eq!(crate::read_file(&dir, "/etc/b").unwrap(), b"beta");
+        assert_eq!(crate::read_file(&dir, "/etc/c"), Err(Errno::ENOENT));
         let _ = fs::remove_dir_all(&dir);
     }
 }

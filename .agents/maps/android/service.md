@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (full refresh: 17 adversarial claims checked independently — 14 confirmed and 3 partial corrected, plus 5 confirmed bugs/debt items recorded below)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: kernel handoffs, exit completion and wake-lock release after service destruction)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: `startKernel` consumes `Rootfs.StartPreparation` and skips `ensureOpenRc` when `openRcDone` is already true)
 
 ## Responsibilities
 
@@ -65,7 +65,7 @@ For a positive PID, `lastExit` asks for the most recent matching `ApplicationExi
 
 `start` clears `startError`, sets `starting`, updates the lock and captures tier/GPU. Given a distro, `appine-start` calls `Rootfs.prepare` with progress delivered on main while the service is alive and `Rootfs::probeMirrors` for import-time sources. Setup records the distro, configures a temporary store and publishes it by rename. `startKernel` still treats this attempt as an import after the store is in place.
 
-`prepareStartBridge` opens `BrowserBridge` before `Native.start`. `Rootfs.prepareStart` receives the optional endpoint configuration and processes network/container settings, login tools, Alpine bash startup, the GPU command if enabled, browser files if configured, and the profile. Its boolean reports whether it wrote the capability to `/etc/appine/browser`.
+`prepareStartBridge` opens `BrowserBridge` before `Native.start`. `Rootfs.prepareStart` receives the optional endpoint configuration and runs network/container settings, login tools, Alpine bash startup, the GPU command if enabled, browser files if configured, the profile and an Alpine `openrc-setup-done` precheck in one store session. Its `StartPreparation` reports `browserReady` (whether it wrote the capability to `/etc/appine/browser`) and `openRcDone`.
 
 | Startup path | Failure behavior |
 | --- | --- |
@@ -73,7 +73,7 @@ For a positive PID, `lastExit` asks for the most recent matching `ApplicationExi
 | Existing store | Each reported setup failure goes to `Log.w` and `Diagnostics.record` without a UI notice. Failure to open the bridge leaves it null. Failure to write the capability closes it and makes `StartedKernel.browser` null. Other failed helpers can coexist with a configured endpoint. |
 | Escaping error | An exception escaping configuration closes the bridge. Failure during subsequent private kernel setup closes it and calls `Native.stop` if a handle was acquired. |
 
-`Rootfs.access.write` excludes provider opens during `Native.start(store, tier, gpu)`. Availability is `gpu && Native.hasGpu(handle)`. Before publication, Alpine runs `Rootfs.ensureOpenRc` on the start thread. It checks the setup marker and installed package, and installs or resumes staged setup when needed. That path calls `Rootfs.boot`, records that inittab ran, verifies the default runlevel and marks setup complete. A post-boot verification failure retains `booted = true`.
+`Rootfs.access.write` excludes provider opens during `Native.start(store, tier, gpu)`. Availability is `gpu && Native.hasGpu(handle)`. Before publication, Alpine runs `Rootfs.ensureOpenRc` on the start thread unless `prepareStart` already confirmed `openRcDone` (an absent or obstructed marker leaves `openRcDone` false). It checks the setup marker and installed package, and installs or resumes staged setup when needed. That path calls `Rootfs.boot`, records that inittab ran, verifies the default runlevel and marks setup complete. A post-boot verification failure retains `booted = true`.
 
 OpenRC setup I/O failure aborts an import and stops the private kernel. On an existing store the callback logs it and sets `setupError` for a visible notice, allowing a repair terminal. `Rootfs.boot` runs the guest `PREFER_OSCLOCK` shell command without a console, preserving existing clock-service choices. It ignores exit status, logs exceptions, then calls `Native.boot` for inittab.
 

@@ -99,6 +99,28 @@ internal object Rootfs {
     /** An account in `/etc/passwd`. */
     data class Account(val name: String, val uid: Int, val gid: Int, val home: String)
 
+    /** Result of [prepareStart]: whether `/etc/appine/browser` was written and OpenRC setup is already done. */
+    data class StartPreparation(val browserReady: Boolean, val openRcDone: Boolean)
+
+    /** Host read/write operations on a single open store session (mocked in JVM unit tests). */
+    internal interface StoreAccess {
+        @Throws(IOException::class)
+        fun readFile(path: String): ByteArray?
+
+        @Throws(IOException::class)
+        fun writeFile(
+            path: String,
+            data: ByteArray,
+            mode: Int = MODE_FILE,
+            overwrite: Boolean = true,
+            uid: Int = 0,
+            gid: Int = 0,
+        )
+    }
+
+    private const val MODE_FILE = 420 // 0644
+    private const val MODE_EXEC = 493 // 0755
+
     /** The first argument that makes `login.sh` only rewrite the NOPASSWD rules ([LoginRules]). */
     private const val REFRESH_RULES = "--refresh-rules"
 
@@ -190,9 +212,11 @@ internal object Rootfs {
         val probes = startMirrorProbes(distro)
         try {
             Native.importRootfs(tmp.path, tarball.path)
-            configure(context, tmp.path, distro)
-            val (path, content) = sources(distro, selectMirror(distro, probes))
-            write(tmp.path, path, content)
+            withStore(tmp.path) { access ->
+                configure(context, access, distro)
+                val (path, content) = sources(distro, selectMirror(distro, probes))
+                write(access, path, content)
+            }
         } finally {
             probes.values.forEach { it.cancel(true) }
         }
@@ -219,27 +243,27 @@ internal object Rootfs {
     }
 
     @Throws(IOException::class)
-    private fun configure(context: Context, store: String, distro: Distro) {
-        write(store, "/etc/hostname", "localhost\n")
+    private fun configure(context: Context, access: StoreAccess, distro: Distro) {
+        write(access, "/etc/hostname", "localhost\n")
         if (distro == Distro.ALPINE) {
-            write(store, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost\n", overwrite = false)
-            useBash(context, store)
-            cachePackages(context, store, "procps")
-            cachePackages(context, store, "bubblewrap")
+            write(access, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost\n", overwrite = false)
+            useBash(context, access)
+            cachePackages(context, access, "procps")
+            cachePackages(context, access, "bubblewrap")
         } else {
             // Debian's has no hosts, and resolv.conf points at 1.1.1.1. DNS must go through the
             // kernel layer's stub (the kernel/net map) for the system's Private DNS and VPNs to
             // take effect
-            write(store, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n")
-            write(store, "/etc/resolv.conf", "nameserver 127.0.0.53\n")
+            write(access, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n")
+            write(access, "/etc/resolv.conf", "nameserver 127.0.0.53\n")
         }
-        writeProfile(context, store, distro)
+        writeProfile(access, distro) { asset(context, it) }
         val (packages, install) = when (distro) {
             Distro.ALPINE -> "apk" to "apk add"
             Distro.DEBIAN -> "apt" to "apt install"
         }
         write(
-            store, "/etc/motd",
+            access, "/etc/motd",
             """
             Welcome to Appine!
             ${distro.label}, running on Android.
@@ -285,18 +309,20 @@ internal object Rootfs {
 
     /** Copies a bundle from the APK to the guest's package cache. */
     @Throws(IOException::class)
-    private fun cachePackages(context: Context, store: String, bundle: String): Boolean {
+    private fun cachePackages(context: Context, access: StoreAccess, bundle: String): Boolean {
         val packages = context.assets.list(bundle).orEmpty()
         for (name in packages) {
-            cachePackage(context, store, "$bundle/$name")
+            cachePackage(context, access, "$bundle/$name")
         }
         return packages.isNotEmpty()
     }
 
-    private fun cachePackage(context: Context, store: String, source: String, target: String = source) {
-        val data = context.assets.open(source).use { it.readBytes() }
-        write(store, "/var/cache/appine/$target", data)
-    }
+    private fun cachePackage(
+        context: Context,
+        access: StoreAccess,
+        source: String,
+        target: String = source,
+    ) = write(access, "/var/cache/appine/$target", asset(context, source))
 
     /**
      * Makes bash the login shell of a system imported from Alpine instead of busybox ash: puts the
@@ -309,9 +335,9 @@ internal object Rootfs {
      * sets), and copy `/etc/skel`. Systems imported before keep their shells.
      */
     @Throws(IOException::class)
-    private fun useBash(context: Context, store: String) {
-        if (!cachePackages(context, store, "bash")) return
-        val passwd = Native.readFile(store, "/etc/passwd") ?: return
+    private fun useBash(context: Context, access: StoreAccess) {
+        if (!cachePackages(context, access, "bash")) return
+        val passwd = access.readFile("/etc/passwd") ?: return
         val lines = String(passwd).split('\n').map { line ->
             val fields = line.split(':')
             if (fields.size == 7 && fields[0] == "root" && fields[6] == "/bin/sh") {
@@ -320,8 +346,8 @@ internal object Rootfs {
                 line
             }
         }
-        write(store, "/etc/passwd", lines.joinToString("\n"))
-        ensureBashStartup(store)
+        write(access, "/etc/passwd", lines.joinToString("\n"))
+        ensureBashStartup(access)
     }
 
     /**
@@ -340,18 +366,20 @@ internal object Rootfs {
      */
     @Throws(IOException::class)
     private fun writeProfile(
-        context: Context,
-        store: String,
+        access: StoreAccess,
         distro: Distro,
         onFailure: (String, IOException) -> Unit = FAIL_FAST,
+        readAsset: (String) -> ByteArray,
     ) {
-        writeStep(store, "/etc/profile.d/appine.ashrc", onFailure) { asset(context, "ashrc.sh") }
-        writeStep(store, "/etc/profile.d/appine.bashrc", onFailure) { asset(context, "bashrc.sh") }
-        writeStep(store, "/etc/profile.d/appine.zshrc", onFailure) { asset(context, "zshrc.sh") }
-        writeStep(store, "/etc/appine/zsh/.zshenv", onFailure) { ZSHENV }
-        if (distro == Distro.ALPINE) writeStep(store, "/etc/bash/appine.sh", onFailure) { BASH_HOOK }
-        writeStep(store, "/etc/profile.d/appine.sh", onFailure) { asset(context, "profile.sh") }
-        ensureShellRcHooks(store, distro, onFailure)
+        fun writeAsset(path: String, asset: String) =
+            runSetupStep(path, onFailure) { write(access, path, readAsset(asset)) }
+        writeAsset("/etc/profile.d/appine.ashrc", "ashrc.sh")
+        writeAsset("/etc/profile.d/appine.bashrc", "bashrc.sh")
+        writeAsset("/etc/profile.d/appine.zshrc", "zshrc.sh")
+        writeStep(access, "/etc/appine/zsh/.zshenv", onFailure) { ZSHENV }
+        if (distro == Distro.ALPINE) writeStep(access, "/etc/bash/appine.sh", onFailure) { BASH_HOOK }
+        writeAsset("/etc/profile.d/appine.sh", "profile.sh")
+        ensureShellRcHooks(access, distro, onFailure)
     }
 
     /**
@@ -405,19 +433,19 @@ if [[ -o interactive ]] && [[ -r /etc/profile.d/appine.zshrc ]]; then . /etc/pro
 
     @Throws(IOException::class)
     private fun appendRcHook(
-        store: String,
+        access: StoreAccess,
         path: String,
         doneMarker: String,
         needle: String,
         hook: String,
     ): Boolean {
-        val current = runCatching { Native.readFile(store, path) }.getOrNull() ?: return false
+        val current = runCatching { access.readFile(path) }.getOrNull() ?: return false
         val text = current.decodeToString()
         if (!text.contains(needle)) {
             val sep = if (text.isEmpty() || text.endsWith("\n")) "\n" else "\n\n"
-            write(store, path, text + sep + hook)
+            write(access, path, text + sep + hook)
         }
-        write(store, doneMarker, "")
+        write(access, doneMarker, "")
         return true
     }
 
@@ -429,24 +457,24 @@ if [[ -o interactive ]] && [[ -r /etc/profile.d/appine.zshrc ]]; then . /etc/pro
      */
     @Throws(IOException::class)
     private fun ensureShellRcHooks(
-        store: String,
+        access: StoreAccess,
         distro: Distro,
         onFailure: (String, IOException) -> Unit = FAIL_FAST,
     ) {
-        if (distro == Distro.DEBIAN && readMarker(store, DEBIAN_BASHRC_HOOK_DONE, onFailure) == false) {
+        if (distro == Distro.DEBIAN && readMarker(access, DEBIAN_BASHRC_HOOK_DONE, onFailure) == false) {
             runSetupStep("/etc/bash.bashrc", onFailure) {
-                appendRcHook(store, "/etc/bash.bashrc", DEBIAN_BASHRC_HOOK_DONE, "/etc/profile.d/appine.bashrc", DEBIAN_BASH_HOOK)
+                appendRcHook(access, "/etc/bash.bashrc", DEBIAN_BASHRC_HOOK_DONE, "/etc/profile.d/appine.bashrc", DEBIAN_BASH_HOOK)
             }
         }
-        if (readMarker(store, ZSH_RC_HOOK_DONE, onFailure) == false) {
+        if (readMarker(access, ZSH_RC_HOOK_DONE, onFailure) == false) {
             runSetupStep("/etc/zsh/zshrc", onFailure) {
-                val appended = appendRcHook(store, "/etc/zsh/zshrc", ZSH_RC_HOOK_DONE, "/etc/profile.d/appine.zshrc", ZSH_RC_HOOK)
+                val appended = appendRcHook(access, "/etc/zsh/zshrc", ZSH_RC_HOOK_DONE, "/etc/profile.d/appine.zshrc", ZSH_RC_HOOK)
                 if (!appended &&
-                    runCatching { Native.readFile(store, "/etc/zsh/zprofile") }.getOrNull() != null &&
-                    !exists(store, "/etc/zsh/zshrc")
+                    runCatching { access.readFile("/etc/zsh/zprofile") }.getOrNull() != null &&
+                    !exists(access, "/etc/zsh/zshrc")
                 ) {
-                    write(store, "/etc/zsh/zshrc", ZSH_RC_HOOK, overwrite = false)
-                    write(store, ZSH_RC_HOOK_DONE, "")
+                    write(access, "/etc/zsh/zshrc", ZSH_RC_HOOK, overwrite = false)
+                    write(access, ZSH_RC_HOOK_DONE, "")
                 }
             }
         }
@@ -499,49 +527,79 @@ esac
         store: String,
         onFailure: (String, IOException) -> Unit = FAIL_FAST,
     ) {
-        if (readMarker(store, BASH_STARTUP_DONE, onFailure) != false) return
+        withStore(store) { access -> ensureBashStartup(access, onFailure) }
+    }
+
+    @Throws(IOException::class)
+    private fun ensureBashStartup(
+        access: StoreAccess,
+        onFailure: (String, IOException) -> Unit = FAIL_FAST,
+    ) {
+        if (readMarker(access, BASH_STARTUP_DONE, onFailure) != false) return
         var complete = true
-        if (!writeStep(store, "/etc/skel/.bash_profile", onFailure, overwrite = false) { BASH_PROFILE }) complete = false
-        if (!writeStep(store, "/etc/skel/.bashrc", onFailure, overwrite = false) { BASHRC }) complete = false
-        for ((account, shell) in accounts(store)) {
+        if (!writeStep(access, "/etc/skel/.bash_profile", onFailure, overwrite = false) { BASH_PROFILE }) complete = false
+        if (!writeStep(access, "/etc/skel/.bashrc", onFailure, overwrite = false) { BASHRC }) complete = false
+        for ((account, shell) in accounts(access)) {
             if (shell != "/bin/bash" || account.gid < 0) continue
             if (account.name == ConsolePty.LOGIN_ROOT || account.uid in 1000..65533) {
-                if (!seedBashHome(store, account, onFailure)) complete = false
+                if (!seedBashHome(access, account, onFailure)) complete = false
             }
         }
-        if (complete) writeStep(store, BASH_STARTUP_DONE, onFailure) { "" }
+        if (complete) writeStep(access, BASH_STARTUP_DONE, onFailure) { "" }
     }
 
     private fun seedBashHome(
-        store: String,
+        access: StoreAccess,
         account: Account,
         onFailure: (String, IOException) -> Unit,
     ): Boolean {
         val home = account.home.trimEnd('/')
         if (!home.startsWith("/") || home.isEmpty()) return true
         // Do not create missing home directories as root; symlinks are rejected below by `exists`.
-        if (!hasNonRegularEntry(store, home)) return true
+        if (!hasNonRegularEntry(access, home)) return true
         var complete = true
         val hasLoginFile = listOf(".bash_profile", ".bash_login", ".profile")
-            .any { exists(store, "$home/$it") }
+            .any { exists(access, "$home/$it") }
         if (!hasLoginFile &&
-            !writeStep(store, "$home/.bash_profile", onFailure, overwrite = false, uid = account.uid, gid = account.gid) { BASH_PROFILE }
+            !writeStep(access, "$home/.bash_profile", onFailure, overwrite = false, uid = account.uid, gid = account.gid) { BASH_PROFILE }
         ) {
             complete = false
         }
         val bashrc = "$home/.bashrc"
-        if (!exists(store, bashrc) &&
-            !writeStep(store, bashrc, onFailure, overwrite = false, uid = account.uid, gid = account.gid) { BASHRC }
+        if (!exists(access, bashrc) &&
+            !writeStep(access, bashrc, onFailure, overwrite = false, uid = account.uid, gid = account.gid) { BASHRC }
         ) {
             complete = false
         }
         return complete
     }
 
+    @Throws(IOException::class)
+    private fun <R> withStore(store: String, block: (StoreAccess) -> R): R {
+        var result: Any? = null
+        Native.withStore(store) { session ->
+            val access = object : StoreAccess {
+                override fun readFile(path: String): ByteArray? = Native.storeReadFile(session, path)
+
+                override fun writeFile(
+                    path: String,
+                    data: ByteArray,
+                    mode: Int,
+                    overwrite: Boolean,
+                    uid: Int,
+                    gid: Int,
+                ) = Native.storeWriteFile(session, path, data, mode, overwrite, uid, gid)
+            }
+            result = block(access)
+        }
+        @Suppress("UNCHECKED_CAST")
+        return result as R
+    }
+
     private val FAIL_FAST: (String, IOException) -> Unit = { _, e -> throw e }
 
     private fun writeStep(
-        store: String,
+        access: StoreAccess,
         path: String,
         onFailure: (String, IOException) -> Unit,
         overwrite: Boolean = true,
@@ -549,7 +607,7 @@ esac
         gid: Int = 0,
         content: () -> String,
     ): Boolean = runSetupStep(path, onFailure) {
-        write(store, path, content(), overwrite, uid, gid)
+        write(access, path, content(), overwrite, uid, gid)
     }
 
     internal fun runSetupStep(
@@ -570,50 +628,65 @@ esac
      * [onFailure] and the caller should skip the one-time setup.
      */
     private fun readMarker(
-        store: String,
+        access: StoreAccess,
         path: String,
         onFailure: (String, IOException) -> Unit,
     ): Boolean? = try {
-        Native.readFile(store, path) != null
+        access.readFile(path) != null
     } catch (e: IOException) {
         onFailure(path, e)
         null
     }
 
-    private fun hasNonRegularEntry(store: String, path: String): Boolean = try {
-        Native.readFile(store, path)
+    private fun hasNonRegularEntry(access: StoreAccess, path: String): Boolean = try {
+        access.readFile(path)
         false
     } catch (_: IOException) {
         true
     }
 
-    private fun exists(store: String, path: String): Boolean = try {
-        Native.readFile(store, path) != null
+    private fun exists(access: StoreAccess, path: String): Boolean = try {
+        access.readFile(path) != null
     } catch (_: IOException) {
         // Non-regular entries (such as symlinks) or non-directory parents must not be overwritten.
         true
     }
 
-    private fun asset(context: Context, name: String): String =
-        context.assets.open(name).bufferedReader().use { it.readText() }
+    private fun asset(context: Context, name: String): ByteArray =
+        context.assets.open(name).use { it.readBytes() }
+
+    @Throws(IOException::class)
+    private fun writeIfChanged(
+        access: StoreAccess,
+        path: String,
+        data: ByteArray,
+        mode: Int = MODE_FILE,
+    ) {
+        val current = access.readFile(path)
+        if (current != null && current.contentEquals(data)) return
+        access.writeFile(path, data, mode, overwrite = true)
+    }
 
     private fun write(
-        store: String,
+        access: StoreAccess,
         path: String,
         text: String,
         overwrite: Boolean = true,
         uid: Int = 0,
         gid: Int = 0,
-    ) = write(store, path, text.toByteArray(), overwrite, uid, gid)
+    ) = write(access, path, text.toByteArray(), overwrite, uid, gid)
 
     private fun write(
-        store: String,
+        access: StoreAccess,
         path: String,
         data: ByteArray,
         overwrite: Boolean = true,
         uid: Int = 0,
         gid: Int = 0,
-    ) = Native.writeFile(store, path, data, 420 /* 0644 */, overwrite, uid, gid)
+    ) = access.writeFile(path, data, MODE_FILE, overwrite, uid, gid)
+
+    private fun write(store: String, path: String, text: String) =
+        Native.writeFile(store, path, text.toByteArray(), MODE_FILE, overwrite = true)
 
     /** Makes renames and deletions in directory [dir] durable. */
     private fun syncDir(dir: File) {
@@ -710,11 +783,12 @@ esac
     private const val GPU_COMMAND_PATH = "/usr/local/bin/appine-gpu"
 
     /**
-     * Refreshes the per-start guest configuration files in [store] before starting the kernel.
-     * Fresh imports (`importing = true`) propagate the first I/O failure; existing stores run each
-     * independent helper and sub-step on its own, reporting failures to [onFailure] so a modified
-     * path or full disk cannot lock the user out of a repair shell.
-     * Returns whether [browserConfiguration] was written to [BrowserBridge.CONFIG_PATH].
+     * Refreshes the per-start guest configuration files in [store] in a single store session before
+     * starting the kernel. Fresh imports (`importing = true`) propagate the first I/O failure;
+     * existing stores run each independent helper and sub-step on its own, reporting failures to
+     * [onFailure] so a modified path or full disk cannot lock the user out of a repair shell.
+     * Returns whether [browserConfiguration] was written to [BrowserBridge.CONFIG_PATH] and
+     * whether Alpine's one-time OpenRC setup marker is already present.
      */
     @Throws(IOException::class)
     fun prepareStart(
@@ -725,17 +799,48 @@ esac
         browserConfiguration: String? = null,
         importing: Boolean = false,
         onFailure: (String, IOException) -> Unit = FAIL_FAST,
-    ): Boolean {
+    ): StartPreparation {
         val handleFailure = if (importing) FAIL_FAST else onFailure
-        runSetupStep(NETWORK_CONFIG_PATH, handleFailure) { ensureNetworkConfig(context, store) }
-        runSetupStep(ROOTLESS_CONTAINERS_PATH, handleFailure) { ensureContainersConfig(context, store) }
-        ensureLoginTools(context, store, distro, handleFailure)
-        if (distro == Distro.ALPINE) ensureBashStartup(store, handleFailure)
-        if (gpu) runSetupStep(GPU_COMMAND_PATH, handleFailure) { ensureGpuCommand(context, store) }
+        var result = StartPreparation(browserReady = false, openRcDone = false)
+        runSetupStep(store, handleFailure) {
+            withStore(store) { access ->
+                result = prepareStart(
+                    access = access,
+                    distro = distro,
+                    gpu = gpu,
+                    browserConfiguration = browserConfiguration,
+                    importing = importing,
+                    onFailure = onFailure,
+                    readAsset = { asset(context, it) },
+                )
+            }
+        }
+        return result
+    }
+
+    @Throws(IOException::class)
+    internal fun prepareStart(
+        access: StoreAccess,
+        distro: Distro = Distro.ALPINE,
+        gpu: Boolean = false,
+        browserConfiguration: String? = null,
+        importing: Boolean = false,
+        onFailure: (String, IOException) -> Unit = FAIL_FAST,
+        readAsset: (String) -> ByteArray,
+    ): StartPreparation {
+        val handleFailure = if (importing) FAIL_FAST else onFailure
+        runSetupStep(NETWORK_CONFIG_PATH, handleFailure) { ensureNetworkConfig(access) }
+        runSetupStep(ROOTLESS_CONTAINERS_PATH, handleFailure) { ensureContainersConfig(access) }
+        ensureLoginTools(access, distro, handleFailure, readAsset)
+        if (distro == Distro.ALPINE) ensureBashStartup(access, handleFailure)
+        if (gpu) runSetupStep(GPU_COMMAND_PATH, handleFailure) { ensureGpuCommand(access, readAsset) }
         val browserReady = browserConfiguration != null &&
-            ensureBrowser(context, browserConfiguration, store, handleFailure)
-        updateProfile(context, store, distro, upgradeDoas = false, onFailure = handleFailure)
-        return browserReady
+            ensureBrowser(access, browserConfiguration, handleFailure, readAsset)
+        updateProfile(access, distro, upgradeDoas = false, onFailure = handleFailure, readAsset = readAsset)
+        // Precheck the OpenRC completion marker while the store is already open so normal Alpine
+        // cold starts avoid opening a second concurrent connection right after Native.start.
+        val openRcDone = distro == Distro.ALPINE && runCatching { access.readFile(OPENRC_DONE) }.getOrNull() != null
+        return StartPreparation(browserReady = browserReady, openRcDone = openRcDone)
     }
 
     /**
@@ -748,8 +853,12 @@ esac
      * reads this file.
      */
     @Throws(IOException::class)
-    fun ensureNetworkConfig(context: Context, store: String = store(context).path) = write(
-        store, NETWORK_CONFIG_PATH,
+    fun ensureNetworkConfig(context: Context, store: String = store(context).path) =
+        withStore(store) { ensureNetworkConfig(it) }
+
+    @Throws(IOException::class)
+    private fun ensureNetworkConfig(access: StoreAccess) = write(
+        access, NETWORK_CONFIG_PATH,
         "auto lo\niface lo inet loopback\n",
         overwrite = false,
     )
@@ -766,7 +875,12 @@ esac
      */
     @Throws(IOException::class)
     fun ensureContainersConfig(context: Context, store: String = store(context).path) {
-        write(store, ROOTLESS_CONTAINERS_PATH, ROOTLESS_CONTAINERS, overwrite = false)
+        withStore(store) { ensureContainersConfig(it) }
+    }
+
+    @Throws(IOException::class)
+    private fun ensureContainersConfig(access: StoreAccess) {
+        write(access, ROOTLESS_CONTAINERS_PATH, ROOTLESS_CONTAINERS, overwrite = false)
     }
 
     private const val ROOTLESS_CONTAINERS = """# Written by Appine when missing: Appine has no TUN device, so pasta and slirp4netns (the
@@ -783,7 +897,15 @@ netns = "host"
     /** Installs the per-command Venus launcher on new and existing stores. */
     @Throws(IOException::class)
     fun ensureGpuCommand(context: Context, store: String = store(context).path) =
-        installExecutable(context, store, "appine-gpu.sh", GPU_COMMAND_PATH, overwrite = false)
+        withStore(store) { ensureGpuCommand(it) { name -> asset(context, name) } }
+
+    @Throws(IOException::class)
+    private fun ensureGpuCommand(access: StoreAccess, readAsset: (String) -> ByteArray) {
+        val existing = try { access.readFile(GPU_COMMAND_PATH) } catch (_: IOException) { null }
+        if (existing == null) {
+            access.writeFile(GPU_COMMAND_PATH, readAsset("appine-gpu.sh"), MODE_EXEC, overwrite = false)
+        }
+    }
 
     /**
      * Refreshes the bridge before kernel start, preserving user-provided local launchers.
@@ -795,26 +917,33 @@ netns = "host"
         configuration: String,
         store: String = store(context).path,
         onFailure: (String, IOException) -> Unit = FAIL_FAST,
+    ): Boolean = withStore(store) { access ->
+        ensureBrowser(access, configuration, onFailure) { asset(context, it) }
+    }
+
+    @Throws(IOException::class)
+    private fun ensureBrowser(
+        access: StoreAccess,
+        configuration: String,
+        onFailure: (String, IOException) -> Unit,
+        readAsset: (String) -> ByteArray,
     ): Boolean {
         val openUrl = "/usr/local/libexec/appine-open-url"
         runSetupStep(openUrl, onFailure) {
-            installExecutable(context, store, "appine-open-url", openUrl, overwrite = true)
+            writeIfChanged(access, openUrl, readAsset("appine-open-url"), MODE_EXEC)
         }
-        val configured = writeStep(store, BrowserBridge.CONFIG_PATH, onFailure) { configuration }
+        val configured = writeStep(access, BrowserBridge.CONFIG_PATH, onFailure) { configuration }
         val xdgOpen = "/usr/local/bin/xdg-open"
         runSetupStep(xdgOpen, onFailure) {
-            val old = try { Native.readFile(store, xdgOpen) } catch (_: IOException) { null }
+            val old = try { access.readFile(xdgOpen) } catch (_: IOException) { null }
             // Replace the previous Appine OSC helper, but leave a user's own launcher alone.
             val replace = old != null && hex(MessageDigest.getInstance("SHA-256").digest(old)) ==
                 "abaf8d811e48df794b931f2fd5876e255c2c430464081e0d9fe880b80a3a1d76"
-            installExecutable(context, store, "xdg-open.sh", xdgOpen, overwrite = replace)
+            if (old == null || replace) {
+                access.writeFile(xdgOpen, readAsset("xdg-open.sh"), MODE_EXEC, overwrite = replace)
+            }
         }
         return configured
-    }
-
-    private fun installExecutable(context: Context, store: String, assetName: String, path: String, overwrite: Boolean) {
-        val bytes = context.assets.open(assetName).use { it.readBytes() }
-        Native.writeFile(store, path, bytes, 493 /* 0755 */, overwrite)
     }
 
     private const val DOAS_WHEEL_PATH = "/etc/doas.d/20-wheel.conf"
@@ -826,10 +955,10 @@ netns = "host"
      * busybox ash's `ENV` hook without touching user-customized doas rules.
      */
     @Throws(IOException::class)
-    private fun ensureDoasEnv(store: String) {
-        val current = runCatching { Native.readFile(store, DOAS_WHEEL_PATH) }.getOrNull() ?: return
+    private fun ensureDoasEnv(access: StoreAccess) {
+        val current = runCatching { access.readFile(DOAS_WHEEL_PATH) }.getOrNull() ?: return
         if (current.decodeToString().trimEnd('\n') == OLD_DOAS_WHEEL_RULE) {
-            write(store, DOAS_WHEEL_PATH, "$DOAS_WHEEL_RULE\n")
+            write(access, DOAS_WHEEL_PATH, "$DOAS_WHEEL_RULE\n")
         }
     }
 
@@ -847,8 +976,23 @@ netns = "host"
         onFailure: (String, IOException) -> Unit = FAIL_FAST,
     ) {
         if (distro != Distro.ALPINE) return
-        runSetupStep("/var/cache/appine/doas.apk", onFailure) { cachePackage(context, store, "doas.apk") }
-        runSetupStep(DOAS_WHEEL_PATH, onFailure) { ensureDoasEnv(store) }
+        withStore(store) { access ->
+            ensureLoginTools(access, distro, onFailure) { asset(context, it) }
+        }
+    }
+
+    @Throws(IOException::class)
+    private fun ensureLoginTools(
+        access: StoreAccess,
+        distro: Distro?,
+        onFailure: (String, IOException) -> Unit,
+        readAsset: (String) -> ByteArray,
+    ) {
+        if (distro != Distro.ALPINE) return
+        runSetupStep("/var/cache/appine/doas.apk", onFailure) {
+            writeIfChanged(access, "/var/cache/appine/doas.apk", readAsset("doas.apk"))
+        }
+        runSetupStep(DOAS_WHEEL_PATH, onFailure) { ensureDoasEnv(access) }
     }
 
     /**
@@ -906,27 +1050,29 @@ netns = "host"
         store: String = store(context).path,
         distro: Distro = installed(context) ?: Distro.ALPINE,
         onFailure: (String, IOException) -> Unit = FAIL_FAST,
-    ) = updateProfile(context, store, distro, upgradeDoas = true, onFailure = onFailure)
+    ) = withStore(store) { access ->
+        updateProfile(access, distro, upgradeDoas = true, onFailure = onFailure) { asset(context, it) }
+    }
 
     @Throws(IOException::class)
     private fun updateProfile(
-        context: Context,
-        store: String,
+        access: StoreAccess,
         distro: Distro,
         upgradeDoas: Boolean,
         onFailure: (String, IOException) -> Unit,
+        readAsset: (String) -> ByteArray,
     ) {
         if (upgradeDoas && distro == Distro.ALPINE) {
-            runSetupStep(DOAS_WHEEL_PATH, onFailure) { ensureDoasEnv(store) }
+            runSetupStep(DOAS_WHEEL_PATH, onFailure) { ensureDoasEnv(access) }
         }
         val path = "/etc/profile.d/appine.sh"
-        val old = runCatching { Native.readFile(store, path) }.getOrNull() ?: return
+        val old = runCatching { access.readFile(path) }.getOrNull() ?: return
         val earlier = String(old) in listOf(OLD_PROFILE, UNMARKED_PROFILE) ||
             hex(MessageDigest.getInstance("SHA-256").digest(old)) in REPLACED_PROFILES
         if (earlier) {
-            writeProfile(context, store, distro, onFailure)
+            writeProfile(access, distro, onFailure, readAsset)
         } else {
-            ensureShellRcHooks(store, distro, onFailure)
+            ensureShellRcHooks(access, distro, onFailure)
         }
     }
 
@@ -981,10 +1127,12 @@ netns = "host"
         if (runBootCommand(machine, "rm -rf /var/cache/appine/openrc") != 0) {
             throw IOException("Cannot prepare the OpenRC package cache")
         }
-        cachePackages(context, store, "openrc")
-        val libcap = context.assets.list("bubblewrap").orEmpty().single { it.startsWith("libcap2-") }
-        cachePackage(context, store, "bubblewrap/$libcap", "openrc/$libcap")
-        write(store, OPENRC_INSTALL, asset(context, "install-openrc.sh"))
+        withStore(store) { access ->
+            cachePackages(context, access, "openrc")
+            val libcap = context.assets.list("bubblewrap").orEmpty().single { it.startsWith("libcap2-") }
+            cachePackage(context, access, "bubblewrap/$libcap", "openrc/$libcap")
+            write(access, OPENRC_INSTALL, asset(context, "install-openrc.sh"))
+        }
         val logPath = "/var/log/appine-openrc.log"
         val status = runBootCommand(machine, "sh $OPENRC_INSTALL >$logPath 2>&1")
         if (status != 0) {
@@ -1041,10 +1189,11 @@ netns = "host"
      * is root too. When `/etc/passwd` cannot be read, it is root with home directory `/root`.
      */
     fun loginAccount(context: Context, login: String): Account {
-        val all = accounts(context).map { it.first }
+        val entries = accounts(context)
+        val all = entries.map { it.first }
         val root = all.firstOrNull { it.name == ConsolePty.LOGIN_ROOT } ?: Account(ConsolePty.LOGIN_ROOT, 0, 0, "/root")
         return when (login) {
-            ConsolePty.LOGIN_AUTO -> regularAccounts(context).firstOrNull() ?: root
+            ConsolePty.LOGIN_AUTO -> regularAccounts(entries).firstOrNull() ?: root
             ConsolePty.LOGIN_ROOT -> root
             else -> all.firstOrNull { it.name == login } ?: root
         }
@@ -1055,18 +1204,23 @@ netns = "host"
      * nologin or false), sorted by UID; the first one is the one logged in "automatically". The
      * rules are the same as in the assets' `login.sh`. Empty when it cannot be read.
      */
-    fun regularAccounts(context: Context): List<Account> = accounts(context).mapNotNull { (account, shell) ->
+    fun regularAccounts(context: Context): List<Account> = regularAccounts(accounts(context))
+
+    private fun regularAccounts(entries: List<Pair<Account, String>>): List<Account> = entries.mapNotNull { (account, shell) ->
         if (shell.isEmpty() || shell.endsWith("/nologin") || shell.endsWith("/false")) return@mapNotNull null
         if (account.uid !in 1000..65533) return@mapNotNull null
         account
     }.sortedBy { it.uid }
 
     /** The accounts in `/etc/passwd`, empty when it cannot be read. */
-    private fun accounts(context: Context): List<Pair<Account, String>> = accounts(store(context).path)
+    private fun accounts(context: Context): List<Pair<Account, String>> =
+        parsePasswd(runCatching { Native.readFile(store(context).path, "/etc/passwd") }.getOrNull())
 
-    private fun accounts(store: String): List<Pair<Account, String>> {
-        val passwd = runCatching { Native.readFile(store, "/etc/passwd") }.getOrNull()
-            ?: return emptyList()
+    private fun accounts(access: StoreAccess): List<Pair<Account, String>> =
+        parsePasswd(runCatching { access.readFile("/etc/passwd") }.getOrNull())
+
+    private fun parsePasswd(passwd: ByteArray?): List<Pair<Account, String>> {
+        if (passwd == null) return emptyList()
         return String(passwd).lines().mapNotNull { line ->
             val f = line.split(':')
             if (f.size < 7) return@mapNotNull null

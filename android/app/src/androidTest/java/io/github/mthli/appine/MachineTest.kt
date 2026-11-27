@@ -670,13 +670,19 @@ class MachineTest {
 
         val failedSteps = mutableListOf<String>()
         var bridgeClosed = false
+        var openRcDone = true
         val bridge = prepareStartBridge(
             importing = false,
             onFailure = { step, _ -> failedSteps.add(step) },
             openBridge = { Closeable { bridgeClosed = true } },
-            configure = { _, onFailure -> prepare(importing = false, onFailure = onFailure) },
+            configure = { _, onFailure ->
+                val prep = prepare(importing = false, onFailure = onFailure)
+                openRcDone = prep.openRcDone
+                prep.browserReady
+            },
         )
         assertNull(bridge)
+        assertFalse(openRcDone)
         assertTrue("browser bridge must close when /etc/appine/browser cannot be written", bridgeClosed)
         val expectedFailures = listOf(
             "/etc/containers/containers.rootless.conf.d/appine.conf",

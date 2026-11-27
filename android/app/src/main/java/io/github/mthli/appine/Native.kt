@@ -2,6 +2,7 @@ package io.github.mthli.appine
 
 import java.io.IOException
 import java.util.function.IntConsumer
+import java.util.function.LongConsumer
 
 /**
  * JNI interface of the native library libappine.so, implemented in hosts/android/src/lib.rs.
@@ -36,6 +37,36 @@ internal object Native {
     @JvmStatic
     @Throws(IOException::class)
     external fun syncRootfs(store: String)
+
+    /**
+     * Opens [store] once without spawning a background reaper thread and invokes [action]
+     * synchronously with a thread-local session handle for [storeWriteFile] and [storeReadFile].
+     * The store is always closed before this call returns or propagates an exception.
+     */
+    @JvmStatic
+    @Throws(IOException::class)
+    external fun withStore(store: String, action: LongConsumer)
+
+    /**
+     * Writes a file using an active [withStore] [session] handle; with [overwrite] false, an
+     * existing file is left alone. New files are owned by [uid] and [gid].
+     */
+    @JvmStatic
+    @Throws(IOException::class)
+    external fun storeWriteFile(
+        session: Long,
+        path: String,
+        data: ByteArray,
+        mode: Int,
+        overwrite: Boolean,
+        uid: Int = 0,
+        gid: Int = 0,
+    )
+
+    /** Reads a regular file using an active [withStore] [session] handle (null when missing). */
+    @JvmStatic
+    @Throws(IOException::class)
+    external fun storeReadFile(session: Long, path: String): ByteArray?
 
     /**
      * Writes a file in the store; with [overwrite] false, an existing file is left alone. New files
