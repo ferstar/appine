@@ -123,17 +123,64 @@ pub fn sendmsg(
     control: &[u8],
     flags: i32,
 ) -> Result<usize, i32> {
-    let mut iov = libc::iovec {
+    let mut iov = [libc::iovec {
         iov_base: data.as_ptr() as *mut libc::c_void,
         iov_len: data.len(),
-    };
+    }];
+    // SAFETY: `data` is valid for reads of `data.len()` bytes for the duration of the call.
+    unsafe { sendmsg_raw(fd, &mut iov, addr, control, flags) }
+}
+
+/// Vectored sendmsg(2) directly from caller-validated host buffers. Always adds `MSG_NOSIGNAL`.
+///
+/// # Safety
+/// Every `(ptr, len)` in `iovecs` must be valid for reads of `len` bytes for the duration of the
+/// call.
+pub unsafe fn sendmsg_iov(
+    fd: i32,
+    iovecs: &[(*const u8, usize)],
+    addr: &[u8],
+    control: &[u8],
+    flags: i32,
+) -> Result<usize, i32> {
+    const STACK_IOV: usize = 64;
+    if iovecs.len() <= STACK_IOV {
+        let mut iov = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }; STACK_IOV];
+        for (dst, &(ptr, len)) in iov.iter_mut().zip(iovecs.iter()) {
+            dst.iov_base = ptr as *mut libc::c_void;
+            dst.iov_len = len;
+        }
+        return unsafe { sendmsg_raw(fd, &mut iov[..iovecs.len()], addr, control, flags) };
+    }
+    let mut iov: Vec<libc::iovec> = iovecs
+        .iter()
+        .map(|&(ptr, len)| libc::iovec {
+            iov_base: ptr as *mut libc::c_void,
+            iov_len: len,
+        })
+        .collect();
+    unsafe { sendmsg_raw(fd, &mut iov, addr, control, flags) }
+}
+
+unsafe fn sendmsg_raw(
+    fd: i32,
+    iov: &mut [libc::iovec],
+    addr: &[u8],
+    control: &[u8],
+    flags: i32,
+) -> Result<usize, i32> {
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     if !addr.is_empty() {
         msg.msg_name = addr.as_ptr() as *mut libc::c_void;
         msg.msg_namelen = addr.len() as libc::socklen_t;
     }
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
+    if !iov.is_empty() {
+        msg.msg_iov = iov.as_mut_ptr();
+        msg.msg_iovlen = iov.len() as _;
+    }
     if !control.is_empty() {
         msg.msg_control = control.as_ptr() as *mut libc::c_void;
         msg.msg_controllen = control.len() as _;
@@ -161,19 +208,110 @@ pub struct Received {
 /// recvmsg(2): reads the data into `buf` and takes at most `control_len` bytes of control
 /// messages.
 pub fn recvmsg(fd: i32, buf: &mut [u8], control_len: usize, flags: i32) -> Result<Received, i32> {
-    let mut iov = libc::iovec {
+    recvmsg_opt(fd, buf, control_len, true, flags)
+}
+
+/// recvmsg(2) with optional peer-address capture: when `need_addr` is false, `msg_name` is left
+/// null so the host skips copying the peer sockaddr and no address `Vec` is allocated; when
+/// `control_len == 0`, `msg_control` is left null and no control buffer is allocated.
+pub fn recvmsg_opt(
+    fd: i32,
+    buf: &mut [u8],
+    control_len: usize,
+    need_addr: bool,
+    flags: i32,
+) -> Result<Received, i32> {
+    let mut iov = [libc::iovec {
         iov_base: buf.as_mut_ptr().cast(),
         iov_len: buf.len(),
-    };
+    }];
+    // SAFETY: `buf` is valid for writes of `buf.len()` bytes for the duration of the call.
+    unsafe { recvmsg_raw(fd, &mut iov, control_len, need_addr, flags) }
+}
+
+/// Vectored recvmsg(2) directly into caller-validated host buffers.
+///
+/// # Safety
+/// Every `(ptr, len)` in `iovecs` must be valid for writes of `len` bytes for the duration of the
+/// call.
+pub unsafe fn recvmsg_iov(
+    fd: i32,
+    iovecs: &[(*mut u8, usize)],
+    control_len: usize,
+    need_addr: bool,
+    flags: i32,
+) -> Result<Received, i32> {
+    const STACK_IOV: usize = 64;
+    if iovecs.len() <= STACK_IOV {
+        let mut iov = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }; STACK_IOV];
+        for (dst, &(ptr, len)) in iov.iter_mut().zip(iovecs.iter()) {
+            dst.iov_base = ptr.cast();
+            dst.iov_len = len;
+        }
+        return unsafe { recvmsg_raw(fd, &mut iov[..iovecs.len()], control_len, need_addr, flags) };
+    }
+    let mut iov: Vec<libc::iovec> = iovecs
+        .iter()
+        .map(|&(ptr, len)| libc::iovec {
+            iov_base: ptr.cast(),
+            iov_len: len,
+        })
+        .collect();
+    unsafe { recvmsg_raw(fd, &mut iov, control_len, need_addr, flags) }
+}
+
+unsafe fn recvmsg_raw(
+    fd: i32,
+    iov: &mut [libc::iovec],
+    control_len: usize,
+    need_addr: bool,
+    flags: i32,
+) -> Result<Received, i32> {
+    // Fast path for address-less, control-less receives (e.g. TCP read/recv): avoid initializing
+    // stack buffers for sockaddr and ancillary data or touching the heap.
+    if !need_addr && control_len == 0 {
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        if !iov.is_empty() {
+            msg.msg_iov = iov.as_mut_ptr();
+            msg.msg_iovlen = iov.len() as _;
+        }
+        let n = unsafe { libc::recvmsg(fd, &mut msg, flags) };
+        if n < 0 {
+            return Err(last_errno());
+        }
+        return Ok(Received {
+            len: n as usize,
+            addr: Vec::new(),
+            control: Vec::new(),
+            flags: msg.msg_flags,
+        });
+    }
+    const STACK_CONTROL: usize = 512;
     let mut addr = [0u8; 128];
-    let mut control = vec![0u8; control_len];
+    let mut stack_ctrl = [0u8; STACK_CONTROL];
+    let mut heap_ctrl = if control_len > STACK_CONTROL {
+        vec![0u8; control_len]
+    } else {
+        Vec::new()
+    };
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_name = addr.as_mut_ptr().cast();
-    msg.msg_namelen = addr.len() as libc::socklen_t;
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
+    if need_addr {
+        msg.msg_name = addr.as_mut_ptr().cast();
+        msg.msg_namelen = addr.len() as libc::socklen_t;
+    }
+    if !iov.is_empty() {
+        msg.msg_iov = iov.as_mut_ptr();
+        msg.msg_iovlen = iov.len() as _;
+    }
     if control_len > 0 {
-        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_control = if control_len > STACK_CONTROL {
+            heap_ctrl.as_mut_ptr().cast()
+        } else {
+            stack_ctrl.as_mut_ptr().cast()
+        };
         msg.msg_controllen = control_len as _;
     }
     let n = unsafe { libc::recvmsg(fd, &mut msg, flags) };
@@ -182,10 +320,28 @@ pub fn recvmsg(fd: i32, buf: &mut [u8], control_len: usize, flags: i32) -> Resul
     }
     // msg_controllen is size_t in glibc and bionic but socklen_t in musl
     #[allow(clippy::unnecessary_cast)]
-    control.truncate(msg.msg_controllen as usize);
+    let clen = (msg.msg_controllen as usize).min(control_len);
+    let control = if clen == 0 {
+        Vec::new()
+    } else if control_len > STACK_CONTROL {
+        heap_ctrl.truncate(clen);
+        heap_ctrl
+    } else {
+        stack_ctrl[..clen].to_vec()
+    };
+    let addr = if need_addr {
+        let alen = (msg.msg_namelen as usize).min(addr.len());
+        if alen > 0 {
+            addr[..alen].to_vec()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
     Ok(Received {
         len: n as usize,
-        addr: addr[..(msg.msg_namelen as usize).min(addr.len())].to_vec(),
+        addr,
         control,
         flags: msg.msg_flags,
     })
@@ -577,7 +733,7 @@ fn query_server(server: &[u8], query: &[u8]) -> Result<Vec<u8>, i32> {
         let deadline = std::time::Instant::now() + TIMEOUT;
         loop {
             wait_fd(fd, libc::POLLIN, deadline)?;
-            let r = recvmsg(fd, &mut buf, 0, 0)?;
+            let r = recvmsg_opt(fd, &mut buf, 0, false, 0)?;
             // Accept only answers with the same ID as the query
             if r.len >= 12 && buf[..2] == query[..2] {
                 buf.truncate(r.len);
@@ -621,7 +777,7 @@ fn query_tcp(server: &[u8], query: &[u8], timeout: Duration) -> Result<Vec<u8>, 
                 }
             }
             wait_fd(fd, libc::POLLIN, deadline)?;
-            match recvmsg(fd, &mut buf, 0, 0)?.len {
+            match recvmsg_opt(fd, &mut buf, 0, false, 0)?.len {
                 0 => return Err(libc::ECONNRESET),
                 n => answer.extend_from_slice(&buf[..n]),
             }
@@ -711,5 +867,93 @@ mod tests {
         assert_eq!(r[0].dst[..2], [0xfe, 0x80]);
         assert_eq!(r[1].gateway.as_ref().map(|g| g[15]), Some(1));
         assert_eq!(r[1].metric, 1024);
+    }
+
+    #[test]
+    fn recvmsg_opt_and_vectored_io_skip_unused_addr_and_control() {
+        // UDP: need_addr=false skips address capture; need_addr=true captures it; control_len
+        // works across 0, stack (<=512), and heap (>512) thresholds.
+        let srv = socket(libc::AF_INET, libc::SOCK_DGRAM, 0).unwrap();
+        let cli = socket(libc::AF_INET, libc::SOCK_DGRAM, 0).unwrap();
+        let lo = sockaddr("127.0.0.1:0".parse().unwrap());
+        bind(srv, &lo).unwrap();
+        let srv_addr = sockname(srv, false).unwrap();
+        setsockopt(srv, libc::SOL_IP, libc::IP_PKTINFO, &1i32.to_ne_bytes()).unwrap();
+
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            recvmsg_opt(srv, &mut buf, 0, false, 0).err(),
+            Some(libc::EAGAIN)
+        );
+        assert_eq!(
+            recvmsg_opt(srv, &mut buf, 128, false, 0).err(),
+            Some(libc::EAGAIN)
+        );
+
+        sendmsg(cli, b"first", &srv_addr, &[], 0).unwrap();
+        let r = recvmsg_opt(srv, &mut buf, 0, false, 0).unwrap();
+        assert_eq!((r.len, &buf[..r.len]), (5, &b"first"[..]));
+        assert!(r.addr.is_empty());
+        assert!(r.control.is_empty());
+
+        sendmsg(cli, b"second", &srv_addr, &[], 0).unwrap();
+        let r = recvmsg_opt(srv, &mut buf, 128, true, 0).unwrap();
+        assert_eq!((r.len, &buf[..r.len]), (6, &b"second"[..]));
+        assert_eq!(r.addr.len(), 16);
+        assert!(!r.control.is_empty());
+
+        sendmsg(cli, b"third", &srv_addr, &[], 0).unwrap();
+        let r = recvmsg_opt(srv, &mut buf, 1024, false, 0).unwrap();
+        assert_eq!((r.len, &buf[..r.len]), (5, &b"third"[..]));
+        assert!(r.addr.is_empty());
+        assert!(!r.control.is_empty());
+
+        close(cli);
+        close(srv);
+
+        // TCP: vectored sendmsg_iov / recvmsg_iov round-trip across multiple spans.
+        let listener = socket(libc::AF_INET, libc::SOCK_STREAM, 0).unwrap();
+        bind(listener, &lo).unwrap();
+        listen(listener, 4).unwrap();
+        let laddr = sockname(listener, false).unwrap();
+        let c = socket(libc::AF_INET, libc::SOCK_STREAM, 0).unwrap();
+        match connect(c, &laddr) {
+            Ok(()) | Err(libc::EINPROGRESS) => {}
+            Err(e) => panic!("connect failed: {e}"),
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let wait_ready = |fd: i32, events: i16| {
+            let mut fds = [(fd, events, 0)];
+            assert_eq!(poll_until(&mut fds, deadline), Ok(1));
+        };
+        wait_ready(listener, libc::POLLIN);
+        let (s, _) = accept(listener).unwrap();
+        wait_ready(c, libc::POLLOUT);
+
+        let p1 = b"hello ";
+        let p2 = b"vectored ";
+        let p3 = b"world!";
+        let tx = [
+            (p1.as_ptr(), p1.len()),
+            (p2.as_ptr(), p2.len()),
+            (p3.as_ptr(), p3.len()),
+        ];
+        let sent = unsafe { sendmsg_iov(c, &tx, &[], &[], 0) }.unwrap();
+        assert_eq!(sent, p1.len() + p2.len() + p3.len());
+
+        wait_ready(s, libc::POLLIN);
+        let mut r1 = [0u8; 5];
+        let mut r2 = [0u8; 16];
+        let rx = [(r1.as_mut_ptr(), r1.len()), (r2.as_mut_ptr(), r2.len())];
+        let got = unsafe { recvmsg_iov(s, &rx, 0, false, 0) }.unwrap();
+        assert_eq!(got.len, sent);
+        assert!(got.addr.is_empty());
+        assert!(got.control.is_empty());
+        assert_eq!(&r1, b"hello");
+        assert_eq!(&r2[..got.len - r1.len()], b" vectored world!");
+
+        close(s);
+        close(c);
+        close(listener);
     }
 }

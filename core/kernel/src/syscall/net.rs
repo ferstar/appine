@@ -6,6 +6,8 @@
 //! ready through [`Cx::wait`], releasing the BKL meanwhile; it can be interrupted by signals and
 //! times out according to `SO_RCVTIMEO`/`SO_SNDTIMEO`.
 
+use std::cell::Cell;
+use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -98,6 +100,11 @@ const POLLERR: i16 = 0x008;
 const SOCKADDR_MAX: usize = 128;
 /// The most bytes per send or receive.
 pub(super) const MSG_MAX: usize = 1 << 20;
+/// Maximum per-thread socket I/O scratch buffer retained across syscalls (256 KiB).
+/// Transfers larger than this (up to [`MSG_MAX`]) use a transient allocation freed on drop.
+const NET_SCRATCH_CAP: usize = 256 * 1024;
+/// Maximum coalesced host spans for direct vectored `SOCK_STREAM` I/O.
+const DIRECT_IOV_MAX: usize = 64;
 
 // ---- Creating sockets ----
 
@@ -2769,7 +2776,13 @@ pub(super) fn sendto(
 ) -> SysResult {
     let (_file, sock, nonblock) = socket_of(cx, fd)?;
     let len = len.min(MSG_MAX);
-    let mut data = vec![0u8; len];
+    if addr == 0
+        && len > 0
+        && let Some(n) = try_direct_send_inet(cx, &sock, nonblock, &[(buf, len)], len, flags)?
+    {
+        return Ok(n as u64);
+    }
+    let mut data = NetScratch::take(len);
     cx.mm().read(UserSlice::new(buf, len), &mut data)?;
     let addr = if addr != 0 {
         read_addr(cx, addr, addrlen)?
@@ -2789,7 +2802,7 @@ pub(super) fn recvfrom(
     addrlen: u64,
 ) -> SysResult {
     let (_file, sock, nonblock) = socket_of(cx, fd)?;
-    let (received, message) = recv_into(cx, &sock, nonblock, &[(buf, len)], 0, flags)?;
+    let (received, message) = recv_into(cx, &sock, nonblock, &[(buf, len)], 0, flags, addr != 0)?;
     write_addr(cx, addr, addrlen, &message.addr)?;
     Ok(received as u64)
 }
@@ -2802,16 +2815,42 @@ fn recv_into(
     iovecs: &[(u64, usize)],
     control_len: usize,
     flags: u32,
+    want_addr: bool,
 ) -> Result<(usize, Message), Errno> {
     let (copied, message, more) = if is_unix(sock) {
         let (copied, message) = unix::recv_into(cx, sock, nonblock, iovecs, control_len, flags)?;
         (copied, message, 0)
     } else {
-        let total = iovecs.iter().map(|&(_, len)| len).sum();
-        let message = recv(cx, sock, nonblock, total, control_len, flags)?;
-        scatter_received(cx, iovecs, 0, &message.data)?;
-        let more = recv_rest(cx, sock, nonblock, message.len, total, flags, iovecs);
-        (message.data.len(), message, more)
+        let total = iovecs
+            .iter()
+            .fold(0usize, |acc, &(_, len)| acc.saturating_add(len));
+        let max = total.min(MSG_MAX);
+        if let Some((copied, message)) = try_direct_recv_inet(
+            cx,
+            sock,
+            nonblock,
+            iovecs,
+            max,
+            control_len,
+            flags,
+            want_addr,
+        )? {
+            (copied, message, 0)
+        } else {
+            let (copied, message) = recv_with(
+                cx,
+                sock,
+                nonblock,
+                total,
+                control_len,
+                flags,
+                want_addr,
+                RecvSink::Scatter { iovecs, off: 0 },
+            )
+            .map_err(RecvErr::into_errno)?;
+            let more = recv_rest(cx, sock, nonblock, message.len, total, flags, iovecs);
+            (copied, message, more)
+        }
     };
     let first = if flags & MSG_TRUNC != 0 {
         message.len
@@ -2844,9 +2883,18 @@ fn recv_rest(
     let mut got = first;
     let mut last = first;
     while last == MSG_MAX && got < total {
-        let m = match recv(cx, sock, nonblock, total - got, 0, flags) {
-            Ok(m) => m,
-            Err(e) => {
+        let m = match recv_with(
+            cx,
+            sock,
+            nonblock,
+            total - got,
+            0,
+            flags,
+            false,
+            RecvSink::Scatter { iovecs, off: got },
+        ) {
+            Ok((_, m)) => m,
+            Err(RecvErr::Sock(e)) => {
                 if !matches!(e, Errno::EAGAIN | Errno::EINTR | Errno::ERESTARTSYS)
                     && let Socket::Inet(s) = &*sock.borrow()
                 {
@@ -2854,10 +2902,8 @@ fn recv_rest(
                 }
                 break;
             }
+            Err(RecvErr::Scatter(_)) => break,
         };
-        if scatter_received(cx, iovecs, got, &m.data).is_err() {
-            break;
-        }
         last = m.len;
         got += last;
     }
@@ -2889,25 +2935,41 @@ pub(super) fn sendmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
         control,
         controllen,
     } = read_msghdr(cx, msg)?;
-    let mut data = Vec::new();
+    let total = iovecs
+        .iter()
+        .fold(0usize, |acc, &(_, len)| acc.saturating_add(len))
+        .min(MSG_MAX);
+    if (name == 0 || namelen == 0)
+        && controllen == 0
+        && total > 0
+        && let Some(n) = try_direct_send_inet(cx, &sock, nonblock, &iovecs, total, flags)?
+    {
+        return Ok(n as u64);
+    }
+    let mut data = NetScratch::take(total);
+    let mut off = 0;
     for (base, len) in iovecs {
-        let len = len.min(MSG_MAX - data.len());
-        let start = data.len();
-        data.resize(start + len, 0);
+        let len = len.min(total - off);
+        if len == 0 {
+            continue;
+        }
         cx.mm()
-            .read(UserSlice::new(base, len), &mut data[start..])?;
+            .read(UserSlice::new(base, len), &mut data[off..off + len])?;
+        off += len;
     }
     let addr = if name != 0 && namelen > 0 {
         read_addr(cx, name, namelen)?
     } else {
         Vec::new()
     };
-    let mut cmsg = vec![0u8; controllen.min(4096)];
-    if !cmsg.is_empty() {
-        cx.mm()
-            .read(UserSlice::new(control, cmsg.len()), &mut cmsg)?;
-    }
-    send(cx, &sock, nonblock, &data, &addr, &cmsg, flags).map(|n| n as u64)
+    let cmsg = if controllen > 0 {
+        let mut b = vec![0u8; controllen.min(4096)];
+        cx.mm().read(UserSlice::new(control, b.len()), &mut b)?;
+        b
+    } else {
+        Vec::new()
+    };
+    send(cx, &sock, nonblock, &data[..off], &addr, &cmsg, flags).map(|n| n as u64)
 }
 
 /// recvmmsg: recvmsg one by one. With `MSG_WAITFORONE` it no longer waits after the first is
@@ -2974,7 +3036,7 @@ fn recv_one(cx: &mut Cx<'_>, sock: &SocketRef, nonblock: bool, msg: u64, flags: 
     } else {
         controllen.min(4096)
     };
-    let (received, mut m) = recv_into(cx, sock, nonblock, &iovecs, room, flags)?;
+    let (received, mut m) = recv_into(cx, sock, nonblock, &iovecs, room, flags, name != 0)?;
     // Write msg_namelen, msg_controllen, msg_flags back to the msghdr
     if name != 0 {
         let n = (namelen as usize).min(m.addr.len());
@@ -3113,8 +3175,16 @@ pub(super) fn rw(
         if iovecs.iter().all(|&(_, len)| len == 0) {
             return Ok(0);
         }
-        let (received, _) = recv_into(cx, sock, nonblock, iovecs, 0, 0)?;
+        let (received, _) = recv_into(cx, sock, nonblock, iovecs, 0, 0, false)?;
         return Ok(received as u64);
+    }
+    let total = iovecs
+        .iter()
+        .fold(0usize, |acc, &(_, len)| acc.saturating_add(len));
+    if total > 0
+        && let Some(n) = try_direct_send_inet(cx, sock, nonblock, iovecs, total, 0)?
+    {
+        return Ok(n as u64);
     }
     let stream = match &*sock.borrow() {
         Socket::Inet(s) => s.ty == SOCK_STREAM,
@@ -3128,35 +3198,47 @@ pub(super) fn rw(
     let mut cur = None;
     let mut done = 0;
     loop {
-        let mut data = Vec::new();
+        let want = cur
+            .map_or(0usize, |(_, len)| len)
+            .saturating_add(
+                rest.clone()
+                    .fold(0usize, |acc, (_, len)| acc.saturating_add(len)),
+            )
+            .min(MSG_MAX);
+        let mut data = NetScratch::take(want);
+        let mut filled = 0;
         let mut fault = None;
-        while data.len() < MSG_MAX {
+        while filled < want {
             let Some((base, len)) = cur.take().or_else(|| rest.next()) else {
                 break;
             };
-            let n = len.min(MSG_MAX - data.len());
-            let start = data.len();
-            data.resize(start + n, 0);
-            if let Err(e) = cx.mm().read(UserSlice::new(base, n), &mut data[start..]) {
-                data.truncate(start);
+            if len == 0 {
+                continue;
+            }
+            let n = len.min(want - filled);
+            if let Err(e) = cx
+                .mm()
+                .read(UserSlice::new(base, n), &mut data[filled..filled + n])
+            {
                 fault = Some(e);
                 break;
             }
+            filled += n;
             if n < len {
                 cur = Some((base.wrapping_add(n as u64), len - n));
             }
         }
-        if let Some(e) = fault.filter(|_| data.is_empty() || !stream) {
+        if let Some(e) = fault.filter(|_| filled == 0 || !stream) {
             return if done > 0 { Ok(done as u64) } else { Err(e) };
         }
-        let last = fault.is_some() || (cur.is_none() && rest.len() == 0);
+        let last = fault.is_some() || (cur.is_none() && rest.clone().all(|(_, len)| len == 0));
         // Once some data has gone, a broken connection ends the write with its count and no
         // SIGPIPE (the next call gets both)
         let flags = if done > 0 { MSG_NOSIGNAL } else { 0 };
-        match send(cx, sock, nonblock, &data, &[], &[], flags) {
+        match send(cx, sock, nonblock, &data[..filled], &[], &[], flags) {
             Ok(n) => {
                 done += n;
-                if !stream || last || n < data.len() {
+                if !stream || last || n < filled {
                     return Ok(done as u64);
                 }
             }
@@ -3779,6 +3861,34 @@ pub(super) fn epipe(cx: &mut Cx<'_>, flags: u32) -> Errno {
     Errno::EPIPE
 }
 
+/// Where [`recv_with`] delivers the received payload bytes.
+enum RecvSink<'a> {
+    /// Scatter directly into guest `iovecs` starting at byte offset `off` while the scratch
+    /// buffer is live, avoiding a second heap copy into [`Message::data`].
+    Scatter {
+        iovecs: &'a [(u64, usize)],
+        off: usize,
+    },
+    /// Copy the received prefix into [`Message::data`] (for kernel-internal callers like `fs.rs`).
+    Collect,
+}
+
+/// Distinguishes a socket-level receive error from a guest-memory scatter fault after the socket
+/// has already consumed the bytes (used by [`recv_rest`] so a scatter fault is not saved into
+/// `InetSocket::pending_err`).
+enum RecvErr {
+    Sock(Errno),
+    Scatter(Errno),
+}
+
+impl RecvErr {
+    fn into_errno(self) -> Errno {
+        match self {
+            RecvErr::Sock(e) | RecvErr::Scatter(e) => e,
+        }
+    }
+}
+
 /// Receives one message (shared by recv, recvfrom, recvmsg, read), at most `max` bytes.
 pub(crate) fn recv(
     cx: &mut Cx<'_>,
@@ -3788,9 +3898,46 @@ pub(crate) fn recv(
     control_len: usize,
     flags: u32,
 ) -> Result<Message, Errno> {
+    recv_with(
+        cx,
+        sock,
+        nonblock,
+        max,
+        control_len,
+        flags,
+        false,
+        RecvSink::Collect,
+    )
+    .map(|(_, m)| m)
+    .map_err(RecvErr::into_errno)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recv_with(
+    cx: &mut Cx<'_>,
+    sock: &SocketRef,
+    nonblock: bool,
+    max: usize,
+    control_len: usize,
+    flags: u32,
+    want_addr: bool,
+    sink: RecvSink<'_>,
+) -> Result<(usize, Message), RecvErr> {
     let max = max.min(MSG_MAX);
+    let finish_owned = |cx: &mut Cx<'_>,
+                        mut m: Message,
+                        sink: RecvSink<'_>|
+     -> Result<(usize, Message), RecvErr> {
+        let copied = m.data.len();
+        if let RecvSink::Scatter { iovecs, off } = sink {
+            scatter_received(cx, iovecs, off, &m.data).map_err(RecvErr::Scatter)?;
+            m.data = Vec::new();
+        }
+        Ok((copied, m))
+    };
     if is_unix(sock) {
-        return unix::recv(cx, sock, nonblock, max, control_len, flags);
+        let m = unix::recv(cx, sock, nonblock, max, control_len, flags).map_err(RecvErr::Sock)?;
+        return finish_owned(cx, m, sink);
     }
     // Reading the error queue (MSG_ERRQUEUE) never waits: EAGAIN when no errors are queued
     let nonblock = nonblock || flags & (MSG_DONTWAIT | MSG_ERRQUEUE) != 0;
@@ -3801,7 +3948,9 @@ pub(crate) fn recv(
         _ => None,
     };
     if let Some(tap) = raw {
-        return raw_recv(cx, sock, &tap, nonblock, max, control_len, flags);
+        let m =
+            raw_recv(cx, sock, &tap, nonblock, max, control_len, flags).map_err(RecvErr::Sock)?;
+        return finish_owned(cx, m, sink);
     }
     // Datagrams produced in process: DNS stub answers, netlink answers and notifications
     fn take<T: Clone>(q: &mut std::collections::VecDeque<T>, peek: bool) -> Option<T> {
@@ -3812,31 +3961,39 @@ pub(crate) fn recv(
         }
     }
     let peek = flags & MSG_PEEK != 0;
-    let local = |d: Vec<u8>, addr: Vec<u8>| {
-        let n = d.len().min(max);
+    let local = |mut d: Vec<u8>, addr: Vec<u8>| {
+        let len = d.len();
+        let n = len.min(max);
+        d.truncate(n);
         Message {
-            data: d[..n].to_vec(),
-            len: d.len(),
+            data: d,
+            len,
             addr,
             control: Vec::new(),
             rights: None,
-            flags: if d.len() > n { MSG_TRUNC } else { 0 },
+            flags: if len > n { MSG_TRUNC } else { 0 },
         }
     };
+    enum Ready {
+        Host(i32, i32, Option<Duration>),
+        Owned(Message),
+        Wait,
+    }
     // The deadline for netlink answers (SO_RCVTIMEO), set the first time no answer can be read
     let mut netlink_deadline = None;
     let (host_fd, ty, timeout) = loop {
-        let host = match &mut *sock.borrow_mut() {
+        let ready = match &mut *sock.borrow_mut() {
             Socket::Inet(s) => {
                 if let Some(d) = take(&mut s.answers, peek) {
-                    return Ok(local(d, stub_addr(s.family)));
+                    Ready::Owned(local(d, stub_addr(s.family)))
+                } else {
+                    Ready::Host(s.fd, s.ty, s.rcvtimeo)
                 }
-                Some((s.fd, s.ty, s.rcvtimeo))
             }
             Socket::Netlink(s) => {
                 // A dropped notification or reply is reported before what is queued (sock_error)
                 if s.overrun.take() {
-                    return Err(Errno::ENOBUFS);
+                    return Err(RecvErr::Sock(Errno::ENOBUFS));
                 }
                 if let Some((d, group)) = s.dequeue(max, peek) {
                     // From the kernel (pid 0), with the group a notification went to as a mask
@@ -3875,27 +4032,30 @@ pub(crate) fn recv(
                             &ucred,
                         );
                     }
-                    return Ok(m);
+                    Ready::Owned(m)
+                } else {
+                    let timeo = s.rcvtimeo;
+                    netlink_deadline.get_or_insert_with(|| timeo.map(|t| Instant::now() + t));
+                    Ready::Wait
                 }
-                let timeo = s.rcvtimeo;
-                netlink_deadline.get_or_insert_with(|| timeo.map(|t| Instant::now() + t));
-                None
             }
             Socket::Unix(_) => unreachable!("handled above"),
         };
-        match host {
-            Some(h) => break h,
+        match ready {
+            Ready::Host(fd, ty, timeo) => break (fd, ty, timeo),
+            Ready::Owned(m) => return finish_owned(cx, m, sink),
             // No netlink answer to read: wait until interrupted by a signal or until SO_RCVTIMEO
             // expires (before, it was ignored and the wait was forever)
-            None => {
+            Ready::Wait => {
                 let deadline = netlink_deadline.flatten();
                 if nonblock || deadline.is_some_and(|d| Instant::now() >= d) {
-                    return Err(Errno::EAGAIN);
+                    return Err(RecvErr::Sock(Errno::EAGAIN));
                 }
                 if cx.interrupted() {
-                    return Err(Errno::ERESTARTSYS);
+                    return Err(RecvErr::Sock(Errno::ERESTARTSYS));
                 }
-                cx.wait_objects(deadline, &mut [], wake::FILE, &[wake::of(sock)])?;
+                cx.wait_objects(deadline, &mut [], wake::FILE, &[wake::of(sock)])
+                    .map_err(RecvErr::Sock)?;
             }
         }
     };
@@ -3904,7 +4064,7 @@ pub(crate) fn recv(
         && let Socket::Inet(s) = &*sock.borrow()
         && s.pending_err.get() != 0
     {
-        return Err(Errno(s.pending_err.replace(0)));
+        return Err(RecvErr::Sock(Errno(s.pending_err.replace(0))));
     }
     // A UDP socket handed to the aggregation point: ICMP errors the host recorded for it would
     // make the receive fail, so take them off first; when the receive fails because of one, take
@@ -3915,34 +4075,43 @@ pub(crate) fn recv(
         if flags & MSG_ERRQUEUE == 0
             && let Some(e) = crate::rawicmp::take_error(sock)
         {
-            return Err(e);
+            return Err(RecvErr::Sock(e));
         }
     }
     let mut retried = false;
     let deadline = timeout.map(|t| Instant::now() + t);
-    let mut buf = vec![0u8; max];
+    let mut buf = NetScratch::take(max);
     let mut got = 0;
     // Peeked data will be read again later, and the error queue is not received traffic
     let counted = flags & (MSG_PEEK | MSG_ERRQUEUE) == 0;
     // MSG_WAITALL on a stream waits until `max` bytes are there, as Linux's tcp_recvmsg does: a
     // read takes them piece by piece, a peek looks at the head of the queue again each time
     let wait_all = flags & MSG_WAITALL != 0 && ty == SOCK_STREAM;
-    let peek = flags & MSG_PEEK != 0;
     // The last wait for more data to peek ended because the host fd was ready
     let mut peek_ready = false;
     loop {
         let host_flags = flags & !(MSG_DONTWAIT | MSG_WAITALL);
         let into = if peek { &mut buf[..] } else { &mut buf[got..] };
-        match appine_hal::net::recvmsg(host_fd, into, control_len, host_flags as i32) {
+        let need_addr = if ty == SOCK_STREAM {
+            want_addr
+        } else {
+            want_addr
+                || flags & MSG_PEEK == 0
+                || flags & MSG_ERRQUEUE != 0
+                || matches!(&*sock.borrow(), Socket::Inet(s) if s.vconn.is_some())
+        };
+        match appine_hal::net::recvmsg_opt(host_fd, into, control_len, need_addr, host_flags as i32)
+        {
             Ok(r) => {
                 // The peer is recorded (InetSocket::vconn): datagrams not from it are dropped
                 // (peeked ones must be taken off too)
-                let foreign = matches!(&*sock.borrow(),
-                    Socket::Inet(s) if s.vconn.as_ref().is_some_and(|v| !same_endpoint(v, &r.addr)));
+                let foreign = ty != SOCK_STREAM
+                    && matches!(&*sock.borrow(),
+                        Socket::Inet(s) if s.vconn.as_ref().is_some_and(|v| !same_endpoint(v, &r.addr)));
                 if foreign {
                     if flags & MSG_PEEK != 0 {
-                        let mut skip = vec![0u8; 1];
-                        let _ = appine_hal::net::recvmsg(host_fd, &mut skip, 0, 0);
+                        let mut skip = [0u8; 1];
+                        let _ = appine_hal::net::recvmsg_opt(host_fd, &mut skip, 0, false, 0);
                     }
                     continue;
                 }
@@ -3967,42 +4136,29 @@ pub(crate) fn recv(
                         continue;
                     }
                 }
-                buf.truncate(got);
                 let len = if ty == SOCK_STREAM { got } else { r.len };
                 // A stream receive with MSG_TRUNC discards the data, copying nothing to the
                 // buffer, and returns its length (tcp_recvmsg); the host wrote nothing into `buf`
-                if ty == SOCK_STREAM && flags & MSG_TRUNC != 0 {
-                    buf.clear();
-                }
+                let copied = if ty == SOCK_STREAM && flags & MSG_TRUNC != 0 {
+                    0
+                } else {
+                    got
+                };
                 if counted {
                     account(cx, sock, true, len, &r.addr);
                 }
-                let addr = match &*sock.borrow() {
-                    Socket::Inet(s) if !r.addr.is_empty() => {
-                        // From a mapped low port on the local machine: report the guest's port
-                        // (crate::portmap)
-                        let w = cx.kr().world();
-                        let a =
-                            translate_peer(&cx.kr().portmap, &w, s, &r.addr, s.self_port.is_some());
-                        // From the destination DNAT rewrote to: report the one the guest sent to
-                        match s
-                            .track
-                            .as_ref()
-                            .and_then(|k| k.nat_back.iter().find(|(t, _)| same_endpoint(t, &a)))
-                        {
-                            Some((_, o)) => o.clone(),
-                            None => a,
-                        }
-                    }
-                    _ => r.addr,
+                let addr = if need_addr {
+                    translate_recv_addr(cx, sock, r.addr)
+                } else {
+                    Vec::new()
                 };
                 // UDP: record the peers received from; sending back to them is ESTABLISHED
                 // (filter chains)
-                if let Socket::Inet(s) = &mut *sock.borrow_mut()
-                    && s.ty == SOCK_DGRAM
+                if ty == SOCK_DGRAM
+                    && flags & MSG_PEEK == 0
+                    && let Socket::Inet(s) = &mut *sock.borrow_mut()
                     && s.icmp.is_none()
                     && crate::netns::is_inet(&addr)
-                    && flags & MSG_PEEK == 0
                     && !s
                         .track
                         .as_ref()
@@ -4014,22 +4170,41 @@ pub(crate) fn recv(
                     }
                     seen.push(addr.clone());
                 }
-                return Ok(Message {
-                    data: buf,
-                    len,
-                    addr,
-                    control: r.control,
-                    rights: None,
-                    flags: r.flags as u32,
-                });
+                let data = match sink {
+                    RecvSink::Scatter { iovecs, off } => {
+                        scatter_received(cx, iovecs, off, &buf[..copied])
+                            .map_err(RecvErr::Scatter)?;
+                        Vec::new()
+                    }
+                    RecvSink::Collect => {
+                        if copied > 0 {
+                            buf[..copied].to_vec()
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                };
+                return Ok((
+                    copied,
+                    Message {
+                        data,
+                        len,
+                        addr,
+                        control: r.control,
+                        rights: None,
+                        flags: r.flags as u32,
+                    },
+                ));
             }
             Err(e) if e == Errno::EAGAIN.0 => {
                 // Also wake up when DNS stub answers come in: they do not go through the host
                 // socket
-                if let Socket::Inet(s) = &mut *sock.borrow_mut()
-                    && let Some(d) = take(&mut s.answers, peek)
-                {
-                    return Ok(local(d, stub_addr(s.family)));
+                let stub = match &mut *sock.borrow_mut() {
+                    Socket::Inet(s) => take(&mut s.answers, peek).map(|d| (d, stub_addr(s.family))),
+                    _ => None,
+                };
+                if let Some((d, addr)) = stub {
+                    return finish_owned(cx, local(d, addr), sink);
                 }
                 // A datagram socket shut down for reading: a blocking receive with nothing queued
                 // returns 0 (Linux's __skb_wait_for_more_packets checks RCV_SHUTDOWN before
@@ -4040,20 +4215,24 @@ pub(crate) fn recv(
                     && ty == SOCK_DGRAM
                     && matches!(&*sock.borrow(), Socket::Inet(s) if s.rd_shut)
                 {
-                    return Ok(Message {
-                        data: Vec::new(),
-                        len: 0,
-                        addr: Vec::new(),
-                        control: Vec::new(),
-                        rights: None,
-                        flags: 0,
-                    });
+                    return Ok((
+                        0,
+                        Message {
+                            data: Vec::new(),
+                            len: 0,
+                            addr: Vec::new(),
+                            control: Vec::new(),
+                            rights: None,
+                            flags: 0,
+                        },
+                    ));
                 }
                 // MSG_WAITALL with part of the data read: wait for the rest; nonblocking, a signal,
                 // the timeout or an error ends it with what was read (Linux's tcp_recvmsg returns
                 // what it copied and leaves the signal to be handled)
                 if got == 0 {
-                    wait_host(cx, sock, host_fd, POLLIN, nonblock, deadline, Errno::EAGAIN)?;
+                    wait_host(cx, sock, host_fd, POLLIN, nonblock, deadline, Errno::EAGAIN)
+                        .map_err(RecvErr::Sock)?;
                 } else if wait_host(cx, sock, host_fd, POLLIN, nonblock, deadline, Errno::EAGAIN)
                     .is_err()
                 {
@@ -4074,25 +4253,453 @@ pub(crate) fn recv(
                 }
                 break;
             }
-            Err(e) => return Err(Errno(e)),
+            Err(e) => return Err(RecvErr::Sock(Errno(e))),
         }
     }
     // Part of a MSG_WAITALL read
-    buf.truncate(got);
-    if ty == SOCK_STREAM && flags & MSG_TRUNC != 0 {
-        buf.clear();
-    }
+    let copied = if ty == SOCK_STREAM && flags & MSG_TRUNC != 0 {
+        0
+    } else {
+        got
+    };
     if counted {
         account(cx, sock, true, got, &[]);
     }
-    Ok(Message {
-        len: got,
-        data: buf,
-        addr: Vec::new(),
-        control: Vec::new(),
-        rights: None,
-        flags: 0,
-    })
+    let data = match sink {
+        RecvSink::Scatter { iovecs, off } => {
+            scatter_received(cx, iovecs, off, &buf[..copied]).map_err(RecvErr::Scatter)?;
+            Vec::new()
+        }
+        RecvSink::Collect => {
+            if copied > 0 {
+                buf[..copied].to_vec()
+            } else {
+                Vec::new()
+            }
+        }
+    };
+    Ok((
+        copied,
+        Message {
+            len: got,
+            data,
+            addr: Vec::new(),
+            control: Vec::new(),
+            rights: None,
+            flags: 0,
+        },
+    ))
+}
+
+/// Translates a host peer address returned by `recvmsg` back to guest coordinates, undoing
+/// low-port mapping, namespace translation and DNAT.
+fn translate_recv_addr(cx: &Cx<'_>, sock: &SocketRef, raw_addr: Vec<u8>) -> Vec<u8> {
+    if raw_addr.is_empty() {
+        return raw_addr;
+    }
+    match &*sock.borrow() {
+        Socket::Inet(s) => {
+            let w = cx.kr().world();
+            let a = translate_peer(&cx.kr().portmap, &w, s, &raw_addr, s.self_port.is_some());
+            match s
+                .track
+                .as_ref()
+                .and_then(|k| k.nat_back.iter().find(|(t, _)| same_endpoint(t, &a)))
+            {
+                Some((_, o)) => o.clone(),
+                None => a,
+            }
+        }
+        _ => raw_addr,
+    }
+}
+
+/// Direct zero-copy vectored receive for hot-page `SOCK_STREAM` calls without `MSG_PEEK`,
+/// `MSG_ERRQUEUE`, `MSG_TRUNC`, or `MSG_WAITALL`. Returns `Ok(None)` to fall back to
+/// [`NetScratch`] when any page is cold/CoW/FUSE/unmapped or the transfer exceeds
+/// [`DIRECT_IOV_MAX`] coalesced host spans.
+#[allow(clippy::too_many_arguments)]
+fn try_direct_recv_inet(
+    cx: &mut Cx<'_>,
+    sock: &SocketRef,
+    nonblock: bool,
+    iovecs: &[(u64, usize)],
+    max: usize,
+    control_len: usize,
+    flags: u32,
+    want_addr: bool,
+) -> Result<Option<(usize, Message)>, Errno> {
+    if max == 0 || flags & (MSG_PEEK | MSG_ERRQUEUE | MSG_TRUNC | MSG_WAITALL) != 0 {
+        return Ok(None);
+    }
+    let (host_fd, timeout) = match &*sock.borrow() {
+        Socket::Inet(s)
+            if s.ty == SOCK_STREAM
+                && s.icmp.is_none()
+                && s.udp_tap.is_none()
+                && s.answers.is_empty()
+                && s.vconn.is_none()
+                && s.pending_err.get() == 0 =>
+        {
+            (s.fd, s.rcvtimeo)
+        }
+        _ => return Ok(None),
+    };
+    let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
+    let host_flags = (flags & !MSG_DONTWAIT) as i32;
+    let deadline = timeout.map(|t| Instant::now() + t);
+    let mut spans = [(std::ptr::null_mut(), 0usize); DIRECT_IOV_MAX];
+    loop {
+        if matches!(&*sock.borrow(), Socket::Inet(s) if s.pending_err.get() != 0) {
+            return Ok(None);
+        }
+        let recv_res = {
+            let mm = cx.mm();
+            let Some((count, translated)) =
+                translate_iovecs(&mm, iovecs, 0, max, appine_engine::prot::WRITE, &mut spans)
+            else {
+                return Ok(None);
+            };
+            debug_assert_eq!(translated, max);
+            // SAFETY: BKL is held and `mm` is borrowed, so no thread can unmap or revoke write
+            // permissions on these guest pages; the host socket is SOCK_NONBLOCK so recvmsg never
+            // blocks or releases the BKL.
+            unsafe {
+                appine_hal::net::recvmsg_iov(
+                    host_fd,
+                    &spans[..count],
+                    control_len,
+                    want_addr,
+                    host_flags,
+                )
+            }
+        };
+        match recv_res {
+            Ok(r) => {
+                let got = r.len;
+                account(cx, sock, true, got, &r.addr);
+                let addr = if want_addr {
+                    translate_recv_addr(cx, sock, r.addr)
+                } else {
+                    Vec::new()
+                };
+                return Ok(Some((
+                    got,
+                    Message {
+                        data: Vec::new(),
+                        len: got,
+                        addr,
+                        control: r.control,
+                        rights: None,
+                        flags: r.flags as u32,
+                    },
+                )));
+            }
+            Err(e) if e == Errno::EAGAIN.0 => {
+                wait_host(cx, sock, host_fd, POLLIN, nonblock, deadline, Errno::EAGAIN)?;
+            }
+            Err(e) if e == Errno::EFAULT.0 => return Ok(None),
+            Err(e) => return Err(Errno(e)),
+        }
+    }
+}
+
+/// Direct zero-copy vectored send for hot-page `SOCK_STREAM` calls without `MSG_FASTOPEN`,
+/// destination address, or control data. Returns `Ok(None)` before sending anything if any page
+/// in the first chunk cannot be translated so callers fall back to [`NetScratch`].
+fn try_direct_send_inet(
+    cx: &mut Cx<'_>,
+    sock: &SocketRef,
+    nonblock: bool,
+    iovecs: &[(u64, usize)],
+    max_total: usize,
+    flags: u32,
+) -> Result<Option<usize>, Errno> {
+    if max_total == 0 || flags & MSG_FASTOPEN != 0 {
+        return Ok(None);
+    }
+    let (host_fd, timeout) = match &*sock.borrow() {
+        Socket::Inet(s)
+            if s.ty == SOCK_STREAM
+                && s.icmp.is_none()
+                && s.udp_tap.is_none()
+                && s.pending_err.get() == 0 =>
+        {
+            (s.fd, s.sndtimeo)
+        }
+        _ => return Ok(None),
+    };
+    let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
+    let host_flags = flags as i32 & !(MSG_DONTWAIT | MSG_NOSIGNAL) as i32;
+    let deadline = timeout.map(|t| Instant::now() + t);
+    let mut done = 0usize;
+    let mut spans = [(std::ptr::null_mut(), 0usize); DIRECT_IOV_MAX];
+    let mut rspans = [(std::ptr::null::<u8>(), 0usize); DIRECT_IOV_MAX];
+    let res = loop {
+        let chunk = (max_total - done).min(MSG_MAX);
+        let send_res = {
+            let mm = cx.mm();
+            let Some((count, translated)) = translate_iovecs(
+                &mm,
+                iovecs,
+                done,
+                chunk,
+                appine_engine::prot::READ,
+                &mut spans,
+            ) else {
+                if done == 0 {
+                    return Ok(None);
+                }
+                break Ok(None);
+            };
+            debug_assert_eq!(translated, chunk);
+            for (dst, &(ptr, len)) in rspans[..count].iter_mut().zip(&spans[..count]) {
+                *dst = (ptr as *const u8, len);
+            }
+            // SAFETY: BKL is held and `mm` is borrowed, so these guest pages stay mapped and
+            // readable; the host socket is SOCK_NONBLOCK so sendmsg never blocks.
+            unsafe { appine_hal::net::sendmsg_iov(host_fd, &rspans[..count], &[], &[], host_flags) }
+        };
+        match send_res {
+            Ok(n) => {
+                done += n;
+                if n == 0 || done == max_total || nonblock {
+                    break Ok(Some(done));
+                }
+            }
+            Err(e) if e == Errno::EAGAIN.0 => {
+                if let Err(err) = wait_host(
+                    cx,
+                    sock,
+                    host_fd,
+                    POLLOUT,
+                    nonblock,
+                    deadline,
+                    Errno::EAGAIN,
+                ) {
+                    break if done > 0 { Ok(Some(done)) } else { Err(err) };
+                }
+            }
+            Err(e) if e == Errno::EPIPE.0 => {
+                break if done > 0 {
+                    Ok(Some(done))
+                } else {
+                    Err(epipe(cx, flags))
+                };
+            }
+            Err(e) if e == Errno::EFAULT.0 && done == 0 => return Ok(None),
+            Err(e) => {
+                break if done > 0 {
+                    Ok(Some(done))
+                } else {
+                    Err(Errno(e))
+                };
+            }
+        }
+    };
+    if done > 0 {
+        account(cx, sock, false, done, &[]);
+    }
+    match res {
+        Ok(Some(n)) => Ok(Some(n)),
+        Ok(None) => {
+            // Earlier chunks were already sent directly; finish `[done..max_total]` via NetScratch
+            // with MSG_NOSIGNAL so cold pages fault in and any later error/fault returns `done`.
+            let tail_flags = flags | MSG_NOSIGNAL;
+            while done < max_total {
+                let want = (max_total - done).min(MSG_MAX);
+                let mut data = NetScratch::take(want);
+                let mut filled = 0;
+                let mut skip = done;
+                let mut fault = false;
+                for &(base, len) in iovecs {
+                    if skip >= len {
+                        skip -= len;
+                        continue;
+                    }
+                    let n = (len - skip).min(want - filled);
+                    if n == 0 {
+                        break;
+                    }
+                    if cx
+                        .mm()
+                        .read(
+                            UserSlice::new(base.wrapping_add(skip as u64), n),
+                            &mut data[filled..filled + n],
+                        )
+                        .is_err()
+                    {
+                        fault = true;
+                        break;
+                    }
+                    filled += n;
+                    skip = 0;
+                    if filled == want {
+                        break;
+                    }
+                }
+                if filled == 0 {
+                    break;
+                }
+                match send(cx, sock, nonblock, &data[..filled], &[], &[], tail_flags) {
+                    Ok(n) => {
+                        done += n;
+                        if fault || n < filled || nonblock {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            Ok(Some(done))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Translates `iovecs` starting at byte offset `skip` (capped at `max_bytes`) into coalesced host
+/// `(ptr, len)` spans using only already-mapped soft-MMU entries with permission `need`
+/// (`prot::READ` or `prot::WRITE`).
+///
+/// Returns `None` if any page is unmapped or lacks `need` (cold, CoW read-only, tmpfs unadmitted,
+/// unread FUSE, or invalid), or if more than [`DIRECT_IOV_MAX`] non-contiguous spans are needed.
+fn translate_iovecs(
+    mm: &crate::mm::Mm,
+    iovecs: &[(u64, usize)],
+    mut skip: usize,
+    max_bytes: usize,
+    need: u32,
+    out: &mut [(*mut u8, usize); DIRECT_IOV_MAX],
+) -> Option<(usize, usize)> {
+    let mmu = mm.mmu();
+    let page_size = appine_engine::PAGE_SIZE;
+    let mut total = 0usize;
+    let mut count = 0usize;
+    for &(base, len) in iovecs {
+        if skip >= len {
+            skip -= len;
+            continue;
+        }
+        let mut cur = base.checked_add(skip as u64)?;
+        let mut rem = (len - skip).min(max_bytes - total);
+        skip = 0;
+        while rem > 0 {
+            let page_left = (page_size - cur % page_size) as usize;
+            let chunk = page_left.min(rem);
+            let host = mmu.translate(cur, need)?.as_ptr();
+            if count > 0 {
+                let (prev_ptr, prev_len) = out[count - 1];
+                if (prev_ptr as usize).checked_add(prev_len) == Some(host as usize) {
+                    out[count - 1].1 = prev_len + chunk;
+                    cur = cur.checked_add(chunk as u64)?;
+                    total += chunk;
+                    rem -= chunk;
+                    continue;
+                }
+            }
+            if count == DIRECT_IOV_MAX {
+                return None;
+            }
+            out[count] = (host, chunk);
+            count += 1;
+            cur = cur.checked_add(chunk as u64)?;
+            total += chunk;
+            rem -= chunk;
+        }
+        if total == max_bytes {
+            break;
+        }
+    }
+    Some((count, total))
+}
+
+thread_local! {
+    /// Per-thread scratch buffer reused across socket send and receive syscalls.
+    ///
+    /// Stored as an owned `Vec<u8>` in a `Cell` rather than a `RefCell`: callers take ownership
+    /// for one operation via [`NetScratch`], so no `RefCell` borrow is held across blocking waits
+    /// (`wait_host` / `wait_peek`) or FUSE page fills (`copy_result`), and re-entrant socket I/O
+    /// on the same thread safely falls back to a transient `Vec` instead of panicking.
+    #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
+    static NET_SCRATCH: Cell<Vec<u8>> = const { Cell::new(Vec::new()) };
+}
+
+/// RAII guard for a per-thread socket I/O scratch slice of exact length `len`.
+///
+/// The cached `Vec<u8>` retains its initialized high-water mark (up to [`NET_SCRATCH_CAP`])
+/// across calls so warm socket I/O neither allocates nor re-zeroes. Callers must only read or
+/// copy out bytes overwritten in the current operation (`&scratch[..got]`) and never assume the
+/// slice is zero-filled. Oversized transfers (`> NET_SCRATCH_CAP`, up to [`MSG_MAX`]) use a
+/// transient buffer freed on drop.
+struct NetScratch {
+    buf: Vec<u8>,
+    len: usize,
+}
+
+impl NetScratch {
+    /// Minimum cached allocation once a thread needs scratch space, avoiding repeated tiny
+    /// reallocations as transfer sizes grow toward a page or [`NET_SCRATCH_CAP`].
+    const MIN_CAP: usize = 4096;
+
+    fn take(len: usize) -> Self {
+        if len == 0 {
+            return Self {
+                buf: Vec::new(),
+                len: 0,
+            };
+        }
+        if len > NET_SCRATCH_CAP {
+            return Self {
+                buf: vec![0u8; len],
+                len,
+            };
+        }
+        let mut buf = NET_SCRATCH.try_with(Cell::take).unwrap_or_default();
+        if buf.capacity() < len {
+            let target = len
+                .max(Self::MIN_CAP)
+                .next_power_of_two()
+                .min(NET_SCRATCH_CAP);
+            buf.reserve_exact(target - buf.len());
+        }
+        if buf.len() < len {
+            buf.resize(len, 0);
+        }
+        Self { buf, len }
+    }
+}
+
+impl Deref for NetScratch {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl DerefMut for NetScratch {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.buf[..self.len]
+    }
+}
+
+impl Drop for NetScratch {
+    fn drop(&mut self) {
+        let buf = std::mem::take(&mut self.buf);
+        if buf.capacity() == 0 || buf.capacity() > NET_SCRATCH_CAP {
+            return;
+        }
+        let _ = NET_SCRATCH.try_with(|cell| {
+            let existing = cell.take();
+            if buf.capacity() > existing.capacity()
+                || (buf.capacity() == existing.capacity() && buf.len() > existing.len())
+            {
+                cell.set(buf);
+            } else {
+                cell.set(existing);
+            }
+        });
+    }
 }
 
 /// Waits for a MSG_PEEK|MSG_WAITALL peek to have `want` bytes to look at: the host socket's
@@ -6028,5 +6635,550 @@ mod tests {
             (1, DROP_TCP.to_vec())
         );
         assert!(filter_locked(fd2));
+    }
+
+    fn with_test_cx(f: impl FnOnce(&mut Cx<'_>)) {
+        use std::sync::Arc;
+
+        use crate::fd::FdTable;
+        use crate::kernel::{Kernel, Shared};
+        use crate::mm::Mm;
+        use crate::process::{RLIMIT_NOFILE, ThreadGroup, Tier};
+        use crate::signal::SigHandlers;
+        use crate::task::{FsContext, Task, TaskState};
+        use crate::vfs::{INIT_MNT_NS, MntNs, Node};
+
+        let shared = Arc::new(Shared::new(Kernel::new(Tier::Interpreter)));
+        let _cpu = {
+            let mut k = shared.lock();
+            let group = Rc::new(RefCell::new(ThreadGroup::new(
+                10,
+                1,
+                Rc::new(RefCell::new(SigHandlers::default())),
+            )));
+            group.borrow_mut().rlimits[RLIMIT_NOFILE as usize] = (4096, 4096);
+            let mm = Mm::new().into_shared();
+            let fds = Rc::new(RefCell::new(FdTable::with_host_stdio()));
+            let fs = Rc::new(RefCell::new(FsContext {
+                root: Node::ROOT,
+                cwd: Node::ROOT,
+                umask: 0o022,
+                mnt_ns: MntNs::standalone(INIT_MNT_NS, crate::cred::UserNs::init()),
+            }));
+            let cpu = unsafe { appine_engine::Cpu::new(mm.borrow().mmu()) };
+            let state = TaskState {
+                mm,
+                fds,
+                fs,
+                group: group.clone(),
+                vfs: None,
+                altstack: Default::default(),
+                clear_child_tid: 0,
+                vfork_done: None,
+                restart: None,
+                fast_sleep: None,
+                sem_undo: Rc::new(crate::ipc::SemUndo::new()),
+            };
+            let task = Task::new(10, 10, &cpu, state, k.init_ns.clone(), 0, [0; 16]).unwrap();
+            group.borrow_mut().threads.push(10);
+            k.groups.insert(10, group);
+            k.tasks.insert(10, task.clone());
+
+            let mut t = task.state.borrow_mut();
+            let mut cx = Cx::new(&shared, k, &task, &mut t);
+            f(&mut cx);
+            cpu
+        };
+    }
+
+    fn tcp_pair(cx: &mut Cx<'_>, nonblock: bool) -> (i32, i32) {
+        let nb = if nonblock { SOCK_NONBLOCK } else { 0 };
+        let lfd = socket(cx, AF_INET, SOCK_STREAM as u32 | SOCK_NONBLOCK, 0).unwrap() as i32;
+        let lo = sockaddr_in([127, 0, 0, 1], 0);
+        let addr_va = 0x1000_0000u64;
+        cx.mm()
+            .write(UserSlice::new(addr_va, lo.len()), &lo)
+            .unwrap();
+        bind(cx, lfd, addr_va, lo.len() as u32).unwrap();
+        listen(cx, lfd, 8).unwrap();
+        let len_va = addr_va + 64;
+        put(cx, len_va, (lo.len() as u32).to_le_bytes()).unwrap();
+        getsockname(cx, lfd, addr_va, len_va).unwrap();
+
+        let cfd = socket(cx, AF_INET, SOCK_STREAM as u32 | nb, 0).unwrap() as i32;
+        match connect(cx, cfd, addr_va, lo.len() as u32) {
+            Ok(_) | Err(Errno::EINPROGRESS) => {}
+            Err(e) => panic!("connect failed: {e:?}"),
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let sfd = loop {
+            match accept4(cx, lfd, 0, 0, nb) {
+                Ok(fd) => break fd as i32,
+                Err(Errno::EAGAIN) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!("accept4 failed: {e:?}"),
+            }
+        };
+        if nonblock {
+            let (_, csock, _) = socket_of(cx, cfd).unwrap();
+            let host_fd = match &*csock.borrow() {
+                Socket::Inet(s) => s.fd,
+                _ => unreachable!(),
+            };
+            let mut pfd = [(host_fd, POLLOUT, 0)];
+            appine_hal::poll(&mut pfd, Some(Duration::from_secs(2))).unwrap();
+        }
+        let _ = cx.fds_mut().close(lfd);
+        (cfd, sfd)
+    }
+
+    fn write_msghdr(
+        cx: &Cx<'_>,
+        hdr: u64,
+        name: (u64, u32),
+        iov: (u64, usize),
+        control: (u64, usize),
+    ) {
+        let mut b = [0u8; 56];
+        b[0..8].copy_from_slice(&name.0.to_le_bytes());
+        b[8..12].copy_from_slice(&name.1.to_le_bytes());
+        b[16..24].copy_from_slice(&iov.0.to_le_bytes());
+        b[24..32].copy_from_slice(&(iov.1 as u64).to_le_bytes());
+        b[32..40].copy_from_slice(&control.0.to_le_bytes());
+        b[40..48].copy_from_slice(&(control.1 as u64).to_le_bytes());
+        cx.mm().write(UserSlice::new(hdr, b.len()), &b).unwrap();
+    }
+
+    fn write_iovecs(cx: &Cx<'_>, iov: u64, entries: &[(u64, usize)]) {
+        for (i, &(base, len)) in entries.iter().enumerate() {
+            let mut v = [0u8; 16];
+            v[0..8].copy_from_slice(&base.to_le_bytes());
+            v[8..16].copy_from_slice(&(len as u64).to_le_bytes());
+            cx.mm()
+                .write(UserSlice::new(iov + (i as u64) * 16, 16), &v)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn net_scratch_reuses_capped_buffer_handles_reentrancy_and_frees_oversized() {
+        let empty = NetScratch::take(0);
+        assert_eq!(empty.len(), 0);
+        assert_eq!(empty.buf.capacity(), 0);
+        drop(empty);
+
+        // Warm reuse keeps capacity and high-water mark without re-zeroing.
+        let (ptr1, cap1) = {
+            let mut s = NetScratch::take(1024);
+            assert_eq!(s.len(), 1024);
+            assert!(s.buf.capacity() >= NetScratch::MIN_CAP);
+            s.fill(0xA5);
+            (s.as_ptr(), s.buf.capacity())
+        };
+        {
+            let mut outer = NetScratch::take(512);
+            assert_eq!(outer.as_ptr(), ptr1);
+            assert_eq!(outer.buf.capacity(), cap1);
+            assert_eq!(outer[0], 0xA5);
+
+            // Re-entrant take allocates a separate buffer instead of panicking; the larger
+            // capacity (<= NET_SCRATCH_CAP) wins when both drop.
+            let inner = NetScratch::take(16384);
+            assert_ne!(inner.as_ptr(), outer.as_ptr());
+            assert!(inner.buf.capacity() >= 16384);
+            outer[0] = 0x5A;
+            drop(inner);
+        }
+        {
+            let grown = NetScratch::take(8192);
+            assert!(grown.buf.capacity() >= 16384);
+            assert!(grown.buf.capacity() <= NET_SCRATCH_CAP);
+        }
+
+        // Oversized (> NET_SCRATCH_CAP) uses a transient allocation freed on drop.
+        let cached_before = {
+            let s = NetScratch::take(8192);
+            (s.as_ptr(), s.buf.capacity())
+        };
+        let big = NetScratch::take(NET_SCRATCH_CAP + 4096);
+        assert_eq!(big.len(), NET_SCRATCH_CAP + 4096);
+        assert_ne!(big.as_ptr(), cached_before.0);
+        drop(big);
+        let after = NetScratch::take(8192);
+        assert_eq!(after.as_ptr(), cached_before.0);
+        assert_eq!(after.buf.capacity(), cached_before.1);
+    }
+
+    #[test]
+    fn socket_io_zero_length_eagain_peek_waitall_trunc_control_large_and_efault() {
+        with_test_cx(|cx| {
+            let rw_prot = appine_engine::prot::READ | appine_engine::prot::WRITE;
+            let base = 0x1000_0000u64;
+            let page = appine_engine::PAGE_SIZE;
+            // 0x1000_0000..+64 KiB: scratch/control/msghdr/small buffers (warm).
+            cx.mm_mut().map_anonymous(base, 16 * page, rw_prot).unwrap();
+            // 0x1010_0000..+4 KiB: read-only page for EFAULT recv tests.
+            let ro_va = 0x1010_0000u64;
+            cx.mm_mut()
+                .map_anonymous(ro_va, page, appine_engine::prot::READ)
+                .unwrap();
+            // 0x1020_0000..+512 KiB: cold anonymous region for >256 KiB tests.
+            let large_tx_va = 0x1020_0000u64;
+            let large_rx_va = 0x1030_0000u64;
+            cx.mm_mut()
+                .map_anonymous(large_tx_va, 128 * page, rw_prot)
+                .unwrap();
+            cx.mm_mut()
+                .map_anonymous(large_rx_va, 128 * page, rw_prot)
+                .unwrap();
+            let unmapped_va = 0x2000_0000u64;
+
+            let (cfd, sfd) = tcp_pair(cx, true);
+            let (_, csock, _) = socket_of(cx, cfd).unwrap();
+            let (_, ssock, _) = socket_of(cx, sfd).unwrap();
+
+            let tx_va = base + 0x1000;
+            let rx_va = base + 0x2000;
+            let hdr_va = base + 0x3000;
+            let iov_va = base + 0x3100;
+            let ctrl_va = base + 0x3200;
+
+            // 1. Zero-length TCP rw read and sendto.
+            assert_eq!(rw(cx, &ssock, true, &[(rx_va, 0)], false), Ok(0));
+            assert_eq!(sendto(cx, cfd, tx_va, 0, 0, 0, 0), Ok(0));
+
+            // 2. Nonblocking EAGAIN on TCP recvfrom and recvmsg (with and without control room).
+            assert_eq!(recvfrom(cx, sfd, rx_va, 64, 0, 0, 0), Err(Errno::EAGAIN));
+            write_iovecs(cx, iov_va, &[(rx_va, 64)]);
+            write_msghdr(cx, hdr_va, (0, 0), (iov_va, 1), (0, 0));
+            assert_eq!(recvmsg(cx, sfd, hdr_va, 0), Err(Errno::EAGAIN));
+            write_msghdr(cx, hdr_va, (0, 0), (iov_va, 1), (ctrl_va, 128));
+            assert_eq!(recvmsg(cx, sfd, hdr_va, 0), Err(Errno::EAGAIN));
+
+            // 3. MSG_PEEK and MSG_PEEK | MSG_WAITALL without leaking dirty NetScratch bytes.
+            let payload = b"hello world";
+            cx.mm()
+                .write(UserSlice::new(tx_va, payload.len()), payload)
+                .unwrap();
+            assert_eq!(sendto(cx, cfd, tx_va, payload.len(), 0, 0, 0), Ok(11));
+            {
+                let mut dirty = NetScratch::take(4096);
+                dirty.fill(0xCC);
+            }
+            cx.mm()
+                .write(UserSlice::new(rx_va, 16), &[0xEE; 16])
+                .unwrap();
+            assert_eq!(recvfrom(cx, sfd, rx_va, 5, MSG_PEEK, 0, 0), Ok(5));
+            let mut got = [0u8; 16];
+            cx.mm().read(UserSlice::new(rx_va, 16), &mut got).unwrap();
+            assert_eq!(&got[..5], b"hello");
+            assert_eq!(&got[5..], &[0xEE; 11]);
+            // Nonblocking MSG_PEEK|MSG_WAITALL for more than queued returns available prefix.
+            assert_eq!(
+                recvfrom(cx, sfd, rx_va, 16, MSG_PEEK | MSG_WAITALL, 0, 0),
+                Ok(11)
+            );
+            cx.mm().read(UserSlice::new(rx_va, 16), &mut got).unwrap();
+            assert_eq!(&got[..11], payload);
+            assert_eq!(&got[11..], &[0xEE; 5]);
+            // Consuming read gets the full payload (direct hot-page fast path).
+            cx.mm()
+                .write(UserSlice::new(rx_va, 16), &[0xDD; 16])
+                .unwrap();
+            assert_eq!(recvfrom(cx, sfd, rx_va, 16, 0, 0, 0), Ok(11));
+            cx.mm().read(UserSlice::new(rx_va, 16), &mut got).unwrap();
+            assert_eq!(&got[..11], payload);
+            assert_eq!(&got[11..], &[0xDD; 5]);
+
+            // 4. TCP MSG_TRUNC discards bytes without touching guest buffer (NULL is valid).
+            assert_eq!(sendto(cx, cfd, tx_va, payload.len(), 0, 0, 0), Ok(11));
+            assert_eq!(recvfrom(cx, sfd, 0, 64, MSG_TRUNC, 0, 0), Ok(11));
+            assert_eq!(recvfrom(cx, sfd, rx_va, 16, 0, 0, 0), Err(Errno::EAGAIN));
+
+            // 5. EFAULT edge cases on TCP: bad send buffer, bad recv buffer, read-only recv
+            //    buffer, bad addrlen after data, and stream rw partial fault.
+            assert_eq!(sendto(cx, cfd, unmapped_va, 8, 0, 0, 0), Err(Errno::EFAULT));
+            assert_eq!(
+                sendto(cx, cfd, tx_va, 4, 0, unmapped_va, 16),
+                Err(Errno::EFAULT)
+            );
+            assert_eq!(sendto(cx, cfd, tx_va, 5, 0, 0, 0), Ok(5));
+            assert_eq!(
+                recvfrom(cx, sfd, unmapped_va, 5, 0, 0, 0),
+                Err(Errno::EFAULT)
+            );
+            assert_eq!(sendto(cx, cfd, tx_va, 5, 0, 0, 0), Ok(5));
+            assert_eq!(recvfrom(cx, sfd, ro_va, 5, 0, 0, 0), Err(Errno::EFAULT));
+            assert_eq!(sendto(cx, cfd, tx_va, 5, 0, 0, 0), Ok(5));
+            assert_eq!(
+                recvfrom(cx, sfd, rx_va, 5, 0, base + 0x4000, 0),
+                Err(Errno::EFAULT)
+            );
+            // Stream rw with [valid 5B, unmapped 5B] sends the valid prefix and returns 5.
+            assert_eq!(
+                rw(cx, &csock, true, &[(tx_va, 5), (unmapped_va, 5)], true),
+                Ok(5)
+            );
+            assert_eq!(recvfrom(cx, sfd, rx_va, 16, 0, 0, 0), Ok(5));
+
+            // 6. Large (> 256 KiB) TCP transfer: first onto cold pages (NetScratch fallback),
+            //    then onto hot pages (direct iovec fast path).
+            let large_len = 320 * 1024;
+            let pattern: Vec<u8> = (0..large_len)
+                .map(|i| ((i * 31) ^ (i >> 8)) as u8)
+                .collect();
+            cx.mm()
+                .write(UserSlice::new(large_tx_va, large_len), &pattern)
+                .unwrap();
+            let (bc, bs) = tcp_pair(cx, false);
+            let (_, bcsock, _) = socket_of(cx, bc).unwrap();
+            let (_, bssock, _) = socket_of(cx, bs).unwrap();
+            let bs_host = match &*bssock.borrow() {
+                Socket::Inet(s) => s.fd,
+                _ => unreachable!(),
+            };
+            // Verify large_rx_va is still cold before the first receive.
+            assert!(
+                cx.mm()
+                    .mmu()
+                    .translate(large_rx_va, appine_engine::prot::WRITE)
+                    .is_none()
+            );
+            let sender = std::thread::spawn(move || {
+                // Drain in a helper thread while the guest writes, then echo back.
+                let mut tmp = vec![0u8; 65536];
+                let mut total = Vec::with_capacity(large_len);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while total.len() < large_len {
+                    let mut pfd = [(bs_host, POLLIN, 0)];
+                    appine_hal::poll(
+                        &mut pfd,
+                        Some(deadline.saturating_duration_since(Instant::now())),
+                    )
+                    .unwrap();
+                    match appine_hal::net::recvmsg_opt(bs_host, &mut tmp, 0, false, 0) {
+                        Ok(r) if r.len > 0 => total.extend_from_slice(&tmp[..r.len]),
+                        Err(e) if e == Errno::EAGAIN.0 => {}
+                        Ok(r) => panic!("unexpected EOF/empty recv: len={}", r.len),
+                        Err(e) => panic!("unexpected recv errno: {e}"),
+                    }
+                }
+                let mut sent = 0;
+                while sent < total.len() {
+                    let mut pfd = [(bs_host, POLLOUT, 0)];
+                    appine_hal::poll(
+                        &mut pfd,
+                        Some(deadline.saturating_duration_since(Instant::now())),
+                    )
+                    .unwrap();
+                    match appine_hal::net::sendmsg(bs_host, &total[sent..], &[], &[], 0) {
+                        Ok(n) => sent += n,
+                        Err(e) if e == Errno::EAGAIN.0 => {}
+                        Err(e) => panic!("unexpected send: {e}"),
+                    }
+                }
+            });
+            // Send 320 KiB through rw (direct hot-page sendmsg_iov) and receive with MSG_WAITALL
+            // onto cold pages (NetScratch > 256 KiB transient path).
+            assert_eq!(
+                rw(cx, &bcsock, false, &[(large_tx_va, large_len)], true),
+                Ok(large_len as u64)
+            );
+            assert_eq!(
+                recvfrom(cx, bc, large_rx_va, large_len, MSG_WAITALL, 0, 0),
+                Ok(large_len as u64)
+            );
+            sender.join().unwrap();
+            let mut echoed = vec![0u8; large_len];
+            cx.mm()
+                .read(UserSlice::new(large_rx_va, large_len), &mut echoed)
+                .unwrap();
+            assert_eq!(echoed, pattern);
+
+            // Now large_rx_va is hot: verify direct vectored sendmsg/recvmsg across 2 iovecs.
+            let half = 64 * 1024;
+            write_iovecs(
+                cx,
+                iov_va,
+                &[(large_tx_va, half), (large_tx_va + half as u64, half)],
+            );
+            write_msghdr(cx, hdr_va, (0, 0), (iov_va, 2), (0, 0));
+            assert_eq!(sendmsg(cx, bc, hdr_va, 0), Ok((2 * half) as u64));
+            let mut got_total = 0usize;
+            while got_total < 2 * half {
+                let first_rem = half.saturating_sub(got_total);
+                let vecs = if first_rem > 0 {
+                    vec![
+                        (large_rx_va + got_total as u64, first_rem),
+                        (large_rx_va + half as u64, half),
+                    ]
+                } else {
+                    vec![(large_rx_va + got_total as u64, 2 * half - got_total)]
+                };
+                write_iovecs(cx, iov_va, &vecs);
+                write_msghdr(cx, hdr_va, (0, 0), (iov_va, vecs.len()), (0, 0));
+                got_total += recvmsg(cx, bs, hdr_va, 0).unwrap() as usize;
+            }
+            let mut vec_out = vec![0u8; 2 * half];
+            cx.mm()
+                .read(UserSlice::new(large_rx_va, 2 * half), &mut vec_out)
+                .unwrap();
+            assert_eq!(vec_out, pattern[..2 * half]);
+
+            // 7. UDP: zero-length datagram, EAGAIN, MSG_TRUNC returning full length, control
+            //    messages (IP_PKTINFO with valid/null/heap/unmapped control buf), and datagram
+            //    rw fault rejecting the entire message.
+            let u_srv = socket(cx, AF_INET, SOCK_DGRAM as u32 | SOCK_NONBLOCK, 0).unwrap() as i32;
+            let u_cli = socket(cx, AF_INET, SOCK_DGRAM as u32 | SOCK_NONBLOCK, 0).unwrap() as i32;
+            let u_addr_va = base + 0x5000;
+            let u_len_va = base + 0x5040;
+            let lo = sockaddr_in([127, 0, 0, 1], 0);
+            cx.mm()
+                .write(UserSlice::new(u_addr_va, lo.len()), &lo)
+                .unwrap();
+            bind(cx, u_srv, u_addr_va, lo.len() as u32).unwrap();
+            put(cx, u_len_va, (lo.len() as u32).to_le_bytes()).unwrap();
+            getsockname(cx, u_srv, u_addr_va, u_len_va).unwrap();
+            connect(cx, u_cli, u_addr_va, lo.len() as u32).unwrap();
+            // Enable IP_PKTINFO on u_srv.
+            put(cx, base + 0x5080, 1i32.to_le_bytes()).unwrap();
+            setsockopt(cx, u_srv, SOL_IP, 8, base + 0x5080, 4).unwrap();
+
+            assert_eq!(recvfrom(cx, u_srv, rx_va, 32, 0, 0, 0), Err(Errno::EAGAIN));
+            // Zero-length UDP datagram.
+            let (_, u_cli_sock, _) = socket_of(cx, u_cli).unwrap();
+            assert_eq!(rw(cx, &u_cli_sock, true, &[(tx_va, 0)], true), Ok(0));
+            assert_eq!(recvfrom(cx, u_srv, rx_va, 32, 0, 0, 0), Ok(0));
+            // Datagram rw with [valid, unmapped] returns EFAULT and sends nothing.
+            assert_eq!(
+                rw(cx, &u_cli_sock, true, &[(tx_va, 4), (unmapped_va, 4)], true),
+                Err(Errno::EFAULT)
+            );
+            assert_eq!(recvfrom(cx, u_srv, rx_va, 32, 0, 0, 0), Err(Errno::EAGAIN));
+
+            // UDP MSG_TRUNC returns full datagram length (11) while copying only 4 bytes.
+            assert_eq!(
+                sendto(cx, u_cli, tx_va, payload.len(), 0, 0, 0),
+                Ok(payload.len() as u64)
+            );
+            cx.mm()
+                .write(UserSlice::new(rx_va, 16), &[0xBB; 16])
+                .unwrap();
+            assert_eq!(recvfrom(cx, u_srv, rx_va, 4, MSG_TRUNC, 0, 0), Ok(11));
+            cx.mm().read(UserSlice::new(rx_va, 16), &mut got).unwrap();
+            assert_eq!(&got[..4], b"hell");
+            assert_eq!(&got[4..], &[0xBB; 12]);
+
+            // Control messages: stack path (128 B), heap path (1024 B), null control (MSG_CTRUNC),
+            // and unmapped control buffer (MSG_CTRUNC + controllen 0, payload preserved).
+            let src_va = base + 0x5100;
+            for (ctrl_ptr, ctrl_len, expect_cmsg, expect_ctrunc) in [
+                (ctrl_va, 128usize, true, false),
+                (ctrl_va, 1024usize, true, false),
+                (0u64, 128usize, false, true),
+                (unmapped_va, 128usize, false, true),
+            ] {
+                assert_eq!(sendto(cx, u_cli, tx_va, 5, 0, 0, 0), Ok(5));
+                write_iovecs(cx, iov_va, &[(rx_va, 16)]);
+                write_msghdr(cx, hdr_va, (src_va, 16), (iov_va, 1), (ctrl_ptr, ctrl_len));
+                assert_eq!(recvmsg(cx, u_srv, hdr_va, 0), Ok(5));
+                let out_namelen = u32::from_le_bytes(get(cx, hdr_va + 8).unwrap());
+                let out_clen = u64::from_le_bytes(get(cx, hdr_va + 40).unwrap());
+                let out_flags = u32::from_le_bytes(get(cx, hdr_va + 48).unwrap());
+                assert_eq!(out_namelen, 16);
+                assert_eq!(out_clen > 0, expect_cmsg);
+                assert_eq!(out_flags & MSG_CTRUNC != 0, expect_ctrunc);
+            }
+
+            // 8. CoW safety: after Mm::fork, receiving into a shared CoW page breaks CoW via
+            //    NetScratch fallback and does not mutate the child's copy.
+            let cow_va = base + 0x6000;
+            cx.mm()
+                .write(UserSlice::new(cow_va, 8), b"ORIGINAL")
+                .unwrap();
+            let child_mm = cx.mm_mut().fork().unwrap();
+            assert!(
+                cx.mm()
+                    .mmu()
+                    .translate(cow_va, appine_engine::prot::WRITE)
+                    .is_none()
+            );
+            assert_eq!(sendto(cx, cfd, tx_va, 5, 0, 0, 0), Ok(5));
+            assert_eq!(recvfrom(cx, sfd, cow_va, 5, 0, 0, 0), Ok(5));
+            let mut parent_bytes = [0u8; 8];
+            let mut child_bytes = [0u8; 8];
+            cx.mm()
+                .read(UserSlice::new(cow_va, 8), &mut parent_bytes)
+                .unwrap();
+            child_mm
+                .borrow()
+                .read(UserSlice::new(cow_va, 8), &mut child_bytes)
+                .unwrap();
+            assert_eq!(&parent_bytes, b"helloNAL");
+            assert_eq!(&child_bytes, b"ORIGINAL");
+
+            // 9. MSG_WAITALL partial on EOF and > MSG_MAX (recv_rest piece-by-piece).
+            let (wc, ws) = tcp_pair(cx, false);
+            assert_eq!(sendto(cx, ws, tx_va, 5, 0, 0, 0), Ok(5));
+            shutdown(cx, ws, 1).unwrap();
+            assert_eq!(recvfrom(cx, wc, rx_va, 16, MSG_WAITALL, 0, 0), Ok(5));
+            assert_eq!(recvfrom(cx, wc, rx_va, 16, MSG_WAITALL, 0, 0), Ok(0));
+
+            let (mc, ms) = tcp_pair(cx, false);
+            let (_, mssock, _) = socket_of(cx, ms).unwrap();
+            let ms_host = match &*mssock.borrow() {
+                Socket::Inet(s) => s.fd,
+                _ => unreachable!(),
+            };
+            let over_max = MSG_MAX + 16 * 1024;
+            let over_va = 0x1040_0000u64;
+            cx.mm_mut()
+                .map_anonymous(over_va, (over_max as u64).next_multiple_of(page), rw_prot)
+                .unwrap();
+            let feeder = std::thread::spawn(move || {
+                let mut chunk = vec![0u8; 65536];
+                let mut sent = 0usize;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while sent < over_max {
+                    let n = (over_max - sent).min(chunk.len());
+                    for (i, b) in chunk[..n].iter_mut().enumerate() {
+                        *b = ((sent + i) ^ ((sent + i) >> 8)) as u8;
+                    }
+                    let mut pfd = [(ms_host, POLLOUT, 0)];
+                    appine_hal::poll(
+                        &mut pfd,
+                        Some(deadline.saturating_duration_since(Instant::now())),
+                    )
+                    .unwrap();
+                    match appine_hal::net::sendmsg(ms_host, &chunk[..n], &[], &[], 0) {
+                        Ok(k) => sent += k,
+                        Err(e) if e == Errno::EAGAIN.0 => {}
+                        Err(e) => panic!("feeder send errno: {e}"),
+                    }
+                }
+            });
+            assert_eq!(
+                recvfrom(cx, mc, over_va, over_max, MSG_WAITALL, 0, 0),
+                Ok(over_max as u64)
+            );
+            feeder.join().unwrap();
+            let mut tail = [0u8; 64];
+            let tail_off = over_max - tail.len();
+            cx.mm()
+                .read(
+                    UserSlice::new(over_va + tail_off as u64, tail.len()),
+                    &mut tail,
+                )
+                .unwrap();
+            for (i, &b) in tail.iter().enumerate() {
+                let idx = tail_off + i;
+                assert_eq!(b, (idx ^ (idx >> 8)) as u8);
+            }
+
+            for fd in [cfd, sfd, bc, bs, u_srv, u_cli, wc, ws, mc, ms] {
+                let _ = cx.fds_mut().close(fd);
+            }
+        });
     }
 }
