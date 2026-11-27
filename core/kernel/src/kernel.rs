@@ -755,7 +755,16 @@ impl Kernel {
     }
 
     fn flush_wakeups(&self) {
-        let (channels, objects) = PENDING.with_borrow_mut(std::mem::take);
+        let (channels, mut objects) = PENDING.with_borrow_mut(|(c, o)| {
+            let channels = *c;
+            *c = 0;
+            let objects = if o.is_empty() {
+                Vec::new()
+            } else {
+                std::mem::take(o)
+            };
+            (channels, objects)
+        });
         if channels == 0 {
             return;
         }
@@ -773,7 +782,23 @@ impl Kernel {
                 signal_later(event);
             }
         }
+        // Return the buffer to PENDING so repeated wake-ups reuse its allocation instead of
+        // re-allocating on every BKL hold, capped to avoid pinning a one-off huge burst.
+        if objects.capacity() > 0 && objects.capacity() <= 1024 {
+            objects.clear();
+            PENDING.with_borrow_mut(|(_, o)| {
+                if o.is_empty() && objects.capacity() > o.capacity() {
+                    *o = objects;
+                }
+            });
+        }
     }
+}
+
+/// Whether this thread recorded any pending wake-up requests while holding the BKL.
+#[inline]
+fn has_pending_wakeups() -> bool {
+    PENDING.with_borrow(|(c, _)| *c != 0)
 }
 
 // ---- The BKL ----
@@ -990,9 +1015,11 @@ impl DerefMut for Bkl<'_> {
 impl Drop for Bkl<'_> {
     fn drop(&mut self) {
         // A terminal whose last master was closed while the lock was held must be hung up, and
-        // hanging up sends signals and wakes waiters
+        // hanging up sends signals and wakes waiters. Skip catch_unwind when nothing closed.
         let k: &mut Kernel = &mut self.0;
-        if crate::bug::catch(|| crate::syscall::hang_up_closed(k)).is_none() {
+        if crate::tty::has_closed()
+            && crate::bug::catch(|| crate::syscall::hang_up_closed(k)).is_none()
+        {
             crate::bug::report(format_args!("kernel panic while hanging up terminals"));
         }
         // Any IPC namespace whose last holder (task, nsfs file, pinned sysctl, or mount) dropped
@@ -1001,9 +1028,10 @@ impl Drop for Bkl<'_> {
             crate::bug::report(format_args!("kernel panic while collecting IPC namespaces"));
         }
         // Contain wake-up matching so a panic can never skip releasing the BKL; on failure, wake
-        // all waiters directly so none remain parked forever
+        // all waiters directly so none remain parked forever. Skip catch_unwind when no wake-ups
+        // were queued during this hold.
         let k: &Kernel = &self.0;
-        if crate::bug::catch(|| k.flush_wakeups()).is_none() {
+        if has_pending_wakeups() && crate::bug::catch(|| k.flush_wakeups()).is_none() {
             crate::bug::report(format_args!("kernel panic while flushing wake-ups"));
             for (event, ..) in &k.waiters {
                 signal_later(event);
@@ -1032,17 +1060,12 @@ fn max_spinners() -> u32 {
     *N.get_or_init(|| (appine_hal::host_cpus().len() / 2).clamp(1, 4) as u32)
 }
 
-/// Whether some thread holds the BKL, and which, for the watchdog ([`crate::watchdog`]) that reads
-/// it without the lock. Each holder writes it when it takes the lock ([`Hold::record`]). It sits
-/// on one cache line with `held`, which the holder writes then anyway, so the other stores add
-/// almost nothing to taking the lock; it reads no clock.
+/// Watchdog metadata written on each BKL acquisition ([`Hold::record`]), packed onto one 64-byte
+/// cache line separate from [`Hold::held`] so spinning waiters reading `held` do not contend with
+/// the holder's relaxed metadata stores.
 #[derive(Default)]
 #[repr(C, align(64))]
-pub(crate) struct Hold {
-    /// Some thread holds the BKL (only a hint): waiters read only this while spinning and try to
-    /// take the lock only when it looks free, so that the lock's cache line does not bounce
-    /// between cores.
-    held: AtomicBool,
+struct HoldInfo {
     /// How many times the lock was taken (wrapping): a different count is a different hold.
     count: AtomicU32,
     /// The holder's host tid.
@@ -1057,6 +1080,19 @@ pub(crate) struct Hold {
     doing: AtomicU64,
     /// The guest pc at that entry.
     pc: AtomicU64,
+}
+
+/// Whether some thread holds the BKL, and which, for the watchdog ([`crate::watchdog`]) that reads
+/// it without the lock. `held` sits on its own cache line away from [`HoldInfo`] so BKL spinners
+/// polling `held` do not false-share with the holder's [`Hold::record`] stores; it reads no clock.
+#[derive(Default)]
+#[repr(C, align(64))]
+pub(crate) struct Hold {
+    /// Some thread holds the BKL (only a hint): waiters read only this while spinning and try to
+    /// take the lock only when it looks free, so that the lock's cache line does not bounce
+    /// between cores.
+    held: AtomicBool,
+    info: HoldInfo,
 }
 
 /// One look at [`Hold`] while the BKL was held: the same values seen again mean the same hold.
@@ -1080,19 +1116,20 @@ impl Hold {
             tid => tid,
         };
         let e = DOING.get();
-        self.host_tid.store(host_tid, Ordering::Relaxed);
-        self.tid.store(e.tid, Ordering::Relaxed);
-        self.tgid.store(e.tgid, Ordering::Relaxed);
-        for (word, bytes) in self.comm.iter().zip(e.comm.chunks_exact(8)) {
+        let info = &self.info;
+        info.host_tid.store(host_tid, Ordering::Relaxed);
+        info.tid.store(e.tid, Ordering::Relaxed);
+        info.tgid.store(e.tgid, Ordering::Relaxed);
+        for (word, bytes) in info.comm.iter().zip(e.comm.chunks_exact(8)) {
             word.store(
                 u64::from_ne_bytes(bytes.try_into().unwrap()),
                 Ordering::Relaxed,
             );
         }
-        self.doing.store(e.doing.bits(), Ordering::Relaxed);
-        self.pc.store(e.pc, Ordering::Relaxed);
-        let count = self.count.load(Ordering::Relaxed).wrapping_add(1);
-        self.count.store(count, Ordering::Relaxed);
+        info.doing.store(e.doing.bits(), Ordering::Relaxed);
+        info.pc.store(e.pc, Ordering::Relaxed);
+        let count = info.count.load(Ordering::Relaxed).wrapping_add(1);
+        info.count.store(count, Ordering::Relaxed);
     }
 
     /// The current holder, None when the lock looks free. The fields are read one by one without
@@ -1102,19 +1139,20 @@ impl Hold {
         if !self.held.load(Ordering::Relaxed) {
             return None;
         }
+        let info = &self.info;
         let mut comm = [0; 16];
-        for (bytes, word) in comm.chunks_exact_mut(8).zip(&self.comm) {
+        for (bytes, word) in comm.chunks_exact_mut(8).zip(&info.comm) {
             bytes.copy_from_slice(&word.load(Ordering::Relaxed).to_ne_bytes());
         }
         Some(HoldSample {
-            count: self.count.load(Ordering::Relaxed),
-            host_tid: self.host_tid.load(Ordering::Relaxed),
+            count: info.count.load(Ordering::Relaxed),
+            host_tid: info.host_tid.load(Ordering::Relaxed),
             entry: Entry {
-                tid: self.tid.load(Ordering::Relaxed),
-                tgid: self.tgid.load(Ordering::Relaxed),
+                tid: info.tid.load(Ordering::Relaxed),
+                tgid: info.tgid.load(Ordering::Relaxed),
                 comm,
-                doing: Doing::from_bits(self.doing.load(Ordering::Relaxed)),
-                pc: self.pc.load(Ordering::Relaxed),
+                doing: Doing::from_bits(info.doing.load(Ordering::Relaxed)),
+                pc: info.pc.load(Ordering::Relaxed),
             },
         })
     }
@@ -2116,5 +2154,37 @@ pub(crate) mod tests {
             ns_id
         };
         assert!(!a.lock().ipcs.contains_key(&ns_id));
+    }
+
+    #[test]
+    fn hold_separates_held_from_watchdog_info_cache_line() {
+        assert!(std::mem::offset_of!(Hold, info) >= 64);
+        assert!(std::mem::size_of::<HoldInfo>() <= 64);
+    }
+
+    #[test]
+    fn pending_wakeups_reuses_object_vec_capacity() {
+        let shared = Shared::new(Kernel::new(Tier::Interpreter));
+        {
+            let _k = shared.lock();
+            request_wake_object(0x1000);
+            request_wake_object(0x2000);
+            assert!(has_pending_wakeups());
+        }
+        assert!(!has_pending_wakeups());
+        let cap_after_first = PENDING.with_borrow(|(_, o)| {
+            assert!(o.is_empty());
+            o.capacity()
+        });
+        assert!(cap_after_first >= 2);
+        {
+            let _k = shared.lock();
+            request_wake_object(0x3000);
+        }
+        let cap_after_second = PENDING.with_borrow(|(_, o)| {
+            assert!(o.is_empty());
+            o.capacity()
+        });
+        assert_eq!(cap_after_second, cap_after_first);
     }
 }

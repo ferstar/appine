@@ -28,10 +28,9 @@
 //!
 //! `sched_yield` is here too: it only yields the host thread, which needs no kernel state.
 //!
-//! Read-only thread and credential ID queries (`getpid`, `gettid`, `getuid`, `geteuid`, `getgid`,
-//! `getegid`) are also served from the namespace-translated values cached in [`Fast`] while
-//! [`Shared::fast_epoch`] matches; `getppid` stays on the BKL path because reparenting on parent
-//! exit does not bump the epoch.
+//! Read-only thread and credential ID queries (`getpid`, `getppid`, `gettid`, `getuid`, `geteuid`,
+//! `getgid`, `getegid`) are also served from the namespace-translated values cached in [`Fast`]
+//! while [`Shared::fast_epoch`] matches; reparenting live children on parent exit bumps the epoch.
 //!
 //! For a thread with seccomp only two kinds of syscalls come here: numbers for which the filter
 //! always returns ALLOW (cached by number, [`crate::seccomp::always_allowed`]), and the vDSO stubs'
@@ -97,6 +96,9 @@ pub(crate) struct Fast {
     tid: Tid,
     /// The thread group's pid as the thread's own pid namespace numbers it (`getpid`).
     ns_tgid: Tid,
+    /// The parent process's pid as the thread's own pid namespace numbers it (`getppid`);
+    /// invalidated via [`Shared::fast_epoch`] whenever live children are reparented.
+    ns_ppid: Tid,
     /// The same tid as the thread's own pid namespace numbers it (`gettid`, and what
     /// `pthread_getcpuclockid` puts into its clock id).
     ns_tid: Tid,
@@ -154,10 +156,11 @@ impl Fast {
             }
             _ => None,
         };
-        let (ns_tgid, ns_tid) = {
+        let (ns_tgid, ns_ppid, ns_tid) = {
             let group = t.group.borrow();
             (
                 group.pid_ns.vnr(task.tgid).unwrap_or(0),
+                group.pid_ns.vnr(group.ppid).unwrap_or(0),
                 group.pid_ns.vnr(task.tid.get()).unwrap_or(0),
             )
         };
@@ -167,6 +170,7 @@ impl Fast {
             paths,
             tid: task.tid.get(),
             ns_tgid,
+            ns_ppid,
             ns_tid,
             uid: cred.uid_out(cred.ruid),
             euid: cred.uid_out(cred.euid),
@@ -249,14 +253,14 @@ impl Fast {
                 .map(Done::InGuest),
             114 => clock_getres(cpu, a[0] as i32, a[1]).map(Done::InGuest),
             169 => gettimeofday(cpu, a[0], a[1]).map(Done::InGuest),
-            // getpid, getuid, geteuid, getgid, getegid, gettid (getppid = 173 stays on the BKL
-            // path because reparenting on parent exit does not bump fast_epoch)
-            172 | 174..=178 => {
+            // getpid, getppid, getuid, geteuid, getgid, getegid, gettid
+            172..=178 => {
                 if shared.fast_epoch() != self.epoch {
                     return None;
                 }
                 Some(Done::InGuest(Ok(match s.x[8] {
                     172 => self.ns_tgid as u64,
+                    173 => self.ns_ppid as u64,
                     174 => u64::from(self.uid),
                     175 => u64::from(self.euid),
                     176 => u64::from(self.gid),
@@ -868,7 +872,7 @@ mod tests {
 
     #[test]
     fn id_syscalls_match_slow_path_across_threads_pid_ns_and_cred_changes() {
-        const ID_NRS: [u64; 6] = [172, 174, 175, 176, 177, 178];
+        const ID_NRS: [u64; 7] = [172, 173, 174, 175, 176, 177, 178];
 
         let mut kernel = Kernel::new(Tier::Interpreter);
         let (proc, _, mut leader_cpu) =
@@ -939,10 +943,10 @@ mod tests {
                 run_fast_noargs(&leader_fast, &shared, cx.task, &mut leader_cpu, 178),
                 Some(1)
             );
-            // getppid (173) intentionally stays on the BKL path.
+            // Parent (INIT = 1 in root pid_ns) is outside child_pid_ns, so getppid (173) reports 0.
             assert_eq!(
                 run_fast_noargs(&leader_fast, &shared, cx.task, &mut leader_cpu, 173),
-                None
+                Some(0)
             );
 
             // Worker in child pid_ns: getpid=1, gettid=2.
@@ -1178,6 +1182,78 @@ mod tests {
             f(&shared, &cx, &fast, &mut cpu, addr);
         }
         drop(cpu);
+        drop(shared);
+    }
+
+    #[test]
+    fn getppid_fast_path_invalidates_and_updates_on_reparent() {
+        let mut kernel = Kernel::new(Tier::Interpreter);
+        // Set up INIT (1) -> subreaper (10) -> parent (20) -> child (30).
+        let init_group = Rc::new(RefCell::new(crate::process::ThreadGroup::new(
+            crate::kernel::INIT,
+            0,
+            Rc::new(RefCell::new(crate::signal::SigHandlers::default())),
+        )));
+        kernel.groups.insert(crate::kernel::INIT, init_group);
+        let (_, _, sub_cpu) = crate::pseudo::tests::add_task(&mut kernel, 10, 0, true, b"");
+        let (_, _, par_cpu) = crate::pseudo::tests::add_task(&mut kernel, 20, 0, true, b"");
+        let (_, _, mut child_cpu) = crate::pseudo::tests::add_task(&mut kernel, 30, 0, true, b"");
+        kernel.groups[&10].borrow_mut().ppid = crate::kernel::INIT;
+        kernel.groups[&10].borrow_mut().child_subreaper = true;
+        kernel.groups[&10].borrow_mut().children.push(20);
+        kernel.groups[&20].borrow_mut().ppid = 10;
+        kernel.groups[&20].borrow_mut().children.push(30);
+        kernel.groups[&30].borrow_mut().ppid = 20;
+
+        let shared = Arc::new(Shared::new(kernel));
+        {
+            let mut k = shared.lock();
+            let child = k.tasks[&30].clone();
+            let mut child_fast = Fast::new(&shared, &child, &child.state.borrow());
+
+            // Initially getppid returns 20 in guest mode.
+            child.sync.in_guest.store(true, Ordering::SeqCst);
+            assert_eq!(
+                run_fast_outcome(&child_fast, &shared, &child, &mut child_cpu, 173, [0; 6]),
+                FastOutcome::InGuest
+            );
+            assert_eq!(child_cpu.state().x[0], 20);
+
+            // Parent (20) exits: child (30) is reparented to subreaper (10), bumping fast_epoch.
+            let parent_group = k.groups[&20].clone();
+            k.tasks.remove(&20);
+            parent_group.borrow_mut().threads.clear();
+            crate::process::finish_group(&mut k, &parent_group, None);
+
+            // Stale child_fast must fall back rather than returning old ppid 20.
+            assert_eq!(
+                run_fast_noargs(&child_fast, &shared, &child, &mut child_cpu, 173),
+                None
+            );
+
+            // After refresh, child_fast serves the new ppid 10 without the BKL.
+            child_fast.refresh(&shared, &child, &child.state.borrow());
+            assert_eq!(
+                run_fast_noargs(&child_fast, &shared, &child, &mut child_cpu, 173),
+                Some(10)
+            );
+
+            // Subreaper (10) exits: child (30) is reparented to INIT (1).
+            let sub_group = k.groups[&10].clone();
+            k.tasks.remove(&10);
+            sub_group.borrow_mut().threads.clear();
+            crate::process::finish_group(&mut k, &sub_group, None);
+            assert_eq!(
+                run_fast_noargs(&child_fast, &shared, &child, &mut child_cpu, 173),
+                None
+            );
+            child_fast.refresh(&shared, &child, &child.state.borrow());
+            assert_eq!(
+                run_fast_noargs(&child_fast, &shared, &child, &mut child_cpu, 173),
+                Some(crate::kernel::INIT as u64)
+            );
+        }
+        drop((child_cpu, par_cpu, sub_cpu));
         drop(shared);
     }
 

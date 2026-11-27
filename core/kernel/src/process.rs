@@ -1095,6 +1095,7 @@ pub(crate) fn finish_group(
         // those handed to it when other threads exited)
         orphaned = pdeath_signals(k, &group.borrow().children);
         let children = std::mem::take(&mut group.borrow_mut().children);
+        let mut reparented = false;
         for c in children {
             let Some(child) = k.groups.get(&c).cloned() else {
                 continue;
@@ -1104,6 +1105,9 @@ pub(crate) fn finish_group(
             }
             let zombie = {
                 let mut cg = child.borrow_mut();
+                if cg.ppid != reaper && !cg.threads.is_empty() {
+                    reparented = true;
+                }
                 cg.ppid = reaper;
                 cg.parent_thread = reaper_thread;
                 cg.exit_signal = Signal::CHLD.number();
@@ -1132,6 +1136,10 @@ pub(crate) fn finish_group(
                 None if reaper == INIT => k.groups[&INIT].borrow_mut().children.push(c),
                 None => {}
             }
+        }
+        // Invalidate cached Fast::ns_ppid for live reparented children (getppid fast path).
+        if reparented {
+            k.fast_changed();
         }
     });
     // PR_SET_PDEATHSIG: notify the children that lost their parent

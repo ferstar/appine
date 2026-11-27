@@ -1267,14 +1267,62 @@ impl Tty {
         if self.stopped {
             return 0;
         }
+        let t = self.termios;
+        if !t.o(OPOST) {
+            let n = data.len().min(OUTPUT_MAX.saturating_sub(self.output.len()));
+            if n > 0 {
+                self.output.extend(&data[..n]);
+                self.arrivals[1] += 1;
+            }
+            return n;
+        }
         let before = self.output.len();
         let mut consumed = 0;
-        for &c in data {
-            if self.processed_len(c) > OUTPUT_MAX.saturating_sub(self.output.len()) {
-                break;
+        if !t.o(OLCUC) {
+            // Without OLCUC, printable ASCII (0x20..=0x7e) never translates, never counts as a
+            // UTF-8 continuation byte, takes 1 output byte and 1 column, and leaves canon_column
+            // untouched, so contiguous runs can be bulk-extended.
+            let onlcr = t.o(ONLCR);
+            while consumed < data.len() {
+                let room = OUTPUT_MAX.saturating_sub(self.output.len());
+                if room > 0 {
+                    let scan = &data[consumed..consumed + (data.len() - consumed).min(room)];
+                    let run = scan
+                        .iter()
+                        .position(|&b| !(0x20..0x7f).contains(&b))
+                        .unwrap_or(scan.len());
+                    if run > 0 {
+                        self.output.extend(&scan[..run]);
+                        self.column += run;
+                        consumed += run;
+                        continue;
+                    }
+                }
+                let c = data[consumed];
+                if onlcr && c == b'\n' {
+                    if room < 2 {
+                        break;
+                    }
+                    self.column = 0;
+                    self.canon_column = 0;
+                    self.output.extend(b"\r\n");
+                    consumed += 1;
+                    continue;
+                }
+                if self.processed_len(c) > room {
+                    break;
+                }
+                self.output_char(c);
+                consumed += 1;
             }
-            self.output_char(c);
-            consumed += 1;
+        } else {
+            for &c in data {
+                if self.processed_len(c) > OUTPUT_MAX.saturating_sub(self.output.len()) {
+                    break;
+                }
+                self.output_char(c);
+                consumed += 1;
+            }
         }
         if self.output.len() > before {
             self.arrivals[1] += 1;
@@ -1720,6 +1768,12 @@ thread_local! {
     #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy false positive
     static CLOSED: std::cell::RefCell<Vec<Weak<RefCell<Tty>>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether this thread closed any terminal's last master since the last [`take_closed`].
+#[inline]
+pub(crate) fn has_closed() -> bool {
+    CLOSED.with_borrow(|c| !c.is_empty())
 }
 
 /// Takes the terminals whose last master this thread closed and which are not hung up yet
@@ -2296,5 +2350,88 @@ mod tests {
         t.take_output(7);
         assert_eq!(t.write_output(b"\t"), 0);
         assert_eq!(t.output.len(), OUTPUT_MAX - 7);
+    }
+
+    #[test]
+    fn write_output_bulk_paths_match_byte_by_byte_output_char() {
+        // Reference implementation matching the original byte-by-byte loop.
+        fn write_reference(t: &mut Tty, data: &[u8]) -> usize {
+            if t.stopped {
+                return 0;
+            }
+            let before = t.output.len();
+            let mut consumed = 0;
+            for &c in data {
+                if t.processed_len(c) > OUTPUT_MAX.saturating_sub(t.output.len()) {
+                    break;
+                }
+                t.output_char(c);
+                consumed += 1;
+            }
+            if t.output.len() > before {
+                t.arrivals[1] += 1;
+            }
+            consumed
+        }
+
+        let payloads: &[&[u8]] = &[
+            b"",
+            b"plain printable ASCII run 0123456789 ~!@#$%^&*()",
+            b"line1\nline2\r\n\tindented\x08back\x1b[31mred\x1b[0m\x7f\x00end\n",
+            "hello 世界 naïve café\n\r\t🦀\n".as_bytes(),
+            b"\r\r\nabc\r\n",
+        ];
+        let oflags = [
+            0,
+            OPOST,
+            OPOST | ONLCR,
+            OPOST | ONLCR | ONLRET,
+            OPOST | ONLCR | OCRNL,
+            OPOST | ONLCR | ONOCR,
+            OPOST | ONLCR | XTABS,
+            OPOST | ONLCR | OLCUC,
+            OPOST | OCRNL | ONOCR | ONLRET | XTABS,
+            OPOST | ONLCR | OCRNL | ONOCR | ONLRET | XTABS | OLCUC,
+        ];
+        let iflags = [0, IUTF8];
+
+        for &oflag in &oflags {
+            for &iflag in &iflags {
+                for &prefill in &[0usize, OUTPUT_MAX - 10, OUTPUT_MAX - 1, OUTPUT_MAX] {
+                    for &init_col in &[0usize, 5] {
+                        for &payload in payloads {
+                            let mut fast = Tty::new(0);
+                            let mut slow = Tty::new(0);
+                            for t in [&mut fast, &mut slow] {
+                                t.termios.oflag = oflag;
+                                t.termios.iflag = iflag;
+                                t.output.extend(std::iter::repeat_n(b'A', prefill));
+                                t.column = init_col;
+                                t.canon_column = 3;
+                            }
+                            let c_fast = fast.write_output(payload);
+                            let c_slow = write_reference(&mut slow, payload);
+                            assert_eq!(
+                                (
+                                    c_fast,
+                                    fast.column,
+                                    fast.canon_column,
+                                    fast.arrivals[1],
+                                    &fast.output
+                                ),
+                                (
+                                    c_slow,
+                                    slow.column,
+                                    slow.canon_column,
+                                    slow.arrivals[1],
+                                    &slow.output
+                                ),
+                                "oflag={oflag:#o} iflag={iflag:#o} prefill={prefill} col={init_col}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
