@@ -291,6 +291,16 @@ enum PinnedSpans {
     Many(Vec<PinnedSpan>),
 }
 
+impl PinnedSpans {
+    fn as_slice(&self) -> &[PinnedSpan] {
+        match self {
+            Self::Empty => &[],
+            Self::One(s) => std::slice::from_ref(s),
+            Self::Many(v) => v,
+        }
+    }
+}
+
 /// Pinned host memory spans covering a guest I/O buffer across a BKL release.
 ///
 /// Retaining `Arc<HostRegion>` keeps every target host mapping alive and unrecycled until the host
@@ -337,10 +347,35 @@ impl PinnedIo {
     }
 
     fn span_count(&self) -> usize {
-        match &self.spans {
-            PinnedSpans::Empty => 0,
-            PinnedSpans::One(_) => 1,
-            PinnedSpans::Many(v) => v.len(),
+        self.spans.as_slice().len()
+    }
+
+    /// Runs a vectored host I/O call (`preadv`/`pwritev`) over `spans`, retrying on `EINTR`.
+    fn iov_io(
+        spans: &[PinnedSpan],
+        mut call: impl FnMut(*const libc::iovec, libc::c_int) -> isize,
+    ) -> Result<usize, i32> {
+        debug_assert!(spans.len() <= MAX_PIN_SPANS);
+        let mut iov = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }; MAX_PIN_SPANS];
+        for (dst, s) in iov.iter_mut().zip(spans) {
+            dst.iov_base = s.ptr.as_ptr().cast();
+            dst.iov_len = s.len;
+        }
+        let count = spans.len() as libc::c_int;
+        loop {
+            let n = call(iov.as_ptr(), count);
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let err = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            if err != libc::EINTR {
+                return Err(err);
+            }
         }
     }
 
@@ -355,41 +390,17 @@ impl PinnedIo {
                 let buf = unsafe { std::slice::from_raw_parts_mut(s.ptr.as_ptr(), s.len) };
                 appine_hal::pread(fd, buf, offset)
             }
-            PinnedSpans::Many(v) => {
-                let mut iov = [libc::iovec {
-                    iov_base: std::ptr::null_mut(),
-                    iov_len: 0,
-                }; MAX_PIN_SPANS];
-                for (dst, s) in iov.iter_mut().zip(v.iter()) {
-                    dst.iov_base = s.ptr.as_ptr().cast();
-                    dst.iov_len = s.len;
-                }
-                loop {
-                    // SAFETY: `iov[..v.len()]` points into live writable `HostRegion`s pinned by
-                    // `self` with `io_write_pins` held.
-                    let n = unsafe {
-                        libc::preadv(
-                            fd,
-                            iov.as_ptr(),
-                            v.len() as libc::c_int,
-                            offset as libc::off_t,
-                        )
-                    };
-                    if n >= 0 {
-                        return Ok(n as usize);
-                    }
-                    let err = std::io::Error::last_os_error()
-                        .raw_os_error()
-                        .unwrap_or(libc::EIO);
-                    if err != libc::EINTR {
-                        return Err(err);
-                    }
-                }
-            }
+            PinnedSpans::Many(v) => Self::iov_io(v, |iov, count| {
+                // SAFETY: `iov[..count]` points into live writable `HostRegion`s pinned by `self`
+                // with `io_write_pins` held.
+                unsafe { libc::preadv(fd, iov, count, offset as libc::off_t) }
+            }),
         }
     }
 
     /// Writes directly from the pinned guest spans to host `fd` at `offset`, retrying on `EINTR`.
+    /// Takes `&mut self` so closures passed to `Cx::unlocked` capture `&mut PinnedIo: Send`
+    /// without requiring `Sync`.
     pub(crate) fn pwrite(&mut self, fd: i32, offset: u64) -> Result<usize, i32> {
         match &self.spans {
             PinnedSpans::Empty => Ok(0),
@@ -398,37 +409,10 @@ impl PinnedIo {
                 let buf = unsafe { std::slice::from_raw_parts(s.ptr.as_ptr(), s.len) };
                 appine_hal::pwrite(fd, buf, offset)
             }
-            PinnedSpans::Many(v) => {
-                let mut iov = [libc::iovec {
-                    iov_base: std::ptr::null_mut(),
-                    iov_len: 0,
-                }; MAX_PIN_SPANS];
-                for (dst, s) in iov.iter_mut().zip(v.iter()) {
-                    dst.iov_base = s.ptr.as_ptr().cast();
-                    dst.iov_len = s.len;
-                }
-                loop {
-                    // SAFETY: `iov[..v.len()]` points into live readable `HostRegion`s pinned by
-                    // `self`.
-                    let n = unsafe {
-                        libc::pwritev(
-                            fd,
-                            iov.as_ptr(),
-                            v.len() as libc::c_int,
-                            offset as libc::off_t,
-                        )
-                    };
-                    if n >= 0 {
-                        return Ok(n as usize);
-                    }
-                    let err = std::io::Error::last_os_error()
-                        .raw_os_error()
-                        .unwrap_or(libc::EIO);
-                    if err != libc::EINTR {
-                        return Err(err);
-                    }
-                }
-            }
+            PinnedSpans::Many(v) => Self::iov_io(v, |iov, count| {
+                // SAFETY: `iov[..count]` points into live readable `HostRegion`s pinned by `self`.
+                unsafe { libc::pwritev(fd, iov, count, offset as libc::off_t) }
+            }),
         }
     }
 }
@@ -438,16 +422,8 @@ impl Drop for PinnedIo {
         if !self.write_pin {
             return;
         }
-        match &self.spans {
-            PinnedSpans::Empty => {}
-            PinnedSpans::One(s) => {
-                s.region.io_write_pins.fetch_sub(1, Ordering::Release);
-            }
-            PinnedSpans::Many(v) => {
-                for s in v {
-                    s.region.io_write_pins.fetch_sub(1, Ordering::Release);
-                }
-            }
+        for s in self.spans.as_slice() {
+            s.region.io_write_pins.fetch_sub(1, Ordering::Release);
         }
     }
 }
@@ -2839,6 +2815,48 @@ impl Mm {
         })
     }
 
+    /// Ensures soft PTEs exist across `[page, stop)` in anonymous VMA `(s, v)`, expanding to
+    /// enclosing 2 MiB `LEAF_SPAN` windows (matching `fault_range`) so 2 MiB-aligned anonymous
+    /// VMAs promote to L2 superpages without allocating L3 tables.
+    #[inline]
+    fn ensure_anon_present(&self, s: u64, v: &Vma, page: u64, stop: u64) -> Result<(), MapError> {
+        let stop_page = stop.next_multiple_of(PAGE_SIZE);
+        let (known_lo, known_hi) = v.present_run.get();
+        if known_lo <= page && stop_page <= known_hi {
+            return Ok(());
+        }
+        let lo = (page & !(LEAF_SPAN - 1)).max(s);
+        let hi = ((stop_page - 1) | (LEAF_SPAN - 1))
+            .saturating_add(1)
+            .min(s + v.len);
+        self.fill_anon_non_cow(s, v, lo, hi)
+    }
+
+    /// Returns the first CoW-borrowed page and its owner host pointer in `[lo, hi)`.
+    #[inline]
+    fn first_borrowed_in(&self, lo: u64, hi: u64) -> Option<(u64, NonNull<u8>)> {
+        let c = self.cow.borrow();
+        if c.borrowed.is_empty() {
+            return None;
+        }
+        c.borrowed.range(lo..hi).next().map(|(&p, b)| (p, b.host))
+    }
+
+    /// Returns the first CoW-borrowed or CoW-lent page in `[lo, hi)`.
+    #[inline]
+    fn first_cow_in(&self, lo: u64, hi: u64) -> Option<u64> {
+        let c = self.cow.borrow();
+        if c.borrowed.is_empty() && c.lent.is_empty() {
+            return None;
+        }
+        let b = c.borrowed.range(lo..hi).next().map(|(&p, _)| p);
+        let l = c.lent.range(lo..hi).next().copied();
+        match (b, l) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     /// Walks `[addr, addr + len)` across contiguous translated host spans, calling
     /// `f(host pointer, bytes done, chunk length)` for each span.
     fn for_each_page(
@@ -2913,20 +2931,7 @@ impl Mm {
                 let page = cur & !(PAGE_SIZE - 1);
                 if write {
                     self.prepare_anon_write(s, v).map_err(|_| Errno::EFAULT)?;
-                    let cow_stop = {
-                        let c = self.cow.borrow();
-                        if c.borrowed.is_empty() && c.lent.is_empty() {
-                            want_end
-                        } else {
-                            let b = c.borrowed.range(page..want_end).next().map(|(&p, _)| p);
-                            let l = c.lent.range(page..want_end).next().copied();
-                            match (b, l) {
-                                (Some(a), Some(b)) => a.min(b),
-                                (Some(a), None) | (None, Some(a)) => a,
-                                (None, None) => want_end,
-                            }
-                        }
-                    };
+                    let cow_stop = self.first_cow_in(page, want_end).unwrap_or(want_end);
                     if cow_stop == page {
                         if !self.cow_break(page) {
                             return Err(Errno::EFAULT);
@@ -2938,18 +2943,8 @@ impl Mm {
                         done += chunk;
                         continue;
                     }
-                    let stop_page = cow_stop.next_multiple_of(PAGE_SIZE);
-                    let (known_lo, known_hi) = v.present_run.get();
-                    if !(known_lo <= page && stop_page <= known_hi) {
-                        // Fill enclosing 2 MiB `LEAF_SPAN` windows (matching `fault_range`) so
-                        // 2 MiB-aligned anonymous VMAs promote to L2 superpages without L3 tables.
-                        let lo = (page & !(LEAF_SPAN - 1)).max(s);
-                        let hi = ((stop_page - 1) | (LEAF_SPAN - 1))
-                            .saturating_add(1)
-                            .min(s + v.len);
-                        self.fill_anon_non_cow(s, v, lo, hi)
-                            .map_err(|_| Errno::EFAULT)?;
-                    }
+                    self.ensure_anon_present(s, v, page, cow_stop)
+                        .map_err(|_| Errno::EFAULT)?;
                     let chunk = (cow_stop - cur) as usize;
                     // SAFETY: `[cur, cow_stop)` is own-backed writable memory inside `v`.
                     let host = unsafe { v.host.as_ptr().add((cur - s) as usize) };
@@ -2957,47 +2952,31 @@ impl Mm {
                     done += chunk;
                 } else {
                     // Lent pages still live at `v.host`; only borrowed pages break host contiguity.
-                    let borrowed = {
-                        let c = self.cow.borrow();
-                        if c.borrowed.is_empty() {
-                            None
-                        } else {
-                            c.borrowed
-                                .range(page..want_end)
-                                .next()
-                                .map(|(&p, b)| (p, b.host))
+                    let (host, chunk) = match self.first_borrowed_in(page, want_end) {
+                        Some((bp, bhost)) if bp == page => (
+                            // SAFETY: `bhost` stays alive in `self.cow.borrowed` for this borrow.
+                            unsafe { bhost.as_ptr().add((cur - page) as usize) },
+                            ((page + PAGE_SIZE).min(want_end) - cur) as usize,
+                        ),
+                        borrowed => {
+                            let stop = borrowed.map_or(want_end, |(bp, _)| bp);
+                            // SAFETY: `[cur, stop)` has no borrowed pages and lives in `v.host`.
+                            (
+                                unsafe { v.host.as_ptr().add((cur - s) as usize) },
+                                (stop - cur) as usize,
+                            )
                         }
                     };
-                    match borrowed {
-                        Some((bp, bhost)) if bp == page => {
-                            let chunk = ((page + PAGE_SIZE).min(want_end) - cur) as usize;
-                            // SAFETY: `bhost` stays alive in `self.cow.borrowed` for this borrow.
-                            let host = unsafe { bhost.as_ptr().add((cur - page) as usize) };
-                            f(host, done, chunk);
-                            done += chunk;
-                        }
-                        Some((bp, _)) => {
-                            let chunk = (bp - cur) as usize;
-                            // SAFETY: `[cur, bp)` has no borrowed pages and lives in `v.host`.
-                            let host = unsafe { v.host.as_ptr().add((cur - s) as usize) };
-                            f(host, done, chunk);
-                            done += chunk;
-                        }
-                        None => {
-                            let chunk = (want_end - cur) as usize;
-                            // SAFETY: `[cur, want_end)` has no borrowed pages and lives in `v.host`.
-                            let host = unsafe { v.host.as_ptr().add((cur - s) as usize) };
-                            f(host, done, chunk);
-                            done += chunk;
-                        }
-                    }
+                    f(host, done, chunk);
+                    done += chunk;
                 }
             } else {
                 // `Backing::PrivateFile` or `Backing::Shared` without `Fill` or `pages`:
                 // contiguous host memory up to `vma_end`.
                 debug_assert!(!write || !v.cow);
                 let chunk = (want_end - cur) as usize;
-                // SAFETY: `[cur, want_end)` lies within `v`'s backed contents and permits `need`.
+                // SAFETY: `[cur, want_end)` lies within `v`'s backed contents and permits
+                // `required_prot`.
                 let host = unsafe { v.host.as_ptr().add((cur - s) as usize) };
                 f(host, done, chunk);
                 done += chunk;
@@ -3081,30 +3060,14 @@ impl Mm {
                             break;
                         }
                     }
-                    let stop_page = want_end.next_multiple_of(PAGE_SIZE);
-                    let (known_lo, known_hi) = v.present_run.get();
-                    if !(known_lo <= page && stop_page <= known_hi) {
-                        let lo = (page & !(LEAF_SPAN - 1)).max(s);
-                        let hi = ((stop_page - 1) | (LEAF_SPAN - 1))
-                            .saturating_add(1)
-                            .min(s + v.len);
-                        if self.fill_anon_non_cow(s, v, lo, hi).is_err() {
-                            break;
-                        }
+                    if self.ensure_anon_present(s, v, page, want_end).is_err() {
+                        break;
                     }
                 } else {
                     // Never pin an owner's borrowed page across `Cx::unlocked` for `pwrite`: a
                     // concurrent recall by the owner could let the owner overwrite its page while
                     // our unlocked `pwrite` reads it.
-                    let borrowed_hit = {
-                        let c = self.cow.borrow();
-                        if c.borrowed.is_empty() {
-                            None
-                        } else {
-                            c.borrowed.range(page..want_end).next().map(|(&bp, _)| bp)
-                        }
-                    };
-                    if let Some(bp) = borrowed_hit {
+                    if let Some((bp, _)) = self.first_borrowed_in(page, want_end) {
                         if bp == page {
                             break;
                         }
@@ -8415,19 +8378,17 @@ impl Mm {
                 })
                 .flatten();
             for (i, page) in (lo..hi).step_by(PAGE_SIZE as usize).enumerate() {
-                let dst = Self::own_page(start, cv, page);
-                if let Some((_, b)) = mine.next_if(|&(&p, _)| p == page) {
-                    // SAFETY: both `b.host` and `dst` are whole mapped pages.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            b.host.as_ptr(),
-                            dst.as_ptr(),
-                            PAGE_SIZE as usize,
-                        );
-                    }
+                let src = if let Some((_, b)) = mine.next_if(|&(&p, _)| p == page) {
+                    Some(b.host)
                 } else if touched.as_ref().is_none_or(|t| t[i]) {
-                    let src = Self::own_page(start, v, page);
-                    // SAFETY: both `src` and `dst` are whole mapped pages inside their VMAs.
+                    Some(Self::own_page(start, v, page))
+                } else {
+                    None
+                };
+                if let Some(src) = src {
+                    let dst = Self::own_page(start, cv, page);
+                    // SAFETY: both `src` and `dst` are whole mapped pages inside their host
+                    // regions.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             src.as_ptr(),
@@ -8811,14 +8772,15 @@ impl Mm {
         // Wait for every user found in guest code, including any that entered after the first pass
         // (such a thread may spin on another thread waiting for the BKL held here, LTP shmctl05,
         // so kick it on entry to the wait loop and after yielding).
+        const SHOOTDOWN_SPINS: u32 = 64;
         for u in others {
             let mut spins = 0u32;
             while u.in_guest.load(Ordering::SeqCst) {
-                if spins == 0 || spins >= 64 {
+                if spins == 0 || spins >= SHOOTDOWN_SPINS {
                     // SAFETY: as above.
                     unsafe { u.kicker.kick() };
                 }
-                if spins < 64 {
+                if spins < SHOOTDOWN_SPINS {
                     std::hint::spin_loop();
                 } else {
                     std::thread::yield_now();
@@ -15505,18 +15467,10 @@ mod tests {
 
         // Simulate the in-flight unlocked host `pread` overwriting the pinned host pages.
         let memfd = appine_hal::memfd(c"pin-fork-test").unwrap();
+        let memfd_fd = std::os::fd::AsRawFd::as_raw_fd(&memfd);
         let updated = vec![0x22u8; len];
-        assert_eq!(
-            appine_hal::pwrite(std::os::fd::AsRawFd::as_raw_fd(&memfd), &updated, 0).unwrap(),
-            len
-        );
-        assert_eq!(
-            pinned
-                .io
-                .pread(std::os::fd::AsRawFd::as_raw_fd(&memfd), 0)
-                .unwrap(),
-            len
-        );
+        assert_eq!(appine_hal::pwrite(memfd_fd, &updated, 0).unwrap(), len);
+        assert_eq!(pinned.io.pread(memfd_fd, 0).unwrap(), len);
 
         // Parent sees the newly read bytes; child retains its pre-fork snapshot intact.
         let mut parent_out = vec![0u8; len];
