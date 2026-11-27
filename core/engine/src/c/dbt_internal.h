@@ -130,17 +130,33 @@ _Static_assert((MAX_BLOCK_WORDS & BRANCH_MASK) == 0 && MAX_BLOCK_WORDS << REASON
                "the conditional branch's distance to the stub and LINK_SHARED must fit in a movz immediate");
 
 #define SYSREG_NZCV 0xda10
+#define SYSREG_DIT 0xda15
 #define SYSREG_FPCR 0xda20
 #define SYSREG_FPSR 0xda21
 #define SYSREG_TPIDR_EL0 0xde82
+#define SYSREG_TPIDRRO_EL0 0xde83
+#define SYSREG_CTR_EL0 0xd801
 #define SYSREG_DCZID_EL0 0xd807
 #define SYSREG_CNTFRQ_EL0 0xdf00
 #define SYSREG_CNTVCT_EL0 0xdf02
 #define SYSREG_CNTVCTSS_EL0 0xdf06
 
-/* Block size of DC ZVA, matching the DCZID_EL0 that Tier 0 reports */
+/* Block size of DC ZVA, CTR_EL0 (DIC = IDC = 0), and FPSR cumulative exception mask (matching interp.c) */
 #define DCZ_BLOCK 64
 #define DCZID_VALUE 4
+#define CTR_VALUE UINT64_C(0x8444c004)
+#define FPSR_MASK UINT64_C(0x0800009f)
+
+/* 128-bit pair exclusives (not in emit.h): LDAXP Xt1, Xt2, [Xn] and STLXP Ws, Xt1, Xt2, [Xn] */
+static inline uint32_t enc_ldaxp_x(unsigned rt, unsigned rt2, unsigned rn)
+{
+    return 0xc87f8000u | rt2 << 10 | rn << 5 | rt;
+}
+
+static inline uint32_t enc_stlxp_x(unsigned rs, unsigned rt, unsigned rt2, unsigned rn)
+{
+    return 0xc8208000u | rs << 16 | rt2 << 10 | rn << 5 | rt;
+}
 
 #define TLB_BITS 12
 #define TLB_OFF offsetof(struct appine_cpu, tlb)
@@ -160,9 +176,11 @@ _Static_assert(offsetof(struct appine_cpu, dbt_fp_loaded) < TLB_OFF,
 _Static_assert(offsetof(struct appine_cpu, nwatch) < TLB_OFF,
                "nwatch is read directly with ldr in refill and fast-loop prologues");
 
+/* XOR-fold bits [25:14] into [13:2] to eliminate 16 KiB aliasing in the 4096-entry jump cache.
+ * Empty entries (jc_empty) have all bits >= 14 clear, so their folded index still differs from i. */
 static inline unsigned jc_index(uint64_t pc)
 {
-    return (unsigned)((pc >> 2) & (JC_SIZE - 1));
+    return (unsigned)(((pc ^ (pc >> JC_BITS)) >> 2) & (JC_SIZE - 1));
 }
 
 struct slot {
@@ -293,6 +311,7 @@ struct appine_dbt {
     uint32_t *refill[2]; /* TLB refill routines: read, write */
     uint32_t *lookup;    /* routine that looks up the table on a jump-cache miss (emit_lookup) */
     uint32_t *rs_miss;   /* landing pad of empty shadow return stack entries: looks up guest x30 */
+    uint32_t *ret_miss;  /* shared RET X30 jump-cache probe on shadow-stack miss */
     uint32_t *memop_ret; /* shared predicted return tail for in-cache memop helpers */
     uint32_t *memop_memset;
     uint32_t *memop_memmove;
@@ -483,15 +502,18 @@ enum {
     TO_MEMOP_MEMCMP,
     TO_MEMOP_MEMCHR,
     TO_LOAD_FP,
+    TO_RET_MISS,
 };
 
 /* The most bytes and the most accesses one group of accesses sharing a check may cover, and the
- * most groups at once (plan_group) */
-#define GROUP_SPAN 512
+ * most groups at once (plan_group). GROUP_SPAN <= 4096 fits in the 12-bit refill byte count. */
+#define GROUP_SPAN 2048
 #define GROUP_MAX 32
 #define GROUP_SLOTS 8
+_Static_assert(GROUP_SPAN <= (1u << REFILL_REASON_SHIFT), "GROUP_SPAN must fit in refill stub info");
 _Static_assert(sizeof(((struct appine_cpu *)0)->dbt_groups) == GROUP_SLOTS * 8, "one slot per group");
 #define MAX_RELOCS (MAX_STUBS * 2 + 4)
+#define MAX_LINKS (MAX_STUBS + 4)
 
 struct xlate {
     struct appine_dbt *d;
@@ -509,6 +531,8 @@ struct xlate {
     unsigned nfixups;
     uint32_t relocs[MAX_RELOCS]; /* index << 4 | TO_* */
     unsigned nrelocs;
+    struct link links[MAX_LINKS]; /* inline and deferred direct-branch link stubs */
+    unsigned nlinks;
     /* The block being translated: start pc, guest instruction source (in mapped guest page),
      * lazily snapshotted words in prep->words (first `copied` words valid), index of the current
      * instruction, and the most instructions the block may have in the first page */
@@ -633,6 +657,8 @@ static inline uint32_t *routine(const struct appine_dbt *d, unsigned to)
         return d->memop_memchr;
     case TO_LOAD_FP:
         return d->load_fp;
+    case TO_RET_MISS:
+        return d->ret_miss;
     default:
         return d->refill[to - TO_REFILL_READ];
     }
@@ -736,6 +762,13 @@ static inline void emit_link_stub(struct xlate *x, unsigned reason, uint64_t pc,
     if (chain) {
         if (x->n == ENTRY_CHECK_WORDS)
             delta = LINK_AT_ENTRY;
+        if (x->nlinks < MAX_LINKS)
+            x->links[x->nlinks] = (struct link){
+                (uint32_t)x->n | (reason == R_CHAIN_FWD ? LINK_FWD : 0),
+                branch ? (uint32_t)(branch - x->buf) : NO_BRANCH,
+                pc,
+            };
+        x->nlinks++; /* overflow is checked by prepare() */
         emit(x, enc_b(4));
     }
     emit(x, enc_adr_self(T1));
@@ -899,7 +932,7 @@ struct prep {
     uint32_t nhost;
     uint32_t relocs[MAX_RELOCS];
     unsigned nrelocs;
-    struct link links[MAX_STUBS];
+    struct link links[MAX_LINKS];
     unsigned nlinks;
 };
 
@@ -966,10 +999,72 @@ static inline bool dbt_is_atomic(uint32_t insn)
 }
 
 bool dbt_tier0_defined_slow(struct appine_cpu *probe, uint64_t *entry, uint32_t insn, uint64_t pc);
+
+/* Fast path for unconditionally-defined base ARMv8.0 encodings whose validity depends on no
+ * optional CPU feature and has exact parity with Tier 0 (interp.c). Returns true only when
+ * guaranteed defined; everything else falls through to the direct-mapped probe cache. */
+static inline bool dbt_tier0_base_defined(uint32_t insn)
+{
+    switch (FIELD(insn, 28, 25)) {
+    case 0x8:
+    case 0x9: {
+        unsigned g = FIELD(insn, 25, 23);
+        if (g <= 2)
+            return true; /* ADR, ADRP, ADD/ADDS/SUB/SUBS (imm) */
+        if (g == 5)
+            return FIELD(insn, 30, 29) != 1 && (BIT(insn, 31) || FIELD(insn, 22, 21) < 2);
+        return false;
+    }
+    case 0xa:
+    case 0xb: {
+        if ((insn & 0x7c000000) == 0x14000000 || /* B, BL */
+            (insn & 0x7e000000) == 0x34000000 || /* CBZ, CBNZ */
+            (insn & 0x7e000000) == 0x36000000 || /* TBZ, TBNZ */
+            (insn & 0xff000010) == 0x54000000 || /* B.cond */
+            (insn & 0xfffff01f) == 0xd503201f || /* HINT */
+            (insn & 0xffe0001f) == 0xd4000001)   /* SVC */
+            return true;
+        uint32_t rb = insn & 0xfffffc1f;
+        return rb == 0xd61f0000 || rb == 0xd63f0000 || rb == 0xd65f0000; /* BR, BLR, RET */
+    }
+    case 0x5:
+        if (!BIT(insn, 24)) /* logical (shifted reg) */
+            return BIT(insn, 31) || FIELD(insn, 15, 10) < 32;
+        if (!BIT(insn, 21)) /* ADD/SUB (shifted reg) */
+            return FIELD(insn, 23, 22) != 3 && (BIT(insn, 31) || FIELD(insn, 15, 10) < 32);
+        return FIELD(insn, 23, 22) == 0 && FIELD(insn, 12, 10) <= 4; /* ADD/SUB (extended reg) */
+    case 0xd:
+        return (insn & 0x3fe00800) == 0x1a800000 || /* CSEL, CSINC, CSINV, CSNEG */
+               (insn & 0x7fe00000) == 0x1b000000;   /* MADD, MSUB */
+    case 0x4:
+    case 0xc: { /* Integer loads/stores (bit 26 == 0) */
+        if ((insn & 0x3b000000) == 0x39000000)
+            return FIELD(insn, 23, 22) < 3 || FIELD(insn, 31, 30) < 2;
+        if ((insn & 0x3b200000) == 0x38000000) {
+            unsigned sz = FIELD(insn, 31, 30), opc = FIELD(insn, 23, 22);
+            return (opc < 3 || sz < 2) && !(sz == 3 && opc == 2 && FIELD(insn, 11, 10) != 0);
+        }
+        if ((insn & 0x3b200c00) == 0x38200800)
+            return (FIELD(insn, 23, 22) < 3 || FIELD(insn, 31, 30) < 2) && (FIELD(insn, 15, 13) & 2);
+        if ((insn & 0x3b000000) == 0x18000000)
+            return true; /* LDR/PRFM (literal) */
+        if ((insn & 0x3a000000) == 0x28000000) {
+            unsigned opc = FIELD(insn, 31, 30);
+            return opc != 3 && !(opc == 1 && (!BIT(insn, 22) || FIELD(insn, 24, 23) == 0));
+        }
+        return false;
+    }
+    default:
+        return false;
+    }
+}
+
 /* Each direct-mapped entry holds a valid bit at bit 40, the instruction in bits 32:1,
  * and the Tier 0 result in bit 0. */
 static inline bool dbt_tier0_defined(struct appine_cpu *probe, uint64_t *cache, uint32_t insn, uint64_t pc)
 {
+    if (LIKELY(dbt_tier0_base_defined(insn)))
+        return true;
     uint64_t *entry = &cache[(insn * UINT32_C(0x9e3779b1)) >> 20];
     if (LIKELY((*entry >> 1) == ((uint64_t)1 << 39 | insn)))
         return *entry & 1;

@@ -5046,6 +5046,7 @@ fn unallocated_id_registers_fault_in_tier1() {
 
         // Unallocated CRm=0 (op2=1) and CRm=1 (op2=0) must exit Undefined in Tier 1.
         for insn in [0xd538_0020u32, 0xd538_0100u32] {
+            dbt.flush();
             let mut g = Guest::new();
             g.code(CODE, &[insn, SVC]);
             g.cpu.state_mut().pc = CODE;
@@ -6687,6 +6688,442 @@ fn dispatcher_jump_cache_reuse_retirement_and_flush() {
             assert_eq!(g.cpu.state().pc, p1);
             assert!(matches!(dbt.run(&mut g.cpu), Exit::Svc { imm: 0 }));
             assert_eq!(g.cpu.state().x[0], 50);
+        }
+    }
+}
+
+#[test]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
+fn eager_inline_linking_and_multithreaded_cond_pretranslate() {
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        // 1. Eagerly link inline B, BL, BL landing pad (R_CHAIN_FWD), and page fallthrough when
+        //    targets are already installed -> zero R_CHAIN exits.
+        let mut g = Guest::new();
+        let mut dbt = Dbt::with_regs(regs).expect("tier 1");
+        let callee = CODE + 0x200;
+        let cont = CODE + 0x104;
+        let caller = CODE + 0x100;
+        let page_end = CODE + PAGE_SIZE - 4;
+        let next_page = CODE + PAGE_SIZE;
+
+        g.code(callee, &[ADD_X1_1, RET]);
+        g.code(caller, &[bl(caller, callee), ADD_X1_1, SVC]);
+        g.code(page_end, &[ADD_X1_1]);
+        g.code(next_page, &[ADD_X1_1, SVC]);
+
+        // Pre-install callee, continuation (pc + 4), and next_page.
+        g.cpu.state_mut().x[1] = 0;
+        assert_eq!(g.run_at(&mut dbt, cont), 0);
+        assert_eq!(g.cpu.state().x[1], 1);
+        assert_eq!(g.run_at(&mut dbt, next_page), 0);
+        assert_eq!(g.cpu.state().x[1], 2);
+        // Install callee by calling it from an unrelated caller first.
+        let probe_call = CODE + 0x300;
+        g.code(probe_call, &[bl(probe_call, callee), SVC]);
+        assert_eq!(g.run_at(&mut dbt, probe_call), 0);
+
+        // Now translating caller and page_end must link BL, landing pad, and fallthrough eagerly.
+        let chains_before = dbt.stats().exits_chain;
+        g.cpu.state_mut().x[1] = 10;
+        assert_eq!(g.run_at(&mut dbt, caller), 0);
+        assert_eq!(g.cpu.state().x[1], 12);
+        assert_eq!(g.run_at(&mut dbt, page_end), 0);
+        assert_eq!(g.cpu.state().x[1], 14);
+        assert_eq!(
+            dbt.stats().exits_chain,
+            chains_before,
+            "eager inline linking should avoid R_CHAIN exits ({regs:?})"
+        );
+
+        // 2. Multithreaded pre-publication conditional-branch relinking (nthreads > 1).
+        let space = DbtSpace::new(0, regs).unwrap();
+        let mut dbt1 = Dbt::attach(&space, 0).unwrap();
+        let _dbt2 = Dbt::attach(&space, 0).unwrap(); // nthreads == 2 -> can_relink_branch == false
+        let src = CODE + 0x400;
+        let dst = CODE + 0x440;
+        g.code(src, &[cbz_x0(src, dst), movz_x0(11), SVC]);
+        g.code(dst, &[movz_x0(22), SVC]);
+
+        let chains0 = dbt1.stats().exits_chain;
+        g.cpu.state_mut().x[0] = 0;
+        assert_eq!(g.run_at(&mut dbt1, src), 22);
+        assert_eq!(
+            dbt1.stats().exits_chain,
+            chains0,
+            "multithreaded pre-translate should link same-page cond branch pre-publication ({regs:?})"
+        );
+        g.cpu.state_mut().x[0] = 1;
+        assert_eq!(g.run_at(&mut dbt1, src), 11);
+    }
+}
+
+#[test]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
+fn ret_miss_out_of_line_and_xor_folded_jump_cache() {
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        // Map two code pages separated by exactly 16 KiB (JC_SIZE * 4) so naive (pc >> 2) & 0xfff
+        // collides, while XOR-folded ((pc ^ (pc >> 12)) >> 2) & 0xfff maps them to distinct slots.
+        let mut pages: Box<[Page]> = (0..4).map(|_| Page([0; 4096])).collect();
+        let mut mmu = Mmu::new();
+        let base = NonNull::new(pages.as_mut_ptr().cast::<u8>()).unwrap();
+        let code_a = 0x40_0000u64;
+        let code_b = code_a + 16 * 1024;
+        let code_c = code_a + 32 * 1024;
+        let stack = 0x80_0000u64;
+        unsafe {
+            mmu.map(code_a, base, PAGE_SIZE, prot::READ | prot::EXEC).unwrap();
+            mmu.map(code_b, base.add(4096), PAGE_SIZE, prot::READ | prot::EXEC).unwrap();
+            mmu.map(code_c, base.add(2 * 4096), PAGE_SIZE, prot::READ | prot::EXEC).unwrap();
+            mmu.map(stack - PAGE_SIZE, base.add(3 * 4096), PAGE_SIZE, prot::READ | prot::WRITE)
+                .unwrap();
+        }
+        let write_code = |pages: &mut [Page], page_idx: usize, off: usize, insns: &[u32]| {
+            for (i, &w) in insns.iter().enumerate() {
+                let at = off + i * 4;
+                pages[page_idx].0[at..at + 4].copy_from_slice(&w.to_le_bytes());
+            }
+        };
+        // Dispatcher loop at code_c: loads x30 = target (alternating code_a and code_b via x2/x3),
+        // executes RET X30 (mispredicted shadow stack -> d->ret_miss -> jump cache!)
+        // code_a and code_b each increment x1, swap x2/x3, decrement x0, and RET to code_c if x0 > 0.
+        // Simpler: code_c has [mov x30, x2; ret] (mispredicted -> ret_miss -> target),
+        // code_a has [add x1, x1, #1; mov x2, x3; mov x3, x4; subs x0, x0, #1; b.eq done; mov x30, x5; ret; done: svc]
+        // Even simpler: use BR X2 in a loop alternating code_a and code_b, plus RET X30 mismatch!
+        let br_x2 = 0xd61f_0040u32; // br x2
+        let mov_x30_x2 = 0xaa02_03feu32; // mov x30, x2
+        let mov_x30_x3 = 0xaa03_03feu32; // mov x30, x3
+        let mov_x30_x4 = 0xaa04_03feu32; // mov x30, x4
+        let subs_x0_1 = 0xf100_0400u32; // subs x0, x0, #1
+        // code_a (+0): add x1, x1, #1; mov x30, x3; ret (jumps to code_b via ret_miss)
+        write_code(&mut pages, 0, 0, &[ADD_X1_1, mov_x30_x3, RET]);
+        // code_b (+0): add x1, x1, #2; subs x0, x0, #1; cbz x0, +8; mov x30, x2; ret; svc
+        write_code(
+            &mut pages,
+            1,
+            0,
+            &[
+                0x9100_0821, // add x1, x1, #2
+                subs_x0_1,
+                cbz_x0(code_b + 8, code_b + 20),
+                mov_x30_x2,
+                RET,
+                SVC,
+            ],
+        );
+        // code_c (+0): br x2 (and +0x10: mov x30, x4; ret for TBI0 tagged ret_miss check)
+        write_code(&mut pages, 2, 0, &[br_x2]);
+        write_code(&mut pages, 2, 0x10, &[mov_x30_x4, RET]);
+        write_code(&mut pages, 2, 0x40, &[movz_x0(77), SVC]);
+
+        let mut cpu = unsafe { Cpu::new(&mmu) };
+        let mut dbt = Dbt::with_regs(regs).expect("tier 1");
+        {
+            let s = cpu.state_mut();
+            s.sp = stack;
+            s.x[0] = 50;
+            s.x[1] = 0;
+            s.x[2] = code_a;
+            s.x[3] = code_b;
+            s.pc = code_c;
+        }
+        assert_eq!(dbt.run(&mut cpu), Exit::Svc { imm: 0 });
+        assert_eq!(cpu.state().x[1], 150);
+        let lookups_after_warm = dbt.stats().exits_lookup;
+
+        // Second run: both 16 KiB-aliased targets (code_a, code_b) must stay resident in t->jc
+        // with zero additional exits_lookup!
+        {
+            let s = cpu.state_mut();
+            s.x[0] = 50;
+            s.x[1] = 0;
+            s.pc = code_c;
+        }
+        assert_eq!(dbt.run(&mut cpu), Exit::Svc { imm: 0 });
+        assert_eq!(cpu.state().x[1], 150);
+        assert_eq!(
+            dbt.stats().exits_lookup,
+            lookups_after_warm,
+            "16 KiB-spaced targets should not collide in XOR-folded t->jc ({regs:?})"
+        );
+
+        // Tagged X30 (TBI0) on RET X30 -> d->ret_miss -> d->lookup untags and succeeds.
+        {
+            let s = cpu.state_mut();
+            s.x[4] = (0xab_u64 << 56) | (code_c + 0x40);
+            s.pc = code_c + 0x10;
+        }
+        assert_eq!(dbt.run(&mut cpu), Exit::Svc { imm: 0 });
+        assert_eq!(cpu.state().x[0], 77);
+    }
+}
+
+#[test]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
+fn grouping_continues_past_out_of_span_tpidr_and_ldar_stlr_and_wide_span() {
+    const MRS_X10_TPIDR: u32 = 0xd53b_d04a; // mrs x10, tpidr_el0
+    const LDAR_X11_X3: u32 = 0xc8df_fc6b; // ldar x11, [x3]
+    const STLR_X11_X3: u32 = 0xc89f_fc6b; // stlr x11, [x3]
+    const LDR_X0_X2_0: u32 = 0xf940_0040; // ldr x0, [x2, #0]
+    const LDR_X1_X2_1536: u32 = 0xf943_0041; // ldr x1, [x2, #1536] (192 * 8 = 1536 <= 2048)
+    const LDR_X4_X2_3072: u32 = 0xf946_0044; // ldr x4, [x2, #3072] (384 * 8 = 3072 > 2048 -> out of span)
+    const LDR_X5_X2_16: u32 = 0xf940_0845; // ldr x5, [x2, #16] (back in span!)
+    const LDR_X6_X2_24: u32 = 0xf940_0c46; // ldr x6, [x2, #24]
+    const LDR_X7_X2_32: u32 = 0xf940_1047; // ldr x7, [x2, #32]
+
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let mut g_t1 = Guest::with_data();
+        let mut g_t0 = Guest::with_data();
+        let mut dbt = Dbt::with_regs(regs).expect("tier 1");
+        let prog = [
+            LDR_X0_X2_0,     // leader (offset 0)
+            MRS_X10_TPIDR,   // allowed without breaking group or clobbering T2
+            LDR_X5_X2_16,    // grouped #1 (offset 16)
+            LDAR_X11_X3,     // allowed atomic (clobbers T2 -> reload)
+            LDR_X6_X2_24,    // grouped #2 (offset 24)
+            STLR_X11_X3,     // allowed release store (clobbers T2 -> reload)
+            LDR_X4_X2_3072,  // out-of-span (> GROUP_SPAN=2048): skipped with clobbered=true!
+            LDR_X1_X2_1536,  // grouped #3 (offset 1536 <= GROUP_SPAN=2048!)
+            LDR_X7_X2_32,    // grouped #4 (offset 32)
+            SVC,
+        ];
+        g_t1.code(CODE, &prog);
+        g_t0.code(CODE, &prog);
+        for g in [&mut g_t1, &mut g_t0] {
+            let s = g.cpu.state_mut();
+            s.x[2] = DATA;
+            s.x[3] = DATA + 0x200;
+            s.tpidr_el0 = 0xfeed_face_cafe_beef;
+            s.pc = CODE;
+        }
+        assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
+        assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
+        assert_eq!(g_t1.cpu.state().x, g_t0.cpu.state().x, "{regs:?}");
+        assert_eq!(
+            dbt.stats().insns_grouped,
+            4,
+            "all 4 in-span members after MRS TPIDR, LDAR, STLR, and out-of-span skip must group ({regs:?})"
+        );
+        assert_eq!(dbt.stats().ungrouped, 0);
+    }
+}
+
+#[test]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
+fn inlined_sysregs_dit_fpsr_and_128bit_exclusives_match_tier0() {
+    use appine_engine::hwcap;
+
+    const MRS_CTR: u32 = 0xd53b_0020; // mrs x0, ctr_el0
+    const MRS_TPIDRRO: u32 = 0xd53b_d061; // mrs x1, tpidrro_el0
+    const MRS_MIDR: u32 = 0xd538_0002; // mrs x2, midr_el1
+    const MRS_MPIDR: u32 = 0xd538_00a3; // mrs x3, mpidr_el1
+    const MRS_REVIDR: u32 = 0xd538_00c4; // mrs x4, revidr_el1
+    const MRS_PFR0: u32 = 0xd538_0405; // mrs x5, id_aa64pfr0_el1
+    const MRS_ISAR0: u32 = 0xd538_0606; // mrs x6, id_aa64isar0_el1
+    const MRS_ISAR1: u32 = 0xd538_0627; // mrs x7, id_aa64isar1_el1
+    const MSR_FPSR_X8: u32 = 0xd51b_4428; // msr fpsr, x8
+    const MRS_FPSR_X9: u32 = 0xd53b_4429; // mrs x9, fpsr
+    const MSR_FPSR_XZR: u32 = 0xd51b_443f; // msr fpsr, xzr
+    const MRS_FPSR_X10: u32 = 0xd53b_442a; // mrs x10, fpsr
+    // 128-bit and 64-bit pair exclusives
+    const LDAXP_X12_X13_X11: u32 = 0xc87f_b56c; // ldaxp x12, x13, [x11]
+    const STLXP_W14_X15_X19_X11: u32 = 0xc82e_cd6f; // stlxp w14, x15, x19, [x11]
+    const LDXP_W20_W19_X11: u32 = 0x887f_4d74; // ldxp w20, w19, [x11]
+    const STXP_W14_W15_W20_X11: u32 = 0x882e_516f; // stxp w14, w15, w20, [x11]
+
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let mut g_t1 = Guest::with_data();
+        let mut g_t0 = Guest::with_data();
+        let mut dbt = Dbt::with_regs(regs).expect("tier 1");
+        let stolen = match regs {
+            DbtRegs::Default => 16u32,
+            DbtRegs::Go => 21u32,
+        };
+
+        // 1. System registers + MSR FPSR (including stolen register)
+        let f_sys = CODE + 0x100;
+        let msr_fpsr_stolen = 0xd51b_4420 | stolen;
+        let mrs_ctr_stolen = 0xd53b_0020 | stolen;
+        let prog_sys = [
+            MRS_CTR,
+            MRS_TPIDRRO,
+            MRS_MIDR,
+            MRS_MPIDR,
+            MRS_REVIDR,
+            MRS_PFR0,
+            MRS_ISAR0,
+            MRS_ISAR1,
+            MSR_FPSR_X8,
+            MRS_FPSR_X9,
+            MSR_FPSR_XZR,
+            MRS_FPSR_X10,
+            msr_fpsr_stolen,
+            mrs_ctr_stolen,
+            SVC,
+        ];
+        for g in [&mut g_t1, &mut g_t0] {
+            g.code(f_sys, &prog_sys);
+            let s = g.cpu.state_mut();
+            s.x[8] = u64::MAX; // must mask to FPSR_MASK (0x0800_009f)
+            s.x[stolen as usize] = 0x0800_0015;
+            s.nzcv = 0x6000_0000;
+            s.pc = f_sys;
+        }
+        let interp0 = dbt.stats().exits_interp;
+        assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
+        assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
+        assert_eq!(
+            dbt.stats().exits_interp,
+            interp0,
+            "inlined sysregs and MSR FPSR should not exit to Tier 0 ({regs:?})"
+        );
+        assert_eq!(g_t1.cpu.state().x, g_t0.cpu.state().x);
+        assert_eq!(g_t1.cpu.state().fpsr, g_t0.cpu.state().fpsr);
+        assert_eq!(g_t1.cpu.state().nzcv, 0x6000_0000);
+
+        // 2. MSR/MRS DIT (immediate and register) when advertised
+        if appine_engine::guest_hwcap() & hwcap::DIT != 0 {
+            let f_dit = CODE + 0x200;
+            let msr_dit_1 = 0xd503_415fu32;
+            let msr_dit_0 = 0xd503_405fu32;
+            let mrs_dit_x0 = 0xd53b_42a0u32;
+            let mrs_dit_x1 = 0xd53b_42a1u32;
+            let msr_dit_x2 = 0xd51b_42a2u32;
+            let msr_dit_stolen = 0xd51b_42a0u32 | stolen;
+            let mrs_dit_x3 = 0xd53b_42a3u32;
+            let prog_dit = [
+                msr_dit_1,
+                mrs_dit_x0,
+                msr_dit_0,
+                mrs_dit_x1,
+                msr_dit_x2,
+                mrs_dit_x3,
+                msr_dit_stolen,
+                SVC,
+            ];
+            for g in [&mut g_t1, &mut g_t0] {
+                g.code(f_dit, &prog_dit);
+                let s = g.cpu.state_mut();
+                s.dit = 0;
+                s.x[2] = 1 << 24;
+                s.x[stolen as usize] = 1 << 24;
+                s.nzcv = 0xa000_0000;
+                s.pc = f_dit;
+            }
+            let interp_d = dbt.stats().exits_interp;
+            assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
+            assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
+            assert_eq!(dbt.stats().exits_interp, interp_d, "DIT should be inline ({regs:?})");
+            assert_eq!(g_t1.cpu.state().x, g_t0.cpu.state().x);
+            assert_eq!(g_t1.cpu.state().dit, 1);
+            assert_eq!(g_t1.cpu.state().nzcv, 0xa000_0000);
+            // Reset DIT back to 0 so host DIT stays clean.
+            let f_dit_off = CODE + 0x240;
+            g_t1.code(f_dit_off, &[msr_dit_0, SVC]);
+            g_t1.cpu.state_mut().pc = f_dit_off;
+            assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
+            assert_eq!(g_t1.cpu.state().dit, 0);
+        }
+
+        // 3. 128-bit and 64-bit pair exclusives (LDAXP/STLXP, LDXP/STXP): success, mismatch,
+        //    stolen registers, and alignment fault.
+        let f_excl = CODE + 0x300;
+        let ldaxp_stolen = 0xc87f_8160 | (stolen << 10) | stolen; // ldaxp xS, xS, [x11] -> wait: use distinct regs
+        let _ = ldaxp_stolen;
+        let s1 = stolen;
+        let s2 = match regs {
+            DbtRegs::Default => 17u32,
+            DbtRegs::Go => 22u32,
+        };
+        let ldaxp_s = 0xc87f_8160 | (s2 << 10) | s1; // ldaxp xS1, xS2, [x11]
+        let stlxp_s = 0xc820_8160 | (s1 << 16) | (s2 << 10) | s1; // stlxp wS1, xS1, xS2, [x11]
+        let prog_excl = [
+            // 16-byte success (non-stolen)
+            LDAXP_X12_X13_X11,
+            STLXP_W14_X15_X19_X11,
+            // 16-byte failure (monitor cleared by previous stlxp)
+            0xc820_cd6f, // stlxp w0, x15, x19, [x11] -> status in w0 must be 1
+            // 16-byte with stolen rt, rt2, rs
+            ldaxp_s,
+            stlxp_s,
+            // 8-byte pair (size=2) success
+            LDXP_W20_W19_X11,
+            STXP_W14_W15_W20_X11,
+            SVC,
+        ];
+        for g in [&mut g_t1, &mut g_t0] {
+            g.code(f_excl, &prog_excl);
+            let s = g.cpu.state_mut();
+            s.x = [0; 31];
+            s.x[11] = DATA; // 16-byte aligned
+            s.x[15] = 0xaaaa_bbbb_cccc_dddd;
+            s.x[19] = 0x1111_2222_3333_4444;
+            s.nzcv = 0x5000_0000;
+            s.pc = f_excl;
+        }
+        let interp_e = dbt.stats().exits_interp;
+        assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
+        assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
+        assert_eq!(
+            dbt.stats().exits_interp,
+            interp_e,
+            "pair exclusives should stay inline ({regs:?})"
+        );
+        assert_eq!(g_t1.cpu.state().x, g_t0.cpu.state().x);
+        assert_eq!(g_t1.cpu.state().nzcv, 0x5000_0000);
+        assert_eq!(g_t1.data(0, 0), g_t0.data(0, 0));
+        assert_eq!(g_t1.data(0, 8), g_t0.data(0, 8));
+        assert_eq!(g_t1.cpu.state().x[0], 1, "unreserved stlxp must fail with 1");
+        assert_eq!(g_t1.cpu.state().x[14], 0, "reserved stxp must succeed with 0");
+        assert_eq!(g_t1.cpu.state().x[s1 as usize], 0, "stolen stlxp must succeed with 0");
+
+        // Misaligned 16-byte LDAXP must fault identically to Tier 0.
+        let f_align = CODE + 0x380;
+        g_t1.code(f_align, &[LDAXP_X12_X13_X11, SVC]);
+        g_t1.cpu.state_mut().x[11] = DATA + 8;
+        g_t1.cpu.state_mut().pc = f_align;
+        assert_eq!(
+            dbt.run(&mut g_t1.cpu),
+            Exit::Fault {
+                addr: DATA + 8,
+                access: Access::Read,
+                kind: FaultKind::Alignment,
+            }
+        );
+
+        // 4. Base-defined fast-path parity: reserved encodings in fast-pathed groups must stay UNDEF.
+        let undef_cases = [
+            0x3280_0000u32, // MOVZ/N/K opc=1 (reserved)
+            0x52c0_0000u32, // MOVZ 32-bit hw=2 (reserved)
+            0x0b60_0000u32, // ADD shifted reg shift=3 (reserved)
+            0x0b20_1400u32, // ADD extended imm3=5 (reserved)
+            0x0a00_8000u32, // AND 32-bit imm6=32 (reserved)
+            0xb9c0_0000u32, // LDR size=2 opc=3 (reserved)
+            0xf880_0c00u32, // PRFM pre-index (reserved)
+            0x6800_0000u32, // STNP/LDPSW opc=1 store (reserved)
+            0x6840_0000u32, // LDPSW no-alloc idx=0 (reserved)
+            0xe840_0000u32, // LDP pair_opc=3 (reserved)
+        ];
+        for (i, &bad) in undef_cases.iter().enumerate() {
+            let pc = CODE + 0x500 + (i as u64) * 8;
+            g_t1.code(pc, &[bad, SVC]);
+            g_t1.cpu.state_mut().pc = pc;
+            assert_eq!(
+                dbt.run(&mut g_t1.cpu),
+                Exit::Undefined { insn: bad },
+                "reserved encoding {bad:#x} must remain UNDEF ({regs:?})"
+            );
         }
     }
 }

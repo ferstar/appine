@@ -392,7 +392,8 @@ static uint32_t *emit_lookup(struct xlate *x, struct appine_dbt *d)
     patch_branch(x->wdelta, found[1], here(x));
     emit_seq_step(x);
     emit(x, enc_ldr_x(0, CTX, offsetof(struct appine_cpu, dbt_jump_cache)));
-    emit(x, enc_ubfx(1, T0, 2, JC_BITS));
+    emit(x, enc_eor_lsr(1, T0, T0, JC_BITS));
+    emit(x, enc_ubfx(1, 1, 2, JC_BITS));
     emit(x, enc_add_lsl(0, 0, 1, 4));
     emit(x, enc_stp_x(T0, T2, 0, 0));
     emit(x, enc_mov(T1, T2));
@@ -429,9 +430,30 @@ static void move_guest_regs(struct xlate *x, unsigned base, bool store)
 }
 
 /*
+ * Shared RET X30 shadow-stack miss path: probe the thread-local jump cache with the XOR-folded
+ * index for raw X30 and jump directly on hit, else fall through to d->lookup (which applies TBI0).
+ */
+static uint32_t *emit_ret_miss(struct xlate *x, struct appine_dbt *d)
+{
+    uint32_t *entry = here(x);
+    emit(x, enc_mov(T0, 30));
+    emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, dbt_jump_cache)));
+    emit(x, enc_eor_lsr(T2, T0, T0, JC_BITS));
+    emit(x, enc_ubfx(T2, T2, 2, JC_BITS));
+    emit(x, enc_add_lsl(T1, T1, T2, 4));
+    emit(x, enc_ldp_x(T2, T1, T1, 0));
+    emit(x, enc_eor_lsr(T2, T2, T0, 0));
+    uint32_t *miss = here(x);
+    emit(x, enc_cbnz_x(T2));
+    patch_branch(x->wdelta, miss, d->lookup);
+    emit(x, enc_br(T1));
+    return entry;
+}
+
+/*
  * Shared predicted return tail for in-cache memop helpers: X0 holds the return value, all other
- * guest registers and NZCV are preserved. On shadow return stack mismatch (e.g., tail call), falls
- * through to d->rs_miss (which looks up X30 in the translation table).
+ * guest registers and NZCV are preserved. On shadow return stack mismatch (e.g., tail call),
+ * probes the jump cache via d->ret_miss before falling back to d->lookup.
  */
 static uint32_t *emit_memop_ret(struct xlate *x, struct appine_dbt *d)
 {
@@ -442,7 +464,7 @@ static uint32_t *emit_memop_ret(struct xlate *x, struct appine_dbt *d)
     emit(x, enc_eor_lsr(T0, T0, 30, 0));
     uint32_t *miss = here(x);
     emit(x, enc_cbnz_x(T0));
-    patch_branch(x->wdelta, miss, d->rs_miss);
+    patch_branch(x->wdelta, miss, d->ret_miss);
     emit(x, enc_sub_imm(T0, T1, 16, 0));
     emit(x, enc_bfxil_low(T1, T0, RS_SHIFT));
     emit(x, enc_str_x(T1, CTX, rs));
@@ -1001,12 +1023,13 @@ void dbt_emit_routines(struct appine_dbt *d)
     d->refill[1] = emit_refill(x, true);
     d->lookup = emit_lookup(x, d);
 
-    /* Landing pad of empty shadow return stack entries (and memop_ret misses): look up by guest
-     * x30 through the same TBI0 lookup as a jump-cache miss */
+    /* Landing pad of empty shadow return stack entries: look up by guest x30 through the same
+     * TBI0 lookup as a jump-cache miss */
     d->rs_miss = here(x);
     emit(x, enc_mov(T0, 30));
     emit(x, enc_b((intptr_t)d->lookup - (intptr_t)here(x)));
 
+    d->ret_miss = emit_ret_miss(x, d);
     d->memop_ret = emit_memop_ret(x, d);
     d->memop_memset = emit_memop_memset(x, d);
     d->memop_memmove = emit_memop_memmove(x, d);

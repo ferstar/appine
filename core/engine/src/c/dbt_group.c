@@ -166,6 +166,12 @@ static int keeps_group_step(const struct xlate *x, uint32_t insn, uint32_t *alia
         }
         return *alias_mask ? (uses_t2(x, insn, &o) ? 2 : 1) : 0;
     }
+    if ((insn & 0xffffffe0u) == (0xd5200000u | (SYSREG_TPIDR_EL0 << 5))) { /* MRS Xt, TPIDR_EL0 */
+        unsigned rt = insn & 31;
+        if (rt < 31)
+            *alias_mask &= ~(1u << rt);
+        return *alias_mask != 0; /* uses at most T0 for stolen Rt, never T2 */
+    }
     return (insn & 0xff000010) == 0x54000000 || /* B.cond */
            (insn & 0x7e000000) == 0x34000000 || /* CBZ/CBNZ */
            (insn & 0x7e000000) == 0x36000000 || /* TBZ/TBNZ */
@@ -225,11 +231,47 @@ static int keeps_group_reg(const struct xlate *x, uint32_t insn, unsigned rn, un
         }
         return uses_t2(x, insn, &o) ? 2 : 1;
     }
+    if ((insn & 0xffffffe0u) == (0xd5200000u | (SYSREG_TPIDR_EL0 << 5))) { /* MRS Xt, TPIDR_EL0 */
+        unsigned rt = insn & 31;
+        return (rt == 31 || (rt != rn && rt != rm)) ? 1 : 0;
+    }
     return (insn & 0xff000010) == 0x54000000 || /* B.cond */
            (insn & 0x7e000000) == 0x34000000 || /* CBZ/CBNZ */
            (insn & 0x7e000000) == 0x36000000 || /* TBZ/TBNZ */
            (insn & 0xfffff01f) == 0xd503201f || /* HINT */
            (insn & 0xfffff01f) == 0xd503301f;   /* barriers, CLREX */
+}
+
+/* Whether insn is an inline-translated LDAR, STLR or feature-gated LDAPR (clobbers T2 via its
+ * own TLB check, writes only Rt when *is_load is true, and never modifies Rn). */
+static bool is_group_safe_atomic(uint32_t insn, bool *is_load)
+{
+    if ((insn & 0x3fa08000u) == 0x08808000u) { /* LDAR / STLR (o2=1, o1=0, o0=1) */
+        *is_load = BIT(insn, 22) != 0;
+        return true;
+    }
+    if ((insn & 0x3ffffc00u) == 0x38bfc000u && appine_has(APPINE_HWCAP_LRCPC)) { /* LDAPR */
+        *is_load = true;
+        return true;
+    }
+    return false;
+}
+
+/* Update affine aliases across a non-joining memory access that will execute ungrouped. */
+static void skip_memop_aliases(const struct memop *m, uint32_t *alias_mask, int64_t alias_off[32])
+{
+    if (m->load && !m->simd) {
+        if (m->rt < 31)
+            *alias_mask &= ~(1u << m->rt);
+        if (m->pair && m->rt2 < 31)
+            *alias_mask &= ~(1u << m->rt2);
+    }
+    if (m->mode == M_PRE || m->mode == M_POST) {
+        if (m->wb_reg)
+            *alias_mask &= ~(1u << m->rn);
+        else if ((*alias_mask >> m->rn) & 1)
+            alias_off[m->rn] += m->imm;
+    }
 }
 
 /* When access `m` executes, the base is `delta` more than before the leader executed: the start
@@ -282,7 +324,17 @@ int dbt_plan_group(struct xlate *x, const struct memop *lead)
             }
             struct memop m;
             uint64_t pc = x->pc + 4ull * j;
-            if (dbt_is_atomic(insn) || !(BIT(insn, 26) ? dbt_decode_simd_memop(insn, pc, &m) : dbt_decode_memop(insn, pc, &m)))
+            if (dbt_is_atomic(insn)) {
+                bool is_load;
+                if (!is_group_safe_atomic(insn, &is_load))
+                    break;
+                unsigned rt = insn & 31;
+                if (is_load && rt < 31 && (rt == rn || rt == rm))
+                    break;
+                clobbered = true;
+                continue;
+            }
+            if (!(BIT(insn, 26) ? dbt_decode_simd_memop(insn, pc, &m) : dbt_decode_memop(insn, pc, &m)))
                 break;
             if (m.prefetch)
                 continue;
@@ -300,8 +352,12 @@ int dbt_plan_group(struct xlate *x, const struct memop *lead)
             int64_t start = delta, end = start + memop_bytes(&m);
             int64_t nlo = start < lo ? start : lo, nhi = end > hi ? end : hi;
             if (nhi - nlo > GROUP_SPAN || start <= -(1 << 23) || start >= (1 << 23) ||
-                nlo <= -(1 << 23) || nlo >= (1 << 23) || !member_fits(x, &m, start))
-                break;
+                nlo <= -(1 << 23) || nlo >= (1 << 23) || !member_fits(x, &m, start)) {
+                if (m.load && !m.simd && ((rn < 31 && m.rt == rn) || (rm < 31 && m.rt == rm)))
+                    break;
+                clobbered = true;
+                continue;
+            }
             lo = nlo;
             hi = nhi;
             write |= !m.load;
@@ -357,7 +413,19 @@ int dbt_plan_group(struct xlate *x, const struct memop *lead)
             }
             struct memop m;
             uint64_t pc = x->pc + 4ull * j;
-            if (dbt_is_atomic(insn) || !(BIT(insn, 26) ? dbt_decode_simd_memop(insn, pc, &m) : dbt_decode_memop(insn, pc, &m)))
+            if (dbt_is_atomic(insn)) {
+                bool is_load;
+                if (!is_group_safe_atomic(insn, &is_load))
+                    break;
+                unsigned rt = insn & 31;
+                if (is_load && rt < 31)
+                    alias_mask &= ~(1u << rt);
+                if (!alias_mask)
+                    break;
+                clobbered = true;
+                continue;
+            }
+            if (!(BIT(insn, 26) ? dbt_decode_simd_memop(insn, pc, &m) : dbt_decode_memop(insn, pc, &m)))
                 break;
             if (m.prefetch) /* generates no code */
                 continue;
@@ -365,18 +433,7 @@ int dbt_plan_group(struct xlate *x, const struct memop *lead)
                             ((alias_mask >> m.rn) & 1) &&
                             (m.rn != 31 || (rn == 31 && (alias_off[31] & 15) == 0));
             if (!can_join) {
-                if (m.load && !m.simd) {
-                    if (m.rt < 31)
-                        alias_mask &= ~(1u << m.rt);
-                    if (m.pair && m.rt2 < 31)
-                        alias_mask &= ~(1u << m.rt2);
-                }
-                if (m.mode == M_PRE || m.mode == M_POST) {
-                    if (m.wb_reg)
-                        alias_mask &= ~(1u << m.rn);
-                    else if ((alias_mask >> m.rn) & 1)
-                        alias_off[m.rn] += m.imm;
-                }
+                skip_memop_aliases(&m, &alias_mask, alias_off);
                 if (!alias_mask)
                     break;
                 clobbered = true;
@@ -385,8 +442,13 @@ int dbt_plan_group(struct xlate *x, const struct memop *lead)
             int64_t start = member_start(&m, alias_off[m.rn]), end = start + memop_bytes(&m);
             int64_t nlo = start < lo ? start : lo, nhi = end > hi ? end : hi;
             if (nhi - nlo > GROUP_SPAN || start <= -(1 << 23) || start >= (1 << 23) ||
-                nlo <= -(1 << 23) || nlo >= (1 << 23) || !member_fits(x, &m, start))
-                break;
+                nlo <= -(1 << 23) || nlo >= (1 << 23) || !member_fits(x, &m, start)) {
+                skip_memop_aliases(&m, &alias_mask, alias_off);
+                if (!alias_mask)
+                    break;
+                clobbered = true;
+                continue;
+            }
             lo = nlo;
             hi = nhi;
             write |= !m.load;

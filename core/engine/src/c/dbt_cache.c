@@ -208,6 +208,8 @@ void dbt_link_block(const struct appine_dbt *d, uint32_t *code, uint64_t pc, uns
         if (l->stub & LINK_FWD)
             target += ENTRY_CHECK_WORDS;
         uint32_t *site = code + (l->stub & ~LINK_FWD);
+        if (target == site)
+            continue;
         *rw(d, site) = enc_b((intptr_t)target - (intptr_t)site);
         if (l->branch != NO_BRANCH)
             dbt_relink_word(d, code + l->branch, target);

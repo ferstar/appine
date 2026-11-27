@@ -201,6 +201,7 @@ retry_prepare:
     x->nstubs = 0;
     x->nfixups = 0;
     x->nrelocs = 0;
+    x->nlinks = 0;
     x->pc = pc;
     x->src = p->guest;
     x->mmu = c->mmu;
@@ -346,10 +347,6 @@ retry_prepare:
         }
         bool link = s->reason == R_CHAIN || s->reason == R_CHAIN_FWD;
         emit_link_stub(x, s->reason, s->pc, link && s->sites == 1 ? s->branch : NULL);
-        if (link)
-            p->links[p->nlinks++] = (struct link){
-                (uint32_t)(s->addr - x->buf) | (s->reason == R_CHAIN_FWD ? LINK_FWD : 0),
-                s->sites == 1 ? (uint32_t)(s->branch - x->buf) : NO_BRANCH, s->pc};
     }
     for (unsigned i = 0; i < x->nfixups; i++) {
         struct fixup *f = &x->fixups[i];
@@ -360,16 +357,18 @@ retry_prepare:
             *f->site |= ((uint32_t)(off >> 2) & 0x3fff) << 5;
     }
 
-    if (x->nrelocs > MAX_RELOCS)
+    if (x->nrelocs > MAX_RELOCS || x->nlinks > MAX_LINKS)
         appine_guard_fail();
     uint32_t total_nguest = fl_nguest > nguest ? fl_nguest : nguest;
     if (!memop_kind)
-        dbt_template_store(pc, p->words, total_nguest, key, x, &before, p->links, p->nlinks);
+        dbt_template_store(pc, p->words, total_nguest, key, x, &before, x->links, x->nlinks);
     p->nguest = total_nguest;
     p->host = x->buf;
     p->nhost = (uint32_t)x->n;
     memcpy(p->relocs, x->relocs, x->nrelocs * 4);
     p->nrelocs = x->nrelocs;
+    memcpy(p->links, x->links, x->nlinks * sizeof(x->links[0]));
+    p->nlinks = x->nlinks;
     return true;
 }
 
@@ -1441,6 +1440,123 @@ static void queue_relink(struct appine_dbt_thread *t, uint32_t *branch, const ui
     }
 }
 
+#define PRETRANS_MAX 2
+#define PRETRANS_MAX_HOST 512
+#define PRETRANS_MAX_RELOCS 128
+#define PRETRANS_MAX_LINKS 32
+
+/*
+ * When post-publication conditional-branch relinking is disallowed (nthreads > 1 under CMODX),
+ * pre-translate up to PRETRANS_MAX same-page conditional branch targets before installing the
+ * prepared block so install()'s dbt_link_block can relink its conditional branches directly while
+ * still invisible to other threads. Kept noinline to avoid stack overhead on single-threaded runs.
+ */
+static __attribute__((noinline)) void pretranslate_cond_targets(struct appine_dbt_thread *t,
+                                                                struct appine_cpu *c)
+{
+    struct appine_dbt *d = t->d;
+    struct prep *p = t->prep;
+    if (p->nhost > PRETRANS_MAX_HOST || p->nrelocs > PRETRANS_MAX_RELOCS ||
+        p->nlinks > PRETRANS_MAX_LINKS)
+        return;
+    if (__atomic_load_n(&d->used_words, __ATOMIC_RELAXED) > d->cache_words * 3 / 4 ||
+        __atomic_load_n(&d->table_count, __ATOMIC_RELAXED) > TABLE_LIMIT * 3 / 4)
+        return;
+    uint64_t page = p->pc >> APPINE_PAGE_SHIFT;
+    if (__atomic_load_n(&d->page_parked[page_bucket(page)], __ATOMIC_RELAXED))
+        return;
+
+    uint64_t targets[PRETRANS_MAX];
+    unsigned ntargets = 0;
+    for (unsigned i = 0; i < p->nlinks && ntargets < PRETRANS_MAX; i++) {
+        const struct link *l = &p->links[i];
+        if (l->branch == NO_BRANCH || l->pc == p->pc || (l->pc >> APPINE_PAGE_SHIFT) != page)
+            continue;
+        bool dup = false;
+        for (unsigned k = 0; k < ntargets; k++)
+            if (targets[k] == l->pc)
+                dup = true;
+        if (dup)
+            continue;
+        unsigned tmp_found;
+        if (dbt_table_lookup(d, c, l->pc, &tmp_found))
+            continue;
+        targets[ntargets++] = l->pc;
+    }
+    if (!ntargets)
+        return;
+
+    struct {
+        uint64_t pc;
+        unsigned tag;
+        uint32_t memop_kind;
+        const uint32_t *guest;
+        const uint32_t *guest1;
+        uint32_t nguest;
+        uint32_t nhost;
+        unsigned nrelocs;
+        unsigned nlinks;
+        uint32_t words[MAX_BLOCK_INSNS];
+        uint32_t host[PRETRANS_MAX_HOST];
+        uint32_t relocs[PRETRANS_MAX_RELOCS];
+        struct link links[PRETRANS_MAX_LINKS];
+    } saved;
+    saved.pc = p->pc;
+    saved.tag = p->tag;
+    saved.memop_kind = p->memop_kind;
+    saved.guest = p->guest;
+    saved.guest1 = p->guest1;
+    saved.nguest = p->nguest;
+    saved.nhost = p->nhost;
+    saved.nrelocs = p->nrelocs;
+    saved.nlinks = p->nlinks;
+    memcpy(saved.words, p->words, p->nguest * 4);
+    memcpy(saved.host, p->host, p->nhost * 4);
+    memcpy(saved.relocs, p->relocs, p->nrelocs * 4);
+    memcpy(saved.links, p->links, p->nlinks * sizeof(p->links[0]));
+
+    for (unsigned k = 0; k < ntargets; k++) {
+        if (!prepare(t, c, targets[k]))
+            continue;
+        lock_dbt(d, &t->stats);
+        if (__atomic_load_n(&d->flushing, __ATOMIC_RELAXED) || d->flush_wanted) {
+            unlock_dbt(d);
+            break;
+        }
+        unsigned found;
+        if (!dbt_table_find_for(d->table, targets[k], t->tag, &found)) {
+            struct syncs sync;
+            sync.n = 0;
+            struct fresh f = {.code = NULL};
+            uint32_t *code = install(d, t->prep, &sync, &f);
+            if (code == NEED_FLUSH) {
+                unlock_dbt(d);
+                break;
+            }
+            if (code != STALE && f.code) {
+                dbt_sync_all(d, &sync);
+                dbt_table_insert(d, f.pc, f.tag, f.code, f.guest, f.nguest);
+            }
+        }
+        unlock_dbt(d);
+    }
+
+    p->pc = saved.pc;
+    p->tag = saved.tag;
+    p->memop_kind = saved.memop_kind;
+    p->guest = saved.guest;
+    p->guest1 = saved.guest1;
+    p->nguest = saved.nguest;
+    p->host = t->scratch;
+    p->nhost = saved.nhost;
+    p->nrelocs = saved.nrelocs;
+    p->nlinks = saved.nlinks;
+    memcpy(p->words, saved.words, saved.nguest * 4);
+    memcpy(t->scratch, saved.host, saved.nhost * 4);
+    memcpy(p->relocs, saved.relocs, saved.nrelocs * 4);
+    memcpy(p->links, saved.links, saved.nlinks * sizeof(p->links[0]));
+}
+
 static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
 {
     struct appine_dbt_thread *t = ctx;
@@ -1520,6 +1636,8 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
         if (!code) {
             /* Translate without the lock, install with it */
             bool fetched = prepare(t, c, c->pc);
+            if (fetched && t->prep->nlinks && !can_relink_branch(d, t, !t->prep->tag))
+                pretranslate_cond_targets(t, c);
             lock_dbt(d, &t->stats);
             if (__atomic_load_n(&d->flushing, __ATOMIC_RELAXED) || d->flush_wanted) {
                 unlock_dbt(d);
@@ -1601,6 +1719,7 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
         }
         if (!code) { /* cannot fetch: let Tier 0 report the precise fault */
             fill_jump_cache = false;
+            appine_sync_dit(c);
             enum appine_exit r = appine_interp_step(c);
             if (r != APPINE_EXIT_NONE)
                 return r;
@@ -1663,6 +1782,7 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
                 }
             }
             t->stats.exits_interp++;
+            appine_sync_dit(c);
             enum appine_exit r = appine_interp_step(c);
             /*
              * When Tier 0 executes ic ivau on a second page, invalidate both pages. The
@@ -1709,6 +1829,8 @@ enum appine_exit appine_dbt_run(struct appine_dbt_thread *t, struct appine_cpu *
     /* Register the cpu first, then look at flushing (see flush_world) */
     __atomic_store_n(&t->cpu, c, __ATOMIC_SEQ_CST);
     enum appine_exit r = appine_guard_run(dbt_run, t, c);
+    /* Keep cpu.c's thread-local host_dit cache synchronized after inline MSR DIT in Tier 1. */
+    appine_sync_dit(c);
     if (UNLIKELY(r == APPINE_EXIT_HOST_FAULT)) {
         /* The guard has already released the locks held. Threads stopped waiting for a flush
          * must not wait forever */
