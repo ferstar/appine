@@ -143,28 +143,51 @@ pub unsafe fn sendmsg_iov(
     control: &[u8],
     flags: i32,
 ) -> Result<usize, i32> {
+    with_iovecs(
+        iovecs,
+        |ptr| ptr as *mut libc::c_void,
+        |iov| {
+            // SAFETY: Caller guarantees every `(ptr, len)` in `iovecs` is valid for reads of
+            // `len` bytes for the duration of the call.
+            unsafe { sendmsg_raw(fd, iov, addr, control, flags) }
+        },
+    )
+}
+
+/// Builds a stack-backed `libc::iovec` array (up to 64 spans, heap fallback above) and passes it
+/// to `f`.
+#[inline]
+fn with_iovecs<P: Copy, R>(
+    iovecs: &[(P, usize)],
+    to_void: impl Fn(P) -> *mut libc::c_void,
+    f: impl FnOnce(&mut [libc::iovec]) -> R,
+) -> R {
     const STACK_IOV: usize = 64;
     if iovecs.len() <= STACK_IOV {
         let mut iov = [libc::iovec {
             iov_base: std::ptr::null_mut(),
             iov_len: 0,
         }; STACK_IOV];
-        for (dst, &(ptr, len)) in iov.iter_mut().zip(iovecs.iter()) {
-            dst.iov_base = ptr as *mut libc::c_void;
+        for (dst, &(ptr, len)) in iov.iter_mut().zip(iovecs) {
+            dst.iov_base = to_void(ptr);
             dst.iov_len = len;
         }
-        return unsafe { sendmsg_raw(fd, &mut iov[..iovecs.len()], addr, control, flags) };
+        f(&mut iov[..iovecs.len()])
+    } else {
+        let mut iov: Vec<libc::iovec> = iovecs
+            .iter()
+            .map(|&(ptr, len)| libc::iovec {
+                iov_base: to_void(ptr),
+                iov_len: len,
+            })
+            .collect();
+        f(&mut iov)
     }
-    let mut iov: Vec<libc::iovec> = iovecs
-        .iter()
-        .map(|&(ptr, len)| libc::iovec {
-            iov_base: ptr as *mut libc::c_void,
-            iov_len: len,
-        })
-        .collect();
-    unsafe { sendmsg_raw(fd, &mut iov, addr, control, flags) }
 }
 
+/// # Safety
+/// Every entry in `iov` must refer to a readable buffer of `iov_len` bytes for the duration of the
+/// syscall.
 unsafe fn sendmsg_raw(
     fd: i32,
     iov: &mut [libc::iovec],
@@ -172,6 +195,7 @@ unsafe fn sendmsg_raw(
     control: &[u8],
     flags: i32,
 ) -> Result<usize, i32> {
+    // SAFETY: `libc::msghdr` is a plain C struct; all-zero is a valid empty header.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     if !addr.is_empty() {
         msg.msg_name = addr.as_ptr() as *mut libc::c_void;
@@ -185,6 +209,7 @@ unsafe fn sendmsg_raw(
         msg.msg_control = control.as_ptr() as *mut libc::c_void;
         msg.msg_controllen = control.len() as _;
     }
+    // SAFETY: `iov` (per caller), `addr`, and `control` remain valid for reads during the syscall.
     let n = unsafe { libc::sendmsg(fd, &msg, flags | libc::MSG_NOSIGNAL) };
     if n < 0 {
         Err(last_errno())
@@ -241,28 +266,63 @@ pub unsafe fn recvmsg_iov(
     need_addr: bool,
     flags: i32,
 ) -> Result<Received, i32> {
-    const STACK_IOV: usize = 64;
-    if iovecs.len() <= STACK_IOV {
-        let mut iov = [libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 0,
-        }; STACK_IOV];
-        for (dst, &(ptr, len)) in iov.iter_mut().zip(iovecs.iter()) {
-            dst.iov_base = ptr.cast();
-            dst.iov_len = len;
-        }
-        return unsafe { recvmsg_raw(fd, &mut iov[..iovecs.len()], control_len, need_addr, flags) };
-    }
-    let mut iov: Vec<libc::iovec> = iovecs
-        .iter()
-        .map(|&(ptr, len)| libc::iovec {
-            iov_base: ptr.cast(),
-            iov_len: len,
-        })
-        .collect();
-    unsafe { recvmsg_raw(fd, &mut iov, control_len, need_addr, flags) }
+    with_iovecs(iovecs, <*mut u8>::cast, |iov| {
+        // SAFETY: Caller guarantees every `(ptr, len)` in `iovecs` is valid for writes of `len`
+        // bytes for the duration of the call.
+        unsafe { recvmsg_raw(fd, iov, control_len, need_addr, flags) }
+    })
 }
 
+/// Issues `recvmsg(2)` with optional caller-owned scratch buffers for `msg_name` and
+/// `msg_control`, returning `(len, addr_len, control_len, msg_flags)` with lengths clamped to the
+/// provided buffer capacities.
+///
+/// # Safety
+/// Every entry in `iov` must refer to a writable buffer of `iov_len` bytes for the duration of the
+/// syscall.
+#[inline]
+unsafe fn recvmsg_call(
+    fd: i32,
+    iov: &mut [libc::iovec],
+    addr: Option<&mut [u8]>,
+    control: Option<&mut [u8]>,
+    flags: i32,
+) -> Result<(usize, usize, usize, i32), i32> {
+    // SAFETY: `libc::msghdr` is a plain C struct; all-zero is a valid empty header.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    if !iov.is_empty() {
+        msg.msg_iov = iov.as_mut_ptr();
+        msg.msg_iovlen = iov.len() as _;
+    }
+    let addr_cap = if let Some(a) = addr {
+        msg.msg_name = a.as_mut_ptr().cast();
+        msg.msg_namelen = a.len() as libc::socklen_t;
+        a.len()
+    } else {
+        0
+    };
+    let ctrl_cap = if let Some(c) = control {
+        msg.msg_control = c.as_mut_ptr().cast();
+        msg.msg_controllen = c.len() as _;
+        c.len()
+    } else {
+        0
+    };
+    // SAFETY: `iov` (per caller), `addr`, and `control` remain valid for writes during the syscall.
+    let n = unsafe { libc::recvmsg(fd, &mut msg, flags) };
+    if n < 0 {
+        return Err(last_errno());
+    }
+    let alen = (msg.msg_namelen as usize).min(addr_cap);
+    // msg_controllen is size_t in glibc and bionic but socklen_t in musl.
+    #[allow(clippy::unnecessary_cast)]
+    let clen = (msg.msg_controllen as usize).min(ctrl_cap);
+    Ok((n as usize, alen, clen, msg.msg_flags))
+}
+
+/// # Safety
+/// Every entry in `iov` must refer to a writable buffer of `iov_len` bytes for the duration of the
+/// syscall.
 unsafe fn recvmsg_raw(
     fd: i32,
     iov: &mut [libc::iovec],
@@ -273,77 +333,62 @@ unsafe fn recvmsg_raw(
     // Fast path for address-less, control-less receives (e.g. TCP read/recv): avoid initializing
     // stack buffers for sockaddr and ancillary data or touching the heap.
     if !need_addr && control_len == 0 {
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        if !iov.is_empty() {
-            msg.msg_iov = iov.as_mut_ptr();
-            msg.msg_iovlen = iov.len() as _;
-        }
-        let n = unsafe { libc::recvmsg(fd, &mut msg, flags) };
-        if n < 0 {
-            return Err(last_errno());
-        }
+        // SAFETY: Caller guarantees `iov` buffers are writable for the duration of the syscall.
+        let (len, _, _, msg_flags) = unsafe { recvmsg_call(fd, iov, None, None, flags) }?;
         return Ok(Received {
-            len: n as usize,
+            len,
             addr: Vec::new(),
             control: Vec::new(),
-            flags: msg.msg_flags,
+            flags: msg_flags,
         });
     }
     const STACK_CONTROL: usize = 512;
-    let mut addr = [0u8; 128];
-    let mut stack_ctrl = [0u8; STACK_CONTROL];
-    let mut heap_ctrl = if control_len > STACK_CONTROL {
-        vec![0u8; control_len]
-    } else {
-        Vec::new()
-    };
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    if need_addr {
-        msg.msg_name = addr.as_mut_ptr().cast();
-        msg.msg_namelen = addr.len() as libc::socklen_t;
-    }
-    if !iov.is_empty() {
-        msg.msg_iov = iov.as_mut_ptr();
-        msg.msg_iovlen = iov.len() as _;
-    }
-    if control_len > 0 {
-        msg.msg_control = if control_len > STACK_CONTROL {
-            heap_ctrl.as_mut_ptr().cast()
-        } else {
-            stack_ctrl.as_mut_ptr().cast()
-        };
-        msg.msg_controllen = control_len as _;
-    }
-    let n = unsafe { libc::recvmsg(fd, &mut msg, flags) };
-    if n < 0 {
-        return Err(last_errno());
-    }
-    // msg_controllen is size_t in glibc and bionic but socklen_t in musl
-    #[allow(clippy::unnecessary_cast)]
-    let clen = (msg.msg_controllen as usize).min(control_len);
-    let control = if clen == 0 {
-        Vec::new()
-    } else if control_len > STACK_CONTROL {
-        heap_ctrl.truncate(clen);
-        heap_ctrl
-    } else {
-        stack_ctrl[..clen].to_vec()
-    };
-    let addr = if need_addr {
-        let alen = (msg.msg_namelen as usize).min(addr.len());
-        if alen > 0 {
-            addr[..alen].to_vec()
+    let mut addr_buf = [0u8; 128];
+    let addr_slice = need_addr.then_some(&mut addr_buf[..]);
+    let ((len, alen, _, msg_flags), control) = if control_len == 0 {
+        // SAFETY: Caller guarantees `iov` buffers are writable for the duration of the syscall.
+        let res = unsafe { recvmsg_call(fd, iov, addr_slice, None, flags) }?;
+        (res, Vec::new())
+    } else if control_len <= STACK_CONTROL {
+        let mut stack_ctrl = [0u8; STACK_CONTROL];
+        // SAFETY: Caller guarantees `iov` buffers are writable for the duration of the syscall.
+        let res = unsafe {
+            recvmsg_call(
+                fd,
+                iov,
+                addr_slice,
+                Some(&mut stack_ctrl[..control_len]),
+                flags,
+            )
+        }?;
+        let ctrl = if res.2 > 0 {
+            stack_ctrl[..res.2].to_vec()
         } else {
             Vec::new()
-        }
+        };
+        (res, ctrl)
+    } else {
+        let mut heap_ctrl = vec![0u8; control_len];
+        // SAFETY: Caller guarantees `iov` buffers are writable for the duration of the syscall.
+        let res = unsafe { recvmsg_call(fd, iov, addr_slice, Some(&mut heap_ctrl), flags) }?;
+        let ctrl = if res.2 > 0 {
+            heap_ctrl.truncate(res.2);
+            heap_ctrl
+        } else {
+            Vec::new()
+        };
+        (res, ctrl)
+    };
+    let addr = if alen > 0 {
+        addr_buf[..alen].to_vec()
     } else {
         Vec::new()
     };
     Ok(Received {
-        len: n as usize,
+        len,
         addr,
         control,
-        flags: msg.msg_flags,
+        flags: msg_flags,
     })
 }
 
@@ -951,6 +996,20 @@ mod tests {
         assert!(got.control.is_empty());
         assert_eq!(&r1, b"hello");
         assert_eq!(&r2[..got.len - r1.len()], b" vectored world!");
+
+        // Exercise heap fallback (> 64 spans) in both sendmsg_iov and recvmsg_iov.
+        let many_tx: Vec<u8> = (0u8..70).collect();
+        let tx_many: Vec<(*const u8, usize)> =
+            many_tx.iter().map(|b| (b as *const u8, 1)).collect();
+        let sent_many = unsafe { sendmsg_iov(c, &tx_many, &[], &[], 0) }.unwrap();
+        assert_eq!(sent_many, many_tx.len());
+        wait_ready(s, libc::POLLIN);
+        let mut many_rx = vec![0u8; 70];
+        let rx_many: Vec<(*mut u8, usize)> =
+            many_rx.iter_mut().map(|b| (b as *mut u8, 1)).collect();
+        let got_many = unsafe { recvmsg_iov(s, &rx_many, 0, false, 0) }.unwrap();
+        assert_eq!(got_many.len, many_tx.len());
+        assert_eq!(many_rx, many_tx);
 
         close(s);
         close(c);
