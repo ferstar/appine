@@ -6355,11 +6355,7 @@ pub(crate) mod tests {
             root: Node::ROOT,
             cwd: Node::ROOT,
             umask: 0o022,
-            mnt_ns: Rc::new(MntNs {
-                id: INIT_MNT_NS,
-                owner: k.init_ns.ipc.owner.clone(),
-                anon: false,
-            }),
+            mnt_ns: MntNs::standalone(INIT_MNT_NS, k.init_ns.ipc.owner.clone()),
         }));
         let cpu = unsafe { appine_engine::Cpu::new(mm.borrow().mmu()) };
         let state = TaskState {

@@ -113,11 +113,7 @@ pub(super) fn new_pid_ns(
 /// `copy_mnt_ns`). Without a rootfs only the number changes.
 pub(super) fn new_mnt_ns(vfs: Option<&Vfs>, fs: &mut FsContext, owner: Rc<UserNs>) {
     let Some(vfs) = vfs else {
-        fs.mnt_ns = Rc::new(MntNs {
-            id: new_ns_id(),
-            owner,
-            anon: false,
-        });
+        fs.mnt_ns = MntNs::standalone(new_ns_id(), owner);
         return;
     };
     let (ns, map) = vfs.copy_ns(fs.mnt_ns.id, owner);

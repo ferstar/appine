@@ -375,11 +375,10 @@ impl Machine {
                 umask: 0o022,
                 mnt_ns: vfs.as_ref().map_or_else(
                     || {
-                        Rc::new(crate::vfs::MntNs {
-                            id: crate::vfs::INIT_MNT_NS,
-                            owner: crate::cred::UserNs::init(),
-                            anon: false,
-                        })
+                        crate::vfs::MntNs::standalone(
+                            crate::vfs::INIT_MNT_NS,
+                            crate::cred::UserNs::init(),
+                        )
                     },
                     |v| v.init_ns(),
                 ),

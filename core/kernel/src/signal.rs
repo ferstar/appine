@@ -2092,11 +2092,7 @@ mod tests {
             root: Node::ROOT,
             cwd: Node::ROOT,
             umask: 0o022,
-            mnt_ns: Rc::new(MntNs {
-                id: INIT_MNT_NS,
-                owner: crate::cred::UserNs::init(),
-                anon: false,
-            }),
+            mnt_ns: MntNs::standalone(INIT_MNT_NS, crate::cred::UserNs::init()),
         }));
         let mut cpus = Vec::with_capacity(specs.len());
         let mut tasks = Vec::with_capacity(specs.len());

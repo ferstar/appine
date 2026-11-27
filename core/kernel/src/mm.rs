@@ -5557,6 +5557,7 @@ impl Mm {
             {
                 self.unmapped_fills
                     .push((fill.clone(), vma.offset(), vma.offset() + len));
+                UNMAPPED_FILLS.fetch_add(1, Ordering::Relaxed);
             }
             self.graveyard.push(vma.region);
             self.dirty = true;
@@ -7376,8 +7377,33 @@ impl Default for Mm {
     }
 }
 
+/// Number of queued `Mm::unmapped_fills` entries across all live address spaces; lets
+/// `post_syscall_sweeps` skip borrowing `Mm` when no removed FUSE mapping awaits writeback.
+static UNMAPPED_FILLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether any address space currently has removed FUSE mappings awaiting writeback.
+#[inline]
+pub(crate) fn has_unmapped_fills() -> bool {
+    UNMAPPED_FILLS.load(Ordering::Relaxed) != 0
+}
+
+impl Mm {
+    /// Drains any removed FUSE mappings queued on this address space for end-of-syscall writeback.
+    pub(crate) fn take_unmapped_fills(&mut self) -> Vec<(Rc<Fill>, u64, u64)> {
+        if self.unmapped_fills.is_empty() {
+            return Vec::new();
+        }
+        let ranges = std::mem::take(&mut self.unmapped_fills);
+        UNMAPPED_FILLS.fetch_sub(ranges.len(), Ordering::Relaxed);
+        ranges
+    }
+}
+
 impl Drop for Mm {
     fn drop(&mut self) {
+        if !self.unmapped_fills.is_empty() {
+            UNMAPPED_FILLS.fetch_sub(self.unmapped_fills.len(), Ordering::Relaxed);
+        }
         if let Some(group) = self.code_group.take() {
             let remaining = group.members.get() - 1;
             group.members.set(remaining);

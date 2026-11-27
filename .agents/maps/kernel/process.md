@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: bypass `shared_maps` read lock for `FUTEX_PRIVATE_FLAG` and add `getpid`/`gettid`/`getuid`/`geteuid`/`getgid`/`getegid` to `syscall::fast` with `uid_map`/`gid_map` epoch invalidation)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: cache-line align `TaskSync`, keep non-sleeping fast syscalls in guest mode with `SeqCst` fence + `Relaxed` generation loads, and gate `post_syscall_sweeps` with dirty flags)
 
 ## Responsibilities
 
@@ -41,8 +41,10 @@ and `kernel/oom`.
   wake `event`/`sleeping`, `pid_ns_children`/`NsProxy`, `TaskRes` (procfs snapshot of mm/fds/fs),
   and thread-private `TaskState` (mm, fds, `FsContext`, group, `sem_undo`, altstack,
   `clear_child_tid`, vfork completion, restart block, `fast_sleep`).
-- `TaskSync` — lock-free `in_guest` flag, engine `Kicker` (`kernel/mmu` shootdowns), and atomic
-  `KernelEntry` (last syscall nr or -1, x0–x5, sp, pc; read by `/proc/<pid>/syscall`).
+- `TaskSync` — cache-line aligned (`#[repr(align(64))]`) lock-free `in_guest` flag, engine `Kicker`
+  (`kernel/mmu` shootdowns), and atomic `KernelEntry` (last syscall nr or -1, x0–x5, sp, pc; read
+  by `/proc/<pid>/syscall`, populated on sleeping fast syscalls and BKL-path exits while skipped on
+  non-sleeping fast syscalls since running threads report `"running\n"`).
 - `ThreadGroup` — one process: tgid, ppid, `parent_thread` (the creating thread, Linux
   `real_parent`), pgid, sid, live `threads` (leader first while alive), `children` (zombies
   included), `exiting` / `leader_status` / `zombie` / `leader_exit`, `exit_signal`, own and
@@ -142,15 +144,24 @@ and `kernel/oom`.
 
 ### Run loop
 
-- Each pass: resume periodic checks, mark in-guest (clearing `KernelEntry`, recorded on every exit
-  before the fast path), handle generation changes (re-attach DBT on code-space change, flush TLB,
+- Each pass when entering from outside guest mode: resume periodic checks, clear `KernelEntry`,
+  mark `in_guest` (`Relaxed`) followed by a `SeqCst` fence and `Relaxed` generation loads (pairing
+  with `Mm::sync`/`Mm::shootdown`'s `SeqCst` bump-then-read; an `Acquire` fence precedes TLB flush
+  on TLB change), handle generation changes (re-attach DBT on code-space change, flush TLB,
   invalidate translations), then execute via `Cpu::step` (single-step), `engine/dbt` (attached, no
   HW breakpoints), or `Cpu::run` (`engine`).
-- `Svc` tries the fast path unlocked first; all other exits record `Entry` for `kernel/bug`, take
-  the BKL, and dispatch: killed exits, code invalidations, syscalls, kicks (signals), undef
-  (`SIGILL`), breakpoints/watchpoints (`SIGTRAP`), alignment (`SIGBUS`), host faults/panics
-  (`kernel/bug` kills process), and page faults (`kernel/mm`: CoW break, already present, fault in,
-  FUSE fill, past-EOF `SIGBUS`/remap, stack growth, else `SIGSEGV`).
+- `Svc` tries the fast path unlocked first (`FastOutcome::{InGuest, LeftGuest, Fallback}`):
+  non-sleeping fast syscalls return `InGuest` and stay in guest mode directly into the next
+  iteration (skipping `KernelEntry`, `in_guest` toggle, `resume_checks` and full generation reload;
+  TLB/space changes kick at engine entry via `cpu->pending`, and Tier 1 polls `generations.code`
+  for un-kicked code-only invalidations). Sleeping fast syscalls record `KernelEntry` before
+  clearing `in_guest` and setting `sleeping`, and sleeping/yielding calls return `LeftGuest` to
+  re-enter through the full loop header. All other exits and fallbacks record `KernelEntry` (if not
+  already recorded), clear `in_guest` (`Release`), record `Entry` for `kernel/bug`, take the BKL,
+  and dispatch: killed exits, code invalidations, syscalls, kicks (signals), undef (`SIGILL`),
+  breakpoints/watchpoints (`SIGTRAP`), alignment (`SIGBUS`), host faults/panics (`kernel/bug` kills
+  process), and page faults (`kernel/mm`: CoW break, already present, fault in, FUSE fill, past-EOF
+  `SIGBUS`/remap, stack growth, else `SIGSEGV`).
 - The result (`Continue`, `Exec`, `Exit`) decides the next step; `Exec` re-attaches the translator
   for the new address space. After each BKL-path handling the fast-path record is rebuilt if the
   epoch moved. On `Exit`, still under the BKL, the last thread using its fd table flushes the FUSE
@@ -170,17 +181,22 @@ and `kernel/oom`.
 - From the token until the sweeps the thread records the syscall in `Task::syscall`
   (`InSyscall`, numbered by the global `SYSCALLS` count, cleared on every way out), so the overlay
   sweep can tell which syscalls began before a removal.
-- After the handler: released FUSE files are flushed, deferred AF_UNIX cycle collection runs
-  (`unix::collect_deferred`), removed FUSE mappings complete writeback and the node cache may be swept
-  (`kernel/fuse`'s `sweep`), detached mounts whose last use the syscall let go of are collected,
-  dead IPC namespaces are reaped (`Kernel::collect_ipc`), removed overlay nodes are swept
-  (`kernel/overlay`), and pending cgroup2 file changes checked
-  (`cgroup::notify_changes`, also run at thread exit, freezer stops and by the timer thread); then
-  results are translated out (invisible pids become 0), edge-triggered readiness is re-armed after
-  reads, x0 is set, `Mm::sync` runs, then the exit stop and signal delivery. A successful `execve`
-  or `execveat` runs the sweeps, drops `InSyscall`, and runs `Mm::sync` on the new address space
-  before `exec_done`. `exit`, `exit_group` and `rt_sigreturn` return before the sweeps and
-  `Mm::sync`.
+- After the handler, `post_syscall_sweeps` checks lightweight thread-local (`tl_sweep`), per-`Vfs`/
+  `Store` (`Vfs::sweep_bits`, `Store::sweep_bits`), per-`Kernel` (`ipc_dead`, `cgroups.pending`),
+  and global (`fuse::SWEEP`, `mm::UNMAPPED_FILLS`) dirty flags so ordinary syscalls with nothing
+  pending skip all seven sweeps in one branch without cloning `Vfs` or borrowing `RefCell`s; when
+  dirty, only the pending sweeps run in order: released FUSE files are flushed, deferred AF_UNIX
+  cycle collection runs (`unix::collect_deferred`), removed FUSE mappings complete writeback and
+  the node cache may be swept (`kernel/fuse`'s `sweep`), detached mounts whose last use the syscall
+  let go of (skipped on `vfs::released` while no detached mounts exist) and unlinked tmpfs /
+  pending store releases / closed sparse memfd sizes are collected, dead IPC namespaces are reaped
+  (`Kernel::collect_ipc`), removed overlay nodes are swept (`kernel/overlay`), and pending cgroup2
+  file changes checked (`cgroup::notify_changes`, also run at thread exit, freezer stops and by the
+  timer thread); then results are translated out (invisible pids become 0), edge-triggered
+  readiness is re-armed after reads, x0 is set, `Mm::sync` runs, then the exit stop and signal
+  delivery. A successful `execve` or `execveat` runs the sweeps, drops `InSyscall`, and runs
+  `Mm::sync` on the new address space before `exec_done`. `exit`, `exit_group` and `rt_sigreturn`
+  return before the sweeps and `Mm::sync`.
 - A guest page fault on a FUSE mapping's page not yet read reads it with the BKL released before
   re-executing (`kernel/mm`'s fault order).
 

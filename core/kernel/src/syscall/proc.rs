@@ -2255,11 +2255,7 @@ mod tests {
                 root: Node::ROOT,
                 cwd: Node::ROOT,
                 umask: 0o022,
-                mnt_ns: Rc::new(MntNs {
-                    id: INIT_MNT_NS,
-                    owner: owner.clone(),
-                    anon: false,
-                }),
+                mnt_ns: MntNs::standalone(INIT_MNT_NS, owner.clone()),
             }));
             // Hold extra references to fds and fs so unshare would clone them if it mutated early
             let _fds_share = fds.clone();

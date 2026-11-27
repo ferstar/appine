@@ -678,25 +678,114 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     signal::deliver(cx, cpu, true)
 }
 
+/// Thread-local dirty bits for [`post_syscall_sweeps`] producers that run inside `Drop` without
+/// `&Kernel` or `&Vfs`.
+pub(crate) mod tl_sweep {
+    pub const FUSE_RELEASED: u32 = 1 << 0;
+    pub const UNIX_DEFERRED: u32 = 1 << 1;
+    pub const VFS_RELEASED: u32 = 1 << 2;
+}
+
+thread_local! {
+    #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
+    static TL_SWEEPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks thread-local sweep bit `bit` (`tl_sweep::*`) as pending for the next
+/// [`post_syscall_sweeps`].
+#[inline]
+pub(crate) fn note_tl_sweep(bit: u32) {
+    TL_SWEEPS.set(TL_SWEEPS.get() | bit);
+}
+
+/// Clears thread-local sweep bit `bit` (`tl_sweep::*`).
+#[inline]
+pub(crate) fn clear_tl_sweep(bit: u32) {
+    TL_SWEEPS.set(TL_SWEEPS.get() & !bit);
+}
+
+/// Clears thread-local sweep bit `bit` (`tl_sweep::*`) and returns whether it was set.
+#[inline]
+pub(crate) fn take_tl_sweep(bit: u32) -> bool {
+    let cur = TL_SWEEPS.get();
+    if cur & bit != 0 {
+        TL_SWEEPS.set(cur & !bit);
+        true
+    } else {
+        false
+    }
+}
+
+#[inline]
+fn tl_sweeps() -> u32 {
+    TL_SWEEPS.get()
+}
+
 /// Runs the end-of-syscall cleanup sweeps after a handler completes (including successful
 /// `execve`/`execveat`), before `InSyscall` is dropped and before any ptrace or signal stops.
+///
+/// Ordinary syscalls with no pending sweep work skip all seven subsystems in one branch without
+/// cloning `Rc<Vfs>` or borrowing any `RefCell`.
+#[inline]
 fn post_syscall_sweeps(cx: &mut Cx<'_>) {
-    // Releases of FUSE files dropped while their connection was borrowed
-    crate::vfs::fuse::flush_released();
-    // AF_UNIX cycles left by drops that had no &mut Kernel (UnixSocket::drop, AIO polls, accept4)
-    crate::unix::collect_deferred(cx.k());
+    let tl = tl_sweeps();
+    let vfs_dirty =
+        cx.t.vfs
+            .as_deref()
+            .is_some_and(crate::vfs::Vfs::has_sweep_work);
+    let k = cx.kr();
+    let pending = tl != 0
+        || vfs_dirty
+        || k.ipc_dead()
+        || k.cgroups.pending.get()
+        || crate::vfs::fuse::SWEEP.load(Ordering::Relaxed)
+        || crate::mm::has_unmapped_fills();
+    if !pending {
+        return;
+    }
+    run_post_syscall_sweeps(cx);
+}
+
+#[cold]
+#[inline(never)]
+fn run_post_syscall_sweeps(cx: &mut Cx<'_>) {
+    // Releases of FUSE files dropped while their connection was borrowed (may set fuse::SWEEP)
+    if tl_sweeps() & tl_sweep::FUSE_RELEASED != 0 {
+        crate::vfs::fuse::flush_released();
+    }
+    // AF_UNIX cycles left by drops that had no &mut Kernel (UnixSocket::drop, AIO polls, accept4;
+    // dropping closed files may trigger VFS_RELEASED or ipc_dead below)
+    if tl_sweeps() & tl_sweep::UNIX_DEFERRED != 0 {
+        crate::unix::collect_deferred(cx.k());
+    }
     // Between syscalls nothing holds a FUSE node but what in_use finds
-    fuse::sweep(cx);
-    // A detached mount whose last open file or directory this syscall let go of
-    if let Ok(vfs) = cx.vfs() {
+    if crate::mm::has_unmapped_fills() || crate::vfs::fuse::SWEEP.load(Ordering::Relaxed) {
+        fuse::sweep(cx);
+    }
+    // A detached mount whose last open file or directory this syscall let go of, or unlinked
+    // tmpfs / pending store releases / linkable O_TMPFILE / closed memfd sizes
+    if let Ok(vfs) = cx.vfs()
+        && (tl_sweeps() & tl_sweep::VFS_RELEASED != 0 || vfs.has_mount_or_tmpfs_sweep())
+    {
         mount::collect_released(cx.kr(), &vfs);
     }
     // IPC namespaces whose last nsfs file, pinned sysctl or mount went away
-    cx.k().collect_ipc();
+    if cx.kr().ipc_dead() {
+        cx.k().collect_ipc();
+    }
     // Removed overlay nodes nothing uses any more
-    mount::sweep_overlays(cx);
+    if cx
+        .t
+        .vfs
+        .as_deref()
+        .is_some_and(crate::vfs::Vfs::has_overlay_sweep)
+    {
+        mount::sweep_overlays(cx);
+    }
     // Changes to watched cgroup files (crate::cgroup::notify_changes)
-    crate::cgroup::notify_changes(cx.k());
+    if cx.kr().cgroups.pending.get() {
+        crate::cgroup::notify_changes(cx.k());
+    }
 }
 
 /// The thread is inside BKL system call `nr` while this lives ([`crate::task::Task::syscall`]),
@@ -874,5 +963,147 @@ pub(crate) fn retry_user_pages<T>(
 
 /// Writes an integer type to guest memory.
 fn put<const N: usize>(cx: &Cx<'_>, addr: u64, bytes: [u8; N]) -> Result<(), Errno> {
-    cx.write_user(UserSlice::new(addr, N), &bytes)
+    cx.write_user(UserSlice::new(addr, bytes.len()), &bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+    use crate::cred::UserNs;
+    use crate::kernel::{Kernel, Shared};
+    use crate::process::Tier;
+    use crate::vfs::Vfs;
+
+    fn has_local_sweeps(cx: &Cx<'_>) -> bool {
+        let tl = tl_sweeps();
+        let vfs_dirty =
+            cx.t.vfs
+                .as_deref()
+                .is_some_and(crate::vfs::Vfs::has_sweep_work);
+        let k = cx.kr();
+        tl != 0 || vfs_dirty || k.ipc_dead() || k.cgroups.pending.get()
+    }
+
+    fn dispatch_nr(cx: &mut Cx<'_>, cpu: &mut appine_engine::Cpu, nr: u64) -> u64 {
+        let s = cpu.state_mut();
+        s.x[..6].fill(0);
+        s.x[8] = nr;
+        let _ = dispatch(cx, cpu);
+        cpu.state().x[0]
+    }
+
+    #[test]
+    fn post_syscall_sweeps_stays_clean_and_fires_for_each_producer() {
+        let dir = std::env::temp_dir().join(format!(
+            "appine-sweep-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let s = crate::vfs::store::Store::create(&dir).unwrap();
+            let dev = s
+                .mkdir(crate::vfs::store::ROOT, b"dev", 0o755, 0, 0)
+                .unwrap();
+            s.mkdir(dev, b"shm", 0o1777, 0, 0).unwrap();
+        }
+        let vfs = Rc::new(Vfs::open(&dir).unwrap());
+
+        let mut kernel = Kernel::new(Tier::Interpreter);
+        kernel.vfs = Some(vfs.clone());
+        let (proc, _, mut cpu) = crate::pseudo::tests::add_task(&mut kernel, 20, 0, true, b"");
+        kernel.tasks[&proc.pid].state.borrow_mut().vfs = Some(vfs.clone());
+        let shared = Arc::new(Shared::new(kernel));
+        {
+            let k = shared.lock();
+            let task = k.tasks[&proc.pid].clone();
+            let mut state = task.state.borrow_mut();
+            let mut cx = Cx::new(&shared, k, &task, &mut state);
+
+            // Clear any thread-local state left by earlier tests on this worker thread.
+            post_syscall_sweeps(&mut cx);
+            assert!(!has_local_sweeps(&cx));
+
+            // Ordinary BKL syscalls (getppid, umask) leave all per-kernel/TLS sweep flags clean.
+            let expected_ppid = cx.t.group.borrow().ppid as u64;
+            assert_eq!(dispatch_nr(&mut cx, &mut cpu, 173), expected_ppid);
+            assert!(!has_local_sweeps(&cx));
+
+            // 1. FUSE deferred handle release bit.
+            note_tl_sweep(tl_sweep::FUSE_RELEASED);
+            assert_ne!(tl_sweeps() & tl_sweep::FUSE_RELEASED, 0);
+            dispatch_nr(&mut cx, &mut cpu, 173);
+            assert_eq!(tl_sweeps() & tl_sweep::FUSE_RELEASED, 0);
+
+            // 2. AF_UNIX deferred GC flag.
+            crate::unix::defer_collect();
+            assert_ne!(tl_sweeps() & tl_sweep::UNIX_DEFERRED, 0);
+            dispatch_nr(&mut cx, &mut cpu, 173);
+            assert_eq!(tl_sweeps() & tl_sweep::UNIX_DEFERRED, 0);
+
+            // 3. FUSE node sweep flag.
+            crate::vfs::fuse::SWEEP.store(true, Ordering::Relaxed);
+            dispatch_nr(&mut cx, &mut cpu, 173);
+            assert!(!crate::vfs::fuse::SWEEP.load(Ordering::Relaxed));
+
+            // 4. Dead mount namespace (MntNs::drop sets VFS_DEAD_MNT_NS).
+            let ns = vfs.anon_ns(UserNs::init());
+            assert!(!vfs.has_dead_ns());
+            drop(ns);
+            assert!(vfs.has_dead_ns());
+            assert!(vfs.has_sweep_work());
+            dispatch_nr(&mut cx, &mut cpu, 173);
+            assert!(!vfs.has_dead_ns());
+            assert!(!vfs.has_sweep_work());
+
+            // 5. Deferred detached-mount collection (Vfs::defer_collect).
+            vfs.defer_collect();
+            assert!(vfs.has_sweep_work());
+            dispatch_nr(&mut cx, &mut cpu, 173);
+            assert!(!vfs.has_sweep_work());
+
+            // 6. Closed sparse memfd size eviction.
+            vfs.set_memfd_size(0xdead_beef, 1 << 40);
+            assert!(vfs.has_sweep_work());
+            dispatch_nr(&mut cx, &mut cpu, 173);
+            assert_eq!(vfs.memfd_size(0xdead_beef), None);
+            assert!(!vfs.has_sweep_work());
+
+            // 7. Unlinked tmpfs file eviction clears VFS_UNLINKED_TMPFS.
+            let tmp_dev = vfs.mount(crate::vfs::SHM_MOUNT).unwrap().dev;
+            let dummy = appine_hal::memfd(c"sweep-tmpfs").unwrap();
+            vfs.tmpfs_unlinked(tmp_dev, 0xfeed_face, 1, dummy);
+            assert!(vfs.has_unlinked_tmpfs());
+            assert!(vfs.has_sweep_work());
+            dispatch_nr(&mut cx, &mut cpu, 173);
+            assert!(!vfs.has_unlinked_tmpfs());
+            assert!(!vfs.has_sweep_work());
+
+            // 8. Dead IPC namespace collection.
+            let ipc = cx.k().new_ipc_ns(UserNs::init(), (0, 0));
+            let ipc_id = ipc.id;
+            assert!(cx.kr().ipcs.contains_key(&ipc_id));
+            assert!(!cx.kr().ipc_dead());
+            drop(ipc);
+            assert!(cx.kr().ipc_dead());
+            dispatch_nr(&mut cx, &mut cpu, 173);
+            assert!(!cx.kr().ipc_dead());
+            assert!(!cx.kr().ipcs.contains_key(&ipc_id));
+
+            // 9. Pending cgroup notification.
+            cx.kr().cgroups.pending.set(true);
+            dispatch_nr(&mut cx, &mut cpu, 173);
+            assert!(!cx.kr().cgroups.pending.get());
+
+            assert!(!has_local_sweeps(&cx));
+        }
+        drop(cpu);
+        drop(shared);
+        drop(vfs);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

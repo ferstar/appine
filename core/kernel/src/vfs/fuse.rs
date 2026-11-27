@@ -2977,6 +2977,7 @@ impl Drop for Handle {
         };
         if !r.send() {
             RELEASED.with(|q| q.borrow_mut().0.push(r));
+            crate::syscall::note_tl_sweep(crate::syscall::tl_sweep::FUSE_RELEASED);
         }
     }
 }
@@ -3035,9 +3036,11 @@ thread_local! {
 /// thread exit, with the BKL held and no connection borrowed.
 pub(crate) fn flush_released() {
     let queued = RELEASED.with(|q| std::mem::take(&mut q.borrow_mut().0));
+    crate::syscall::clear_tl_sweep(crate::syscall::tl_sweep::FUSE_RELEASED);
     for r in queued {
         if !r.send() {
             RELEASED.with(|q| q.borrow_mut().0.push(r));
+            crate::syscall::note_tl_sweep(crate::syscall::tl_sweep::FUSE_RELEASED);
         }
     }
 }

@@ -268,7 +268,7 @@ pub(crate) struct Cgroups {
     /// on the next relevant change if the last observer went away.
     observed: HashMap<(u64, &'static [u8]), Observed>,
     /// At least one observed file needs checking.
-    pending: Cell<bool>,
+    pub(crate) pending: Cell<bool>,
 }
 
 /// A notifying cgroup file being watched: what it showed at the last mutation, whether any
@@ -1954,11 +1954,7 @@ mod tests {
                 root: Node::ROOT,
                 cwd: Node::ROOT,
                 umask: 0o022,
-                mnt_ns: Rc::new(MntNs {
-                    id: INIT_MNT_NS,
-                    owner: crate::cred::UserNs::init(),
-                    anon: false,
-                }),
+                mnt_ns: MntNs::standalone(INIT_MNT_NS, crate::cred::UserNs::init()),
             })),
             group: group.clone(),
             vfs: None,

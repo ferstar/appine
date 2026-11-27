@@ -67,6 +67,32 @@ use crate::task::{Task, TaskState};
 use crate::vfs::store::{Ino, Stat};
 use crate::vfs::{Cached, Node, ROOT_MOUNT};
 
+/// Outcome of attempting a syscall without the BKL ([`Fast::syscall`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FastOutcome {
+    /// Completed without leaving guest mode (`TaskSync::in_guest` remained `true` throughout).
+    InGuest,
+    /// Completed after leaving guest mode (`sleep` or `sched_yield` cleared `TaskSync::in_guest`).
+    LeftGuest,
+    /// Not handled; caller falls back to the BKL path.
+    Fallback,
+}
+
+enum FastDispatch {
+    DoneInGuest(SysResult),
+    DoneLeftGuest(SysResult),
+    Fallback,
+}
+
+impl From<Option<SysResult>> for FastDispatch {
+    fn from(r: Option<SysResult>) -> Self {
+        match r {
+            Some(r) => Self::DoneInGuest(r),
+            None => Self::Fallback,
+        }
+    }
+}
+
 /// The state a thread records for syscalls without the BKL.
 pub(crate) struct Fast {
     /// [`Shared::fast_epoch`] when recorded.
@@ -171,10 +197,11 @@ impl Fast {
         }
     }
 
-    /// Runs the syscall `cpu` stopped at without the BKL. Returns true when done (the result
-    /// written to x0); on false the caller handles it normally with the BKL held, and nothing but
-    /// [`TaskState::fast_sleep`] has been changed here.
-    pub(crate) fn syscall(&self, shared: &Shared, task: &Task, cpu: &mut Cpu) -> bool {
+    /// Runs the syscall `cpu` stopped at without the BKL. Returns [`FastOutcome::InGuest`] or
+    /// [`FastOutcome::LeftGuest`] when done (the result written to x0); on
+    /// [`FastOutcome::Fallback`] the caller handles it normally with the BKL held, and nothing but
+    /// [`TaskState::fast_sleep`] (and `TaskSync::in_guest`/`entry` if it slept) has been changed.
+    pub(crate) fn syscall(&self, shared: &Shared, task: &Task, cpu: &mut Cpu) -> FastOutcome {
         // With an ic ivau not yet invalidated, the thread must first enter the kernel to invalidate
         // it (task::handle); under PTRACE_SYSCALL it must stop at entry and exit, and when
         // single-stepping the finished syscall must be reported (crate::ptrace); with seccomp it
@@ -185,17 +212,19 @@ impl Fast {
             || task.stepping.load(Ordering::Relaxed)
             || !self.seccomp_allows(task, cpu)
         {
-            return false;
+            return FastOutcome::Fallback;
         }
         crate::bug::trap(crate::bug::Trap::Fast, self.tid);
-        let Some(r) = self.dispatch(shared, task, cpu) else {
-            return false;
+        let (r, outcome) = match self.dispatch(shared, task, cpu) {
+            FastDispatch::DoneInGuest(r) => (r, FastOutcome::InGuest),
+            FastDispatch::DoneLeftGuest(r) => (r, FastOutcome::LeftGuest),
+            FastDispatch::Fallback => return FastOutcome::Fallback,
         };
         cpu.state_mut().x[0] = match r {
             Ok(v) => v,
             Err(e) => e.to_syscall_return(),
         };
-        true
+        outcome
     }
 
     /// What may run without checking under seccomp: the vDSO stubs' clock reads
@@ -210,7 +239,7 @@ impl Fast {
             || crate::seccomp::always_allowed(task, s.x[8])
     }
 
-    fn dispatch(&self, shared: &Shared, task: &Task, cpu: &Cpu) -> Option<SysResult> {
+    fn dispatch(&self, shared: &Shared, task: &Task, cpu: &Cpu) -> FastDispatch {
         let s = cpu.state();
         let a = [s.x[0], s.x[1], s.x[2], s.x[3], s.x[4], s.x[5]];
         match s.x[8] {
@@ -222,17 +251,17 @@ impl Fast {
                 let clock = a[0] as i32;
                 clock_nanosleep(task, cpu, (clock, self.offset(clock)), a[1] as u32, a[2])
             }
-            124 => Some(sched_yield(task)),
-            113 => self.clock_gettime(cpu, a[0] as i32, a[1]),
-            114 => clock_getres(cpu, a[0] as i32, a[1]),
-            169 => gettimeofday(cpu, a[0], a[1]),
+            124 => FastDispatch::DoneLeftGuest(sched_yield(task)),
+            113 => self.clock_gettime(cpu, a[0] as i32, a[1]).into(),
+            114 => clock_getres(cpu, a[0] as i32, a[1]).into(),
+            169 => gettimeofday(cpu, a[0], a[1]).into(),
             // getpid, getuid, geteuid, getgid, getegid, gettid (getppid = 173 stays on the BKL
             // path because reparenting on parent exit does not bump fast_epoch)
             172 | 174..=178 => {
                 if shared.fast_epoch() != self.epoch {
-                    return None;
+                    return FastDispatch::Fallback;
                 }
-                Some(Ok(match s.x[8] {
+                FastDispatch::DoneInGuest(Ok(match s.x[8] {
                     172 => self.ns_tgid as u64,
                     174 => u64::from(self.uid),
                     175 => u64::from(self.euid),
@@ -242,16 +271,19 @@ impl Fast {
                 }))
             }
             79 | 291 => {
-                let p = self.paths.as_ref()?;
+                let Some(p) = self.paths.as_ref() else {
+                    return FastDispatch::Fallback;
+                };
                 if shared.fast_epoch() != self.epoch {
-                    return None;
+                    return FastDispatch::Fallback;
                 }
                 match s.x[8] {
                     79 => p.newfstatat(cpu, a[0] as i32, a[1], a[2], a[3] as u32),
                     _ => p.statx(cpu, a[0] as i32, a[1], a[2] as u32, a[3] as u32, a[4]),
                 }
+                .into()
             }
-            _ => None,
+            _ => FastDispatch::Fallback,
         }
     }
 
@@ -353,26 +385,29 @@ fn futex(
     (task, cpu, mm): (&Task, &Cpu, u64),
     a: &[u64; 6],
     monotonic: i64,
-) -> Option<SysResult> {
+) -> FastDispatch {
     let (uaddr, op, val, timeout, val3) = (a[0], a[1] as u32, a[2] as u32, a[3], a[5] as u32);
     let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
     // FUTEX_CLOCK_REALTIME with another command is ENOSYS, which the BKL path answers
     if op & FUTEX_CLOCK_REALTIME != 0 && cmd != FUTEX_WAIT_BITSET {
-        return None;
+        return FastDispatch::Fallback;
     }
     let bitset = match cmd {
         FUTEX_WAIT | FUTEX_WAKE => u32::MAX,
         FUTEX_WAIT_BITSET | FUTEX_WAKE_BITSET if val3 != 0 => val3,
-        _ => return None,
+        _ => return FastDispatch::Fallback,
     };
     // The key of a `FUTEX_PRIVATE_FLAG` operation or private memory is the address space and the
     // address (Mm::futex_key; the caller left non-private operations on shared mappings to the BKL
     // path). Borrowed copy-on-write pages and read-only mappings are rare places for a futex: they
     // go to the BKL path too, which reads them
     if !uaddr.is_multiple_of(4) {
-        return None;
+        return FastDispatch::Fallback;
     }
-    let host = cpu.translate(uaddr, prot::WRITE)?.as_ptr().cast::<u32>();
+    let Some(host) = cpu.translate(uaddr, prot::WRITE) else {
+        return FastDispatch::Fallback;
+    };
+    let host = host.as_ptr().cast::<u32>();
     let key = Key::Private {
         mm,
         addr: uaddr,
@@ -383,12 +418,14 @@ fn futex(
             .futexes()
             .wake(key, super::misc::wake_count(val), bitset);
         crate::kernel::flush_signals();
-        return Some(Ok(woken as u64));
+        return FastDispatch::DoneInGuest(Ok(woken as u64));
     }
     let deadline = match timeout {
         0 => None,
         addr => {
-            let t = read_timespec(cpu, addr)?;
+            let Some(t) = read_timespec(cpu, addr) else {
+                return FastDispatch::Fallback;
+            };
             Some(if cmd == FUTEX_WAIT {
                 Expiry::after(t)
             } else {
@@ -398,7 +435,10 @@ fn futex(
                     (CLOCK_MONOTONIC, monotonic)
                 };
                 let t = super::misc::to_host_clock(offset, t);
-                Expiry::new(clock, t, true).ok()?
+                let Ok(exp) = Expiry::new(clock, t, true) else {
+                    return FastDispatch::Fallback;
+                };
+                exp
             })
         }
     };
@@ -408,15 +448,15 @@ fn futex(
         // as running guest code, so the page is not released meanwhile
         let now = unsafe { AtomicU32::from_ptr(host) }.load(Ordering::SeqCst);
         if now != val {
-            return Some(Err(Errno::EAGAIN));
+            return FastDispatch::DoneInGuest(Err(Errno::EAGAIN));
         }
         futexes.enqueue(key, bitset, task.event.clone())
     };
     let waiting = Enqueued::new(shared, [id]);
     crate::bug::trap(crate::bug::Trap::FutexWait, task.tgid);
-    let woke = sleep(task, deadline);
+    let woke = sleep(task, cpu, deadline);
     match waiting.leave() {
-        Some(_) => Some(Ok(0)),
+        Some(_) => FastDispatch::DoneLeftGuest(Ok(0)),
         // Most likely a signal arrived: the BKL path re-checks the value, enqueues again and
         // handles the signal, waiting until the deadline computed here without reading the
         // timeout again ([`TaskState::fast_sleep`])
@@ -424,15 +464,18 @@ fn futex(
             if deadline.is_some() {
                 task.state.borrow_mut().fast_sleep = deadline;
             }
-            None
+            FastDispatch::Fallback
         }
-        None => Some(Err(Errno::ETIMEDOUT)),
+        None => FastDispatch::DoneLeftGuest(Err(Errno::ETIMEDOUT)),
     }
 }
 
-fn nanosleep(task: &Task, cpu: &Cpu, req: u64) -> Option<SysResult> {
-    let deadline = Expiry::after(read_timespec(cpu, req)?);
-    sleep_until(task, deadline)
+fn nanosleep(task: &Task, cpu: &Cpu, req: u64) -> FastDispatch {
+    let Some(t) = read_timespec(cpu, req) else {
+        return FastDispatch::Fallback;
+    };
+    let deadline = Expiry::after(t);
+    sleep_until(task, cpu, deadline)
 }
 
 /// The wall clock, the monotonic clock and the since-boot clock of `misc::clock_nanosleep`.
@@ -443,19 +486,26 @@ fn clock_nanosleep(
     (clock, offset): (i32, i64),
     flags: u32,
     req: u64,
-) -> Option<SysResult> {
+) -> FastDispatch {
     if !matches!(clock, CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME)
         || flags & !TIMER_ABSTIME != 0
     {
-        return None;
+        return FastDispatch::Fallback;
     }
-    let t = read_timespec(cpu, req)?;
+    let Some(t) = read_timespec(cpu, req) else {
+        return FastDispatch::Fallback;
+    };
     if flags & TIMER_ABSTIME == 0 {
-        return sleep_until(task, Expiry::new(clock, t, false).ok()?);
+        let Ok(deadline) = Expiry::new(clock, t, false) else {
+            return FastDispatch::Fallback;
+        };
+        return sleep_until(task, cpu, deadline);
     }
     let t = super::misc::to_host_clock(offset, t);
-    let deadline = Expiry::new(clock, t, true).ok()?;
-    sleep_until(task, deadline)
+    let Ok(deadline) = Expiry::new(clock, t, true) else {
+        return FastDispatch::Fallback;
+    };
+    sleep_until(task, cpu, deadline)
 }
 
 /// Sleeps until `deadline`. When woken (most likely by a signal) the BKL path goes on sleeping,
@@ -463,23 +513,26 @@ fn clock_nanosleep(
 /// time again, so a relative sleep does not start over from now, the time remaining when a
 /// signal interrupts comes from it, and memory unmapped meanwhile is never read (Linux's restart
 /// keeps the deadline too).
-fn sleep_until(task: &Task, deadline: Expiry) -> Option<SysResult> {
-    if !sleep(task, Some(deadline)) {
-        return Some(Ok(0));
+fn sleep_until(task: &Task, cpu: &Cpu, deadline: Expiry) -> FastDispatch {
+    if !sleep(task, cpu, Some(deadline)) {
+        return FastDispatch::DoneLeftGuest(Ok(0));
     }
     task.state.borrow_mut().fast_sleep = Some(deadline);
-    None
+    FastDispatch::Fallback
 }
 
 /// Sleeps without the BKL until `deadline` (None sleeps forever), or until the thread's event is
 /// signalled (futex wake, signal, being ended). While sleeping it does not count as running guest
 /// code: a thread that unmaps memory need not wait for it (Mm::sync), and it is marked again on
-/// returning to the run loop. Returns true when the event was signalled (or a host signal
-/// interrupted the wait); a jump of the deadline's clock signals it too ([`crate::itimer::clock_jumped`]),
-/// and the locked path then looks at the deadline again.
-fn sleep(task: &Task, deadline: Option<Expiry>) -> bool {
+/// returning to the run loop. Records [`crate::task::KernelEntry`] before marking `sleeping` so
+/// `/proc/<pid>/syscall` always sees the syscall while the thread is in state `S`. Returns true
+/// when the event was signalled (or a host signal interrupted the wait); a jump of the deadline's
+/// clock signals it too ([`crate::itimer::clock_jumped`]), and the locked path then looks at the
+/// deadline again.
+fn sleep(task: &Task, cpu: &Cpu, deadline: Option<Expiry>) -> bool {
     const POLLIN: i16 = 1;
-    task.sync.in_guest.store(false, Ordering::SeqCst);
+    task.sync.entry.enter(cpu.state(), true);
+    task.sync.in_guest.store(false, Ordering::Release);
     task.sleeping.store(true, Ordering::SeqCst);
     let woke = loop {
         let timeout = match deadline {
@@ -506,7 +559,7 @@ fn sleep(task: &Task, deadline: Option<Expiry>) -> bool {
 /// turn around with it went 230 times slower than natively, and spinners slowed every other
 /// thread's syscalls. It touches no guest memory, so it does not count as running guest code.
 fn sched_yield(task: &Task) -> SysResult {
-    task.sync.in_guest.store(false, Ordering::SeqCst);
+    task.sync.in_guest.store(false, Ordering::Release);
     std::thread::yield_now();
     Ok(0)
 }
@@ -664,7 +717,7 @@ mod tests {
         let s = cpu.state_mut();
         s.x[..6].copy_from_slice(&args);
         s.x[8] = nr;
-        fast.syscall(shared, task, cpu).then(|| cpu.state().x[0])
+        (fast.syscall(shared, task, cpu) != FastOutcome::Fallback).then(|| cpu.state().x[0])
     }
 
     fn run_fast_noargs(
@@ -850,11 +903,7 @@ mod tests {
                 root: Node::ROOT,
                 cwd: Node::ROOT,
                 umask: 0o022,
-                mnt_ns: Rc::new(MntNs {
-                    id: INIT_MNT_NS,
-                    owner: kernel.init_ns.ipc.owner.clone(),
-                    anon: false,
-                }),
+                mnt_ns: MntNs::standalone(INIT_MNT_NS, kernel.init_ns.ipc.owner.clone()),
             })),
             group: group.clone(),
             vfs: None,
@@ -1113,6 +1162,196 @@ mod tests {
             );
             // Other ID syscalls not in the bitmap still fall back.
             assert_eq!(run_fast_noargs(&fast, &shared, &task, &mut cpu, 174), None);
+        }
+        drop(cpu);
+        drop(shared);
+    }
+
+    #[test]
+    fn non_sleeping_fast_syscalls_stay_in_guest_without_kernel_entry() {
+        let mut kernel = Kernel::new(Tier::Interpreter);
+        let (proc, _, mut cpu) = crate::pseudo::tests::add_task(&mut kernel, 20, 0, true, b"");
+        let shared = Arc::new(Shared::new(kernel));
+        {
+            let k = shared.lock();
+            let task = k.tasks[&proc.pid].clone();
+            let mut state = task.state.borrow_mut();
+            let cx = Cx::new(&shared, k, &task, &mut state);
+            let addr = cx
+                .mm_mut()
+                .mmap(
+                    0,
+                    PAGE_SIZE,
+                    prot::READ | prot::WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    None,
+                )
+                .unwrap();
+            cx.mm()
+                .write(crate::uaccess::UserSlice::new(addr, 4), &1u32.to_le_bytes())
+                .unwrap();
+            let fast = Fast::new(&shared, cx.task, cx.t);
+
+            for (nr, args) in [
+                (172u64, [0; 6]),                  // getpid
+                (178, [0; 6]),                     // gettid
+                (113, [1, addr + 16, 0, 0, 0, 0]), // clock_gettime(CLOCK_MONOTONIC)
+                (169, [addr + 32, 0, 0, 0, 0, 0]), // gettimeofday
+                (
+                    98,
+                    [addr, u64::from(FUTEX_WAKE | FUTEX_PRIVATE_FLAG), 1, 0, 0, 0],
+                ),
+                (
+                    98,
+                    [addr, u64::from(FUTEX_WAIT | FUTEX_PRIVATE_FLAG), 0, 0, 0, 0],
+                ), // EAGAIN
+            ] {
+                cx.task.sync.in_guest.store(true, Ordering::SeqCst);
+                let s = cpu.state_mut();
+                s.x[..6].copy_from_slice(&args);
+                s.x[8] = nr;
+                let outcome = fast.syscall(&shared, cx.task, &mut cpu);
+                assert_eq!(
+                    outcome,
+                    FastOutcome::InGuest,
+                    "syscall {nr} must stay in guest"
+                );
+                assert!(
+                    cx.task.sync.in_guest.load(Ordering::Relaxed),
+                    "syscall {nr} must keep in_guest true"
+                );
+                assert_eq!(
+                    cx.task.sync.entry.get(),
+                    None,
+                    "non-sleeping fast syscall {nr} must skip KernelEntry"
+                );
+            }
+        }
+        drop(cpu);
+        drop(shared);
+    }
+
+    #[test]
+    fn sleeping_and_yielding_fast_syscalls_leave_guest_and_record_entry() {
+        let mut kernel = Kernel::new(Tier::Interpreter);
+        let (proc, _, mut cpu) = crate::pseudo::tests::add_task(&mut kernel, 20, 0, true, b"");
+        let shared = Arc::new(Shared::new(kernel));
+        {
+            let k = shared.lock();
+            let task = k.tasks[&proc.pid].clone();
+            let mut state = task.state.borrow_mut();
+            let cx = Cx::new(&shared, k, &task, &mut state);
+            let addr = cx
+                .mm_mut()
+                .mmap(
+                    0,
+                    PAGE_SIZE,
+                    prot::READ | prot::WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    None,
+                )
+                .unwrap();
+            // 1 ns timespec for nanosleep, plus futex word = 0 at addr + 32.
+            let mut ts = [0u8; 16];
+            ts[8..16].copy_from_slice(&1i64.to_le_bytes());
+            cx.mm()
+                .write(crate::uaccess::UserSlice::new(addr, 16), &ts)
+                .unwrap();
+            let fast = Fast::new(&shared, cx.task, cx.t);
+
+            // 1. sched_yield leaves guest mode without populating KernelEntry.
+            cx.task.sync.in_guest.store(true, Ordering::SeqCst);
+            cpu.state_mut().x[8] = 124;
+            assert_eq!(
+                fast.syscall(&shared, cx.task, &mut cpu),
+                FastOutcome::LeftGuest
+            );
+            assert!(!cx.task.sync.in_guest.load(Ordering::Relaxed));
+            assert_eq!(cx.task.sync.entry.get(), None);
+
+            // 2. nanosleep leaves guest mode and records KernelEntry for /proc/<pid>/syscall.
+            cx.task.sync.in_guest.store(true, Ordering::SeqCst);
+            {
+                let s = cpu.state_mut();
+                s.x[..6].copy_from_slice(&[addr, 0, 0, 0, 0, 0]);
+                s.x[8] = 101;
+                s.sp = 0x7000;
+                s.pc = 0x4004;
+            }
+            assert_eq!(
+                fast.syscall(&shared, cx.task, &mut cpu),
+                FastOutcome::LeftGuest
+            );
+            assert!(!cx.task.sync.in_guest.load(Ordering::Relaxed));
+            assert_eq!(
+                cx.task.sync.entry.get(),
+                Some([101, addr, 0, 0, 0, 0, 0, 0x7000, 0x4004])
+            );
+
+            // 3. Blocking futex(WAIT) records KernelEntry before entering state S and wakes via
+            // FUTEX_WAKE returning LeftGuest with x0 == 0.
+            let futex_addr = addr + 32;
+            let mm_id = cx.mm().id;
+            let key = Key::Private {
+                mm: mm_id,
+                addr: futex_addr,
+                shared: false,
+            };
+            let shared_waker = shared.clone();
+            let sync_waker = cx.task.sync.clone();
+            let sleeping_event = cx.task.event.clone();
+            let waker = std::thread::spawn(move || {
+                // Wait until waiter has enqueued and cleared in_guest.
+                while sync_waker.in_guest.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                let entry = sync_waker.entry.get();
+                let woken = loop {
+                    let n = shared_waker.futexes().wake(key, 1, u32::MAX);
+                    crate::kernel::flush_signals();
+                    if n > 0 {
+                        break n;
+                    }
+                    std::thread::yield_now();
+                };
+                (entry, woken, sleeping_event.is_signaled())
+            });
+
+            cx.task.sync.in_guest.store(true, Ordering::SeqCst);
+            {
+                let s = cpu.state_mut();
+                s.x[..6].copy_from_slice(&[
+                    futex_addr,
+                    u64::from(FUTEX_WAIT | FUTEX_PRIVATE_FLAG),
+                    0,
+                    0,
+                    0,
+                    0,
+                ]);
+                s.x[8] = 98;
+                s.sp = 0x8000;
+                s.pc = 0x5004;
+            }
+            let outcome = fast.syscall(&shared, cx.task, &mut cpu);
+            let (seen_entry, woken, _) = waker.join().unwrap();
+            assert_eq!(outcome, FastOutcome::LeftGuest);
+            assert_eq!(cpu.state().x[0], 0);
+            assert_eq!(woken, 1);
+            assert!(!cx.task.sync.in_guest.load(Ordering::Relaxed));
+            assert_eq!(
+                seen_entry,
+                Some([
+                    98,
+                    futex_addr,
+                    u64::from(FUTEX_WAIT | FUTEX_PRIVATE_FLAG),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0x8000,
+                    0x5004,
+                ])
+            );
         }
         drop(cpu);
         drop(shared);

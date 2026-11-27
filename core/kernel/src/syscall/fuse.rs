@@ -2224,8 +2224,8 @@ pub(super) fn prefault(cx: &mut Cx<'_>, nr: u64, a: &[u64; 6]) {
 /// Other threads hold nodes through what [`in_use`] finds, O_PATH pins, open handles and
 /// requests in flight ([`fuse::Fuses::evict`]).
 pub(super) fn sweep(cx: &mut Cx<'_>) {
-    if !cx.mm().unmapped_fills.is_empty() {
-        let ranges = std::mem::take(&mut cx.mm_mut().unmapped_fills);
+    if crate::mm::has_unmapped_fills() && !cx.mm().unmapped_fills.is_empty() {
+        let ranges = cx.mm_mut().take_unmapped_fills();
         let current = cx.task.sync.clone();
         cx.mm_mut().sync(&current);
         flush_ranges(cx, ranges);
@@ -2542,11 +2542,7 @@ mod tests {
             root: Node::ROOT,
             cwd: Node::ROOT,
             umask: 0o022,
-            mnt_ns: Rc::new(MntNs {
-                id: INIT_MNT_NS,
-                owner: user_ns.clone(),
-                anon: false,
-            }),
+            mnt_ns: MntNs::standalone(INIT_MNT_NS, user_ns.clone()),
         }));
         let cpu = unsafe { appine_engine::Cpu::new(mm.borrow().mmu()) };
         let state = task_state(mm, fds, fs, group.clone(), k.vfs.clone());

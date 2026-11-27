@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: allocation-free `unmap_noalloc` superpage-clearing fallback and widened watch invalidation)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: cache-line align `TaskSync`, `SeqCst` fence + `Relaxed` generation loads in the run loop, and `InGuest` fast-syscall `generations.code` polling)
 
 ## Responsibilities
 
@@ -70,8 +70,8 @@ fast path and refill (`engine/dbt`).
 
 ### Consistency and code
 
-- `TaskSync` — per-thread `in_guest` flag plus a `Kicker` (sticky: a CPU not running returns at
-  its next run), shared without the BKL.
+- `TaskSync` — cache-line aligned (`#[repr(align(64))]`) per-thread `in_guest` flag plus a `Kicker`
+  (sticky: a CPU not running returns at its next run), shared without the BKL.
 - `Generations` — clones of the three counters (`tlb`, `code`, `space`) and the code log; the run
   loop reads them without the BKL.
 - `CodeLog` — log of `(generation, start, len)` code changes covering the last 4096 code
@@ -181,11 +181,15 @@ fast path and refill (`engine/dbt`).
   kicks, which nothing else would stop). It does not hold users back: one that enters guest code
   after the wait has passed it (such as a thread waking from a no-BKL fast-path sleep) runs with a
   flushed TLB while the caller still holds the BKL.
-- The run loop sets `in_guest`, then reads the counters (a SeqCst store-then-load pairing with the
-  mutator's bump-then-read). If `space` changed it re-attaches to a new `CodeSpace` (when it had a
-  translator) and looks again on the next pass; if `tlb` changed it flushes its TLB; if `code`
+- The run loop sets `in_guest` (`Relaxed`), issues a `SeqCst` fence, then reads the counters
+  (`Relaxed`, pairing with the mutator's `SeqCst` bump-then-read under fence-atomic coherence). If
+  `space` changed it re-attaches to a new `CodeSpace` (when it had a translator) and looks again on
+  the next pass; if `tlb` changed it issues an `Acquire` fence and flushes its TLB; if `code`
   changed it invalidates Tier 1 blocks for the ranges its space has not yet applied (once per
-  space), or flushes all translations when the log no longer covers them.
+  space), or flushes all translations when the log no longer covers them. Non-sleeping fast
+  syscalls stay `in_guest` across iterations, relying on engine-entry `cpu->pending` kicks for
+  TLB/space changes while polling `generations.code` when Tier 1 is attached so un-kicked
+  code-only invalidations still leave guest mode and run the full generation check.
 - Other threads see code-only changes on their next guest entry. A registered caller can force
   context synchronization with `PRIVATE_EXPEDITED_SYNC_CORE`. Tier 1 handles `ic ivau` inside
   the translator. The log carries mapping changes, Tier 0 invalidations and leftover `ivau` pages.

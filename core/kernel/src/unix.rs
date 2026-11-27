@@ -1217,21 +1217,14 @@ fn line(s: &mut String, flags: u32, ty: i32, state: u32, ino: u64, addr: &[u8]) 
 
 // ---- Garbage collection ----
 
-thread_local! {
-    /// An AF_UNIX socket or packet carrying open files was dropped on a path without `&mut Kernel`
-    /// (`UnixSocket::drop`, AIO poll completion, etc.); collect cycles at the next sweep.
-    #[allow(clippy::missing_const_for_thread_local)]
-    static DEFERRED_COLLECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// Schedules an AF_UNIX cycle collection on the current thread's next sweep (`collect_deferred`).
 pub(crate) fn defer_collect() {
-    DEFERRED_COLLECT.set(true);
+    crate::syscall::note_tl_sweep(crate::syscall::tl_sweep::UNIX_DEFERRED);
 }
 
 /// Takes and clears the deferred cycle-collection flag.
 pub(crate) fn take_deferred() -> bool {
-    DEFERRED_COLLECT.replace(false)
+    crate::syscall::take_tl_sweep(crate::syscall::tl_sweep::UNIX_DEFERRED)
 }
 
 /// Runs [`collect`] if a drop path scheduled one and any in-flight channels remain.

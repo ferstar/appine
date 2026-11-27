@@ -636,6 +636,12 @@ impl Kernel {
         &mut self.ipcs.get_mut(&id).expect("IPC namespace in use").1
     }
 
+    /// Whether any [`crate::nsproxy::IpcNs`] of this kernel dropped since the last [`collect_ipc`].
+    #[inline]
+    pub fn ipc_dead(&self) -> bool {
+        self.ipc_dead.get()
+    }
+
     /// Drops the objects of IPC namespaces with no remaining references (Linux's `free_ipc_ns`;
     /// for shared memory segments still mapped, the mappings keep the memory). Returns immediately
     /// unless an [`crate::nsproxy::IpcNs`] dropped since the last sweep.

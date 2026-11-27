@@ -398,6 +398,10 @@ pub struct Store {
     /// host objects stay on disk until linked once by [`Store::link`] or reaped by
     /// [`Store::release_tmpfile`] after the last guest reference closes.
     linkable_tmpfiles: RefCell<HashSet<Ino>>,
+    /// Bitmask mirroring `!pending_release.is_empty()` (bit 0) and `!linkable_tmpfiles.is_empty()`
+    /// (bit 1) so `post_syscall_sweeps` and `evict_unlinked_tmpfs` skip borrowing either `RefCell`
+    /// when nothing is pending.
+    sweep_bits: Cell<u8>,
     /// Previous linkability at each change in the pending transaction, in operation order.
     tmpfile_undo: RefCell<Vec<(Ino, bool)>>,
 }
@@ -543,6 +547,7 @@ impl Store {
         })?;
         self.commit()?;
         self.pending_release.borrow_mut().clear();
+        self.sweep_bits.set(self.sweep_bits.get() & !1);
         // Even an empty cleanup may follow a prior run's unsynced change of shared object.
         #[cfg(test)]
         on_cleanup(&self, CleanupStep::BeforeSync)?;
@@ -704,6 +709,7 @@ impl Store {
             changed_backings: RefCell::new(Some(HashSet::new())),
             pending_release: RefCell::default(),
             linkable_tmpfiles: RefCell::default(),
+            sweep_bits: Cell::new(0),
             tmpfile_undo: RefCell::default(),
         })
     }
@@ -1956,6 +1962,7 @@ impl Store {
                 self.drop_object(ino, data)?;
             } else {
                 self.pending_release.borrow_mut().insert(ino);
+                self.sweep_bits.set(self.sweep_bits.get() | 1);
             }
         } else if kind == mode::S_IFREG && data.held.is_none() {
             self.touch_object_ctime(data.object);
@@ -3143,10 +3150,17 @@ impl Store {
         }
     }
 
+    /// Whether either `pending_release` or `linkable_tmpfiles` has entries awaiting sweep.
+    #[inline]
+    pub(crate) fn has_sweep_work(&self) -> bool {
+        self.sweep_bits.get() != 0
+    }
+
     /// Whether any deleted held regular files are waiting for their last reference to close so
     /// their shared-object hold can be released.
+    #[inline]
     pub(crate) fn has_pending_release(&self) -> bool {
-        !self.pending_release.borrow().is_empty()
+        self.sweep_bits.get() & 1 != 0
     }
 
     /// Snapshot of deleted held regular files awaiting release.
@@ -3161,6 +3175,12 @@ impl Store {
         } else {
             links.remove(&ino)
         };
+        let bits = self.sweep_bits.get();
+        if links.is_empty() {
+            self.sweep_bits.set(bits & !2);
+        } else {
+            self.sweep_bits.set(bits | 2);
+        }
         self.tmpfile_undo.borrow_mut().push((ino, was_linkable));
     }
 
@@ -3173,16 +3193,23 @@ impl Store {
                 links.remove(&ino);
             }
         }
+        let bits = self.sweep_bits.get();
+        if links.is_empty() {
+            self.sweep_bits.set(bits & !2);
+        } else {
+            self.sweep_bits.set(bits | 2);
+        }
     }
 
     /// Whether `ino` is an unlinked `O_TMPFILE` that can still be linked into a directory.
     pub(crate) fn is_linkable_tmpfile(&self, ino: Ino) -> bool {
-        self.linkable_tmpfiles.borrow().contains(&ino)
+        self.sweep_bits.get() & 2 != 0 && self.linkable_tmpfiles.borrow().contains(&ino)
     }
 
     /// Whether any unlinked linkable `O_TMPFILE` inodes are still tracked.
+    #[inline]
     pub(crate) fn has_linkable_tmpfiles(&self) -> bool {
-        !self.linkable_tmpfiles.borrow().is_empty()
+        self.sweep_bits.get() & 2 != 0
     }
 
     /// Snapshot of unlinked linkable `O_TMPFILE` inodes awaiting either linking or close cleanup.
@@ -3211,7 +3238,14 @@ impl Store {
     /// object, which goes when no other file uses it (otherwise the next boot does this).
     pub fn release(&self, ino: Ino) -> Result<(), Errno> {
         self.writable_maps.borrow_mut().remove(&ino);
-        let was_pending = self.pending_release.borrow_mut().remove(&ino);
+        let (was_pending, empty) = {
+            let mut pending = self.pending_release.borrow_mut();
+            let removed = pending.remove(&ino);
+            (removed, pending.is_empty())
+        };
+        if empty {
+            self.sweep_bits.set(self.sweep_bits.get() & !1);
+        }
         let (st, data) = self.row(ino)?;
         if st.nlink != 0 || st.kind() != mode::S_IFREG || (!data.listed(ino) && !was_pending) {
             return Ok(());

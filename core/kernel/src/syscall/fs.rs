@@ -12790,7 +12790,10 @@ mod tests {
             let regs = &mut cpu.state_mut().x;
             regs[..5].copy_from_slice(&[AT_FDCWD as u64, addr, 0, 0x17ff, buf]);
             regs[8] = 291; // arm64 statx
-            assert!(fast.syscall(cx.shared, cx.task, cpu));
+            assert_eq!(
+                fast.syscall(cx.shared, cx.task, cpu),
+                super::super::fast::FastOutcome::InGuest
+            );
             assert_eq!(cpu.state().x[0], 0);
             assert_eq!(get::<256>(cx, buf).unwrap(), slow);
             let tmp = lookup_at(cx, AT_FDCWD, b"/tmp", true)
@@ -12803,7 +12806,10 @@ mod tests {
                 .set_flags(tmp, inode_flags::NODUMP)
                 .unwrap();
             cpu.state_mut().x[0] = AT_FDCWD as u64;
-            assert!(!fast.syscall(cx.shared, cx.task, cpu));
+            assert_eq!(
+                fast.syscall(cx.shared, cx.task, cpu),
+                super::super::fast::FastOutcome::Fallback
+            );
             statx(cx, AT_FDCWD, addr, 0, 0x17ff, buf).unwrap();
             assert_eq!(
                 u64::from_le_bytes(get(cx, buf + 8).unwrap()),

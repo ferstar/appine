@@ -23,12 +23,16 @@ use crate::kernel::{Cx, Doing, Entry, Kernel, Shared, Tid, request_wake_on, wake
 use crate::mm::{CodeSpace, Generations, Mm};
 use crate::process::{CpuTime, ExitStatus, Signal, ThreadGroup, Tier};
 use crate::signal::{self, AltStack, Pending, SigInfo, code};
-use crate::syscall::fast::Fast;
+use crate::syscall::fast::{Fast, FastOutcome};
 use crate::syscall::{self, Flow};
 use crate::uaccess::UserSlice;
 use crate::vfs::{Node, Vfs};
 
 /// State shared without locks between the run loop and the rest of the kernel.
+///
+/// Cache-line aligned so per-thread `in_guest` updates never share a 64-byte line with another
+/// thread's `TaskSync` (or its own `Arc` refcounts).
+#[repr(align(64))]
 pub(crate) struct TaskSync {
     /// Whether the thread is running guest code (a TLB shootdown waits for it to leave).
     pub in_guest: AtomicBool,
@@ -41,7 +45,8 @@ pub(crate) struct TaskSync {
 /// What a thread entered the kernel with and has not yet gone back to guest code from, as Linux's
 /// `task_current_syscall` sees it: the syscall number (-1 for a fault, a kick or another
 /// exception), x0 to x5 and sp and pc at the entry. Published with atomics, since the no-BKL path
-/// enters syscalls too, and only while the thread is in the kernel.
+/// enters blocking syscalls too, and only while the thread is stopped, sleeping, or on the BKL path
+/// (running threads read as `"running\n"` in `/proc/<pid>/syscall`).
 #[derive(Default)]
 pub(crate) struct KernelEntry {
     inside: AtomicBool,
@@ -50,7 +55,7 @@ pub(crate) struct KernelEntry {
 
 impl KernelEntry {
     /// The thread enters the kernel with the registers `state`, for a syscall when `svc`.
-    fn enter(&self, state: &CpuState, svc: bool) {
+    pub(crate) fn enter(&self, state: &CpuState, svc: bool) {
         let x = &state.x;
         let nr = if svc { x[8] } else { u64::MAX };
         let regs = [nr, x[0], x[1], x[2], x[3], x[4], x[5], state.sp, state.pc];
@@ -58,6 +63,12 @@ impl KernelEntry {
             r.store(v, Ordering::Relaxed);
         }
         self.inside.store(true, Ordering::Release);
+    }
+
+    /// Whether [`KernelEntry::enter`] has recorded the current kernel entry (read by the owning
+    /// thread only).
+    fn is_inside(&self) -> bool {
+        self.inside.load(Ordering::Relaxed)
     }
 
     /// Linux's `forget_syscall`, which signal delivery does first: the thread is still in the
@@ -685,56 +696,75 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
     drop(k);
     let mut dbt = attach(space);
     let load = |g: &Generations| {
-        let tlb = g.tlb.load(Ordering::SeqCst);
         (
-            tlb,
-            g.code.load(Ordering::SeqCst),
-            g.space.load(Ordering::SeqCst),
+            g.tlb.load(Ordering::Relaxed),
+            g.code.load(Ordering::Relaxed),
+            g.space.load(Ordering::Relaxed),
         )
     };
     let mut seen = load(&generations);
+    let mut in_guest = false;
     loop {
-        // When every thread is waiting, the timer thread's periodic checks stop (crate::oom,
-        // crate::loadavg)
-        shared.resume_checks();
-        // Mark first, then read the generations, pairing with Mm::sync's "change the generation
-        // first, then look at the flags"
-        sync.in_guest.store(true, Ordering::SeqCst);
-        sync.entry.leave();
-        let now = load(&generations);
-        // The address space has left its shared-translation group (crate::mm::CodeGroup): switch
-        // to its own translations. Leaving did a shootdown, so this thread will not run the
-        // group's translations again
-        if now.2 != seen.2 {
-            sync.in_guest.store(false, Ordering::SeqCst);
-            if dbt.take().is_some() {
-                let space = space_of(&shared.lock());
-                dbt = attach(space);
+        if !in_guest {
+            // When every thread is waiting, the timer thread's periodic checks stop (crate::oom,
+            // crate::loadavg)
+            shared.resume_checks();
+            sync.entry.leave();
+            // Mark first, fence SeqCst, then read the generations, pairing with Mm::sync and
+            // Mm::shootdown's SeqCst generation bump followed by SeqCst in_guest load: under
+            // C++20/Rust fence-atomic coherence, either we read the new generation or the mutator
+            // observes in_guest == true and kicks/waits for us.
+            sync.in_guest.store(true, Ordering::Relaxed);
+            std::sync::atomic::fence(Ordering::SeqCst);
+            in_guest = true;
+            let now = load(&generations);
+            // The address space has left its shared-translation group (crate::mm::CodeGroup):
+            // switch to its own translations. Leaving did a shootdown, so this thread will not run
+            // the group's translations again
+            if now.2 != seen.2 {
+                sync.in_guest.store(false, Ordering::Release);
+                in_guest = false;
+                if dbt.take().is_some() {
+                    let space = space_of(&shared.lock());
+                    dbt = attach(space);
+                }
+                seen.2 = now.2;
+                continue;
             }
-            seen.2 = now.2;
+            if now.0 != seen.0 {
+                // Synchronize with Mm::sync/Mm::shootdown's SeqCst generation bump so PTE updates
+                // are visible to subsequent guest refills (including Tier 1's inline walker).
+                std::sync::atomic::fence(Ordering::Acquire);
+                cpu.tlb_flush();
+            }
+            // Translations need invalidating only when code changed: invalidate page by page over
+            // the missed ranges, or flush everything when the record is incomplete. Translations
+            // are shared, so it is enough for the first thread that sees the new generation to do
+            // it once
+            if now.1 != seen.1
+                && let Some((d, space)) = &mut dbt
+            {
+                let mut done = space.seen.lock().unwrap();
+                if *done < now.1 {
+                    match generations.log.lock().unwrap().since(*done, now.1) {
+                        Some(ranges) => ranges
+                            .iter()
+                            .for_each(|&(start, len)| d.invalidate(cpu, start, len)),
+                        None => d.flush(),
+                    }
+                    *done = now.1;
+                }
+            }
+            seen = now;
+        } else if dbt.is_some() && generations.code.load(Ordering::Relaxed) != seen.1 {
+            // Stayed in guest mode across a non-sleeping fast syscall: TLB and code-space changes
+            // always kick in-guest threads (caught at engine entry via cpu->pending), while
+            // code-only invalidations do not kick. Leave guest mode to process space/tlb/code in
+            // canonical order.
+            sync.in_guest.store(false, Ordering::Release);
+            in_guest = false;
             continue;
         }
-        if now.0 != seen.0 {
-            cpu.tlb_flush();
-        }
-        // Translations need invalidating only when code changed: invalidate page by page over the
-        // missed ranges, or flush everything when the record is incomplete. Translations are
-        // shared, so it is enough for the first thread that sees the new generation to do it once
-        if now.1 != seen.1
-            && let Some((d, space)) = &mut dbt
-        {
-            let mut done = space.seen.lock().unwrap();
-            if *done < now.1 {
-                match generations.log.lock().unwrap().since(*done, now.1) {
-                    Some(ranges) => ranges
-                        .iter()
-                        .for_each(|&(start, len)| d.invalidate(cpu, start, len)),
-                    None => d.flush(),
-                }
-                *done = now.1;
-            }
-        }
-        seen = now;
         // PTRACE_SINGLESTEP: the interpreter executes only one instruction. When it is done (ic
         // ivau counts too) enter the kernel to report; an svc reports after the syscall
         // completes, and memory faults and brk deliver their own signals (crate::ptrace)
@@ -762,21 +792,33 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
             (exit, false)
         };
         // Syscalls that can complete without the BKL (syscall::fast). While it accesses guest
-        // memory it is still marked as running guest code. A kernel-layer bug ends only this
-        // process, as on the locked path (crate::bug): the frames unwound through here hold no
-        // Rc; it used to unwind all the way to thread_main and terminate the whole app
+        // memory it is still marked as running guest code. Non-sleeping fast syscalls stay in
+        // guest mode directly into the next iteration (skipping KernelEntry, in_guest toggle,
+        // resume_checks and full generation reload); sleeping/yielding fast syscalls clear
+        // in_guest themselves and re-enter through the full header. A kernel-layer bug ends only
+        // this process, as on the locked path (crate::bug): the frames unwound through here hold
+        // no Rc; it used to unwind all the way to thread_main and terminate the whole app
         let svc = matches!(exit, Exit::Svc { .. });
-        sync.entry.enter(cpu.state(), svc);
         let done = if svc {
             crate::bug::catch(|| fast.syscall(shared, &task, cpu))
         } else {
-            Some(false)
+            Some(FastOutcome::Fallback)
         };
-        sync.in_guest.store(false, Ordering::SeqCst);
         match done {
-            Some(true) => continue,
-            Some(false) => {}
+            Some(FastOutcome::InGuest) => continue,
+            Some(FastOutcome::LeftGuest) => {
+                in_guest = false;
+                continue;
+            }
+            Some(FastOutcome::Fallback) => {
+                if !sync.entry.is_inside() {
+                    sync.entry.enter(cpu.state(), svc);
+                }
+                sync.in_guest.store(false, Ordering::Release);
+                in_guest = false;
+            }
             None => {
+                sync.in_guest.store(false, Ordering::Release);
                 task.sleeping.store(false, Ordering::SeqCst);
                 let nr = cpu.state().x[8];
                 crate::kernel::doing(entry(Some(&task), Doing::Syscall(nr), cpu.state().pc));
@@ -1444,5 +1486,158 @@ mod tests {
             )
         );
         assert_eq!(signal::abort_name(info.esr), "level 0 translation fault");
+    }
+
+    #[test]
+    fn task_sync_is_cache_line_aligned() {
+        assert!(std::mem::align_of::<TaskSync>() >= 64);
+    }
+
+    #[test]
+    fn fast_syscall_loop_responds_to_quiesce_and_code_invalidation() {
+        use std::time::{Duration, Instant};
+
+        for tier in [Tier::Interpreter, Tier::Dbt] {
+            let mut kernel = Kernel::new(tier);
+            let (proc, _, mut cpu) = crate::pseudo::tests::add_task(&mut kernel, 20, 0, true, b"");
+            let code_addr: u64 = 0x1000_0000;
+            let data_addr: u64 = 0x2000_0000;
+            let (mm_rc, task) = {
+                let task = kernel.tasks.remove(&proc.pid).unwrap();
+                let mm = task.state.borrow().mm.clone();
+                {
+                    let mut m = mm.borrow_mut();
+                    m.map_anonymous(code_addr, PAGE_SIZE, prot::READ | prot::WRITE | prot::EXEC)
+                        .unwrap();
+                    m.map_anonymous(data_addr, PAGE_SIZE, prot::READ | prot::WRITE)
+                        .unwrap();
+                    // Tight loop of non-sleeping fast syscalls (getpid = 172) incrementing [x2]:
+                    //   0: movz x8, #172
+                    //   4: svc  #0
+                    //   8: ldr  w1, [x2]
+                    //  12: add  w1, w1, #1
+                    //  16: str  w1, [x2]
+                    //  20: b    -20
+                    let prog: [u32; 6] = [
+                        0xd280_1588, // movz x8, #172
+                        0xd400_0001, // svc #0
+                        0xb940_0041, // ldr w1, [x2]
+                        0x1100_0421, // add w1, w1, #1
+                        0xb900_0041, // str w1, [x2]
+                        0x17ff_fffb, // b -20
+                    ];
+                    let bytes: Vec<u8> = prog.iter().flat_map(|w| w.to_le_bytes()).collect();
+                    m.write(UserSlice::new(code_addr, bytes.len()), &bytes)
+                        .unwrap();
+                    // Reset users list so start() registers the running thread cleanly.
+                    m.remove_user(&task.sync);
+                }
+                {
+                    let st = cpu.state_mut();
+                    st.pc = code_addr;
+                    st.x[2] = data_addr;
+                    st.x[3] = data_addr + 8;
+                }
+                // Remove task from group.threads so start() re-adds it once.
+                task.state.borrow().group.borrow_mut().threads.clear();
+                (mm, task)
+            };
+
+            let shared = Arc::new(Shared::new(kernel));
+            {
+                let mut k = shared.lock();
+                start(&shared, &mut k, task.clone(), cpu).unwrap();
+            }
+
+            let read_u32 = |addr: u64| -> u32 {
+                let _k = shared.lock();
+                let mut b = [0u8; 4];
+                mm_rc
+                    .borrow()
+                    .read(UserSlice::new(addr, 4), &mut b)
+                    .unwrap();
+                u32::from_le_bytes(b)
+            };
+
+            // Wait until the guest thread is actively looping in fast getpid syscalls.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while read_u32(data_addr) < 50 {
+                assert!(
+                    Instant::now() < deadline,
+                    "guest loop did not progress ({tier:?})"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
+            // 1. Mm::quiesce must kick and stop the fast-syscall loop without starving.
+            let dummy_cpu = unsafe { Cpu::new(mm_rc.borrow().mmu()) };
+            let caller_sync = Arc::new(TaskSync {
+                in_guest: AtomicBool::new(false),
+                kicker: dummy_cpu.kicker(),
+                entry: KernelEntry::default(),
+            });
+            {
+                let _k = shared.lock();
+                mm_rc.borrow().quiesce(&caller_sync);
+                assert!(!task.sync.in_guest.load(Ordering::SeqCst));
+            }
+            drop(dummy_cpu);
+
+            // Confirm the loop resumes after BKL release.
+            let after_quiesce = read_u32(data_addr);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while read_u32(data_addr) < after_quiesce + 50 {
+                assert!(
+                    Instant::now() < deadline,
+                    "guest loop did not resume after quiesce ({tier:?})"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
+            // 2. Code-only invalidation (bumps generations.code without kicking) must be observed
+            // by the fast-syscall loop (both Tier 0 and Tier 1): patch the branch at +20 to write
+            // sentinel 0x42 to [x3] and call exit(0).
+            {
+                let _k = shared.lock();
+                let mut mm = mm_rc.borrow_mut();
+                // Write tail instructions first (+24..+36), then replace the branch at +20.
+                let tail: [u32; 3] = [
+                    0xb900_0060, // str w0, [x3]
+                    0xd280_0ba8, // movz x8, #93 (exit)
+                    0xd400_0001, // svc #0
+                ];
+                let tail_bytes: Vec<u8> = tail.iter().flat_map(|w| w.to_le_bytes()).collect();
+                mm.write(
+                    UserSlice::new(code_addr + 24, tail_bytes.len()),
+                    &tail_bytes,
+                )
+                .unwrap();
+                let head: u32 = 0x5280_0840; // movz w0, #0x42
+                mm.write(UserSlice::new(code_addr + 20, 4), &head.to_le_bytes())
+                    .unwrap();
+                mm.invalidate_code(code_addr, PAGE_SIZE);
+                mm.sync(&caller_sync);
+            }
+
+            // Wait for the guest thread to observe the code invalidation and exit cleanly.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                {
+                    let k = shared.lock();
+                    if !k.tasks.contains_key(&proc.pid) {
+                        break;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "guest loop did not observe code-only invalidation ({tier:?})"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(read_u32(data_addr + 8), 0x42);
+            drop(task);
+            drop(mm_rc);
+            drop(shared);
+        }
     }
 }

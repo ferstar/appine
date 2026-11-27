@@ -21,6 +21,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::{Mutex, PoisonError};
 
@@ -84,6 +85,9 @@ pub(crate) struct Overlays {
     /// The total node count above which the next live-cache sweep is tried (0 meaning
     /// [`NODES_MAX`]).
     nodes_sweep_at: usize,
+    /// Shared with [`super::Vfs::sweep_bits`]: mirrors [`Overlays::wants_sweep`] in
+    /// [`super::VFS_OVERLAY_SWEEP`] so `post_syscall_sweeps` skips borrowing `Overlays`.
+    sweep_bits: Rc<Cell<u32>>,
 }
 
 /// Open files holding each overlay node ([`Hold`]): their nodes are never swept. One table for
@@ -599,6 +603,24 @@ fn maybe_whiteout(store: &Store, e: &DirEntry) -> Result<bool, Errno> {
 }
 
 impl Overlays {
+    pub(crate) fn with_sweep_bits(sweep_bits: Rc<Cell<u32>>) -> Self {
+        Self {
+            sweep_bits,
+            ..Self::default()
+        }
+    }
+
+    fn sync_sweep_bit(&self) {
+        let bits = self.sweep_bits.get();
+        if self.wants_sweep() {
+            if bits & super::VFS_OVERLAY_SWEEP == 0 {
+                self.sweep_bits.set(bits | super::VFS_OVERLAY_SWEEP);
+            }
+        } else if bits & super::VFS_OVERLAY_SWEEP != 0 {
+            self.sweep_bits.set(bits & !super::VFS_OVERLAY_SWEEP);
+        }
+    }
+
     /// Records a new instance with device number `dev` and returns its root node. `upper` is the
     /// upper layer's root, `lower` the lower layers' roots, topmost first.
     pub(crate) fn add_instance(
@@ -654,6 +676,7 @@ impl Overlays {
             self.nodes_sweep_at = self
                 .nodes_sweep_at
                 .min(Self::next_nodes_sweep_at(self.nodes.len()));
+            self.sync_sweep_bit();
         }
     }
 
@@ -661,6 +684,7 @@ impl Overlays {
     fn orphan(&mut self, id: OvlId) {
         let now = crate::task::SYSCALLS.load(Ordering::Relaxed);
         self.orphans.push((id, now));
+        self.sync_sweep_bit();
     }
 
     /// Whether enough removed nodes have gathered or the live node cache outgrew its bound to try
@@ -728,6 +752,7 @@ impl Overlays {
             self.nodes_sweep_at = self
                 .nodes_sweep_at
                 .min(Self::next_nodes_sweep_at(self.nodes.len()));
+            self.sync_sweep_bit();
             return gone;
         }
         let mut pinned: HashSet<OvlId> = keep
@@ -796,6 +821,7 @@ impl Overlays {
             }
         }
         self.nodes_sweep_at = Self::next_nodes_sweep_at(self.nodes.len());
+        self.sync_sweep_bit();
         gone
     }
 
@@ -829,6 +855,10 @@ impl Overlays {
         node.touched
             .set(crate::task::SYSCALLS.load(Ordering::Relaxed));
         self.nodes.insert(self.next, node);
+        if self.nodes.len() > self.nodes_sweep_at.max(NODES_MAX) {
+            self.sweep_bits
+                .set(self.sweep_bits.get() | super::VFS_OVERLAY_SWEEP);
+        }
         self.next
     }
 
@@ -1962,5 +1992,37 @@ mod tests {
         o.remove_instance(0x33);
         assert!(o.nodes.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_bit_tracks_wants_sweep_across_orphans_and_sweep() {
+        let bits = Rc::new(Cell::new(0u32));
+        let mut o = Overlays::with_sweep_bits(bits.clone());
+        let root = o.add_instance(
+            1,
+            (Some(1), Vec::new()),
+            ((0, 0), Vec::new()),
+            Options::default(),
+        );
+        assert_eq!(bits.get() & crate::vfs::VFS_OVERLAY_SWEEP, 0);
+        for i in 0..ORPHANS_MIN {
+            let id = o.add_node(OvlNode {
+                dev: 1,
+                parent: root,
+                name: format!("f{i}").into_bytes(),
+                upper: Some(i as u64 + 10),
+                lower: Vec::new(),
+                origin: None,
+                children: HashMap::new(),
+                seen: 0,
+                touched: Cell::new(0),
+            });
+            o.orphan(id);
+        }
+        assert!(o.wants_sweep());
+        assert_ne!(bits.get() & crate::vfs::VFS_OVERLAY_SWEEP, 0);
+        o.sweep(&HashSet::new(), u64::MAX);
+        assert!(!o.wants_sweep());
+        assert_eq!(bits.get() & crate::vfs::VFS_OVERLAY_SWEEP, 0);
     }
 }
