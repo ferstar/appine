@@ -368,7 +368,12 @@ impl PinnedIo {
                     // SAFETY: `iov[..v.len()]` points into live writable `HostRegion`s pinned by
                     // `self` with `io_write_pins` held.
                     let n = unsafe {
-                        libc::preadv(fd, iov.as_ptr(), v.len() as libc::c_int, offset as libc::off_t)
+                        libc::preadv(
+                            fd,
+                            iov.as_ptr(),
+                            v.len() as libc::c_int,
+                            offset as libc::off_t,
+                        )
                     };
                     if n >= 0 {
                         return Ok(n as usize);
@@ -2936,11 +2941,14 @@ impl Mm {
                     let stop_page = cow_stop.next_multiple_of(PAGE_SIZE);
                     let (known_lo, known_hi) = v.present_run.get();
                     if !(known_lo <= page && stop_page <= known_hi) {
-                        let host_page = Self::own_page(s, v, page);
-                        // SAFETY: `[page, stop_page)` has no CoW pages and belongs to `v`.
-                        unsafe { self.mmu.fill_shared(page, host_page, stop_page - page, p) }
+                        // Fill enclosing 2 MiB `LEAF_SPAN` windows (matching `fault_range`) so
+                        // 2 MiB-aligned anonymous VMAs promote to L2 superpages without L3 tables.
+                        let lo = (page & !(LEAF_SPAN - 1)).max(s);
+                        let hi = ((stop_page - 1) | (LEAF_SPAN - 1))
+                            .saturating_add(1)
+                            .min(s + v.len);
+                        self.fill_anon_non_cow(s, v, lo, hi)
                             .map_err(|_| Errno::EFAULT)?;
-                        v.note_present(page, stop_page);
                     }
                     let chunk = (cow_stop - cur) as usize;
                     // SAFETY: `[cur, cow_stop)` is own-backed writable memory inside `v`.
@@ -3076,14 +3084,13 @@ impl Mm {
                     let stop_page = want_end.next_multiple_of(PAGE_SIZE);
                     let (known_lo, known_hi) = v.present_run.get();
                     if !(known_lo <= page && stop_page <= known_hi) {
-                        let host_page = Self::own_page(s, v, page);
-                        // SAFETY: `[page, stop_page)` has CoW settled and belongs to `v`.
-                        if unsafe { self.mmu.fill_shared(page, host_page, stop_page - page, p) }
-                            .is_err()
-                        {
+                        let lo = (page & !(LEAF_SPAN - 1)).max(s);
+                        let hi = ((stop_page - 1) | (LEAF_SPAN - 1))
+                            .saturating_add(1)
+                            .min(s + v.len);
+                        if self.fill_anon_non_cow(s, v, lo, hi).is_err() {
                             break;
                         }
-                        v.note_present(page, stop_page);
                     }
                 } else {
                     // Never pin an owner's borrowed page across `Cx::unlocked` for `pwrite`: a
@@ -3136,6 +3143,49 @@ impl Mm {
             self.fault_in(addr, need)
                 .then(|| self.mmu.translate(addr, need))?
         })
+    }
+
+    /// Reads a NUL-terminated string (without the NUL) into `buf` when it fits within `buf.len()`
+    /// (and at most `max` bytes). Returns `Ok(Some(len))` when it fits, `Ok(None)` when the string
+    /// exceeds `buf.len()` (still within `max`), or `Err(ENAMETOOLONG / EFAULT / FUSE_RETRY)`.
+    pub fn read_cstr_into(
+        &self,
+        addr: u64,
+        buf: &mut [u8],
+        max: usize,
+    ) -> Result<Option<usize>, Errno> {
+        let cap = buf.len().min(max);
+        let mut out_len = 0;
+        let mut cur = addr;
+        loop {
+            let chunk = (PAGE_SIZE - cur % PAGE_SIZE) as usize;
+            let host = self
+                .translate(cur, prot::READ)
+                .ok_or_else(|| self.miss(cur, prot::READ))?;
+            // SAFETY: translate guarantees this page stays valid for the duration of this call.
+            let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr(), chunk) };
+            if let Some(n) = bytes.iter().position(|&b| b == 0) {
+                let total = out_len + n;
+                if total > max {
+                    return Err(Errno::ENAMETOOLONG);
+                }
+                if total > buf.len() {
+                    return Ok(None);
+                }
+                buf[out_len..total].copy_from_slice(&bytes[..n]);
+                return Ok(Some(total));
+            }
+            let total = out_len + chunk;
+            if total > max {
+                return Err(Errno::ENAMETOOLONG);
+            }
+            if total > cap {
+                return Ok(None);
+            }
+            buf[out_len..total].copy_from_slice(bytes);
+            out_len = total;
+            cur = cur.checked_add(chunk as u64).ok_or(Errno::EFAULT)?;
+        }
     }
 
     /// Reads a NUL-terminated string (without the NUL), at most `max` bytes; ENAMETOOLONG if
@@ -8391,8 +8441,12 @@ impl Mm {
             // prot-0 entries for PROT_NONE VMAs) so future forks' `touched_windows` find them.
             let dst_lo = Self::own_page(start, cv, lo);
             // SAFETY: `[lo, hi)` belongs to `cv` and uses its own host backing.
-            unsafe { child.mmu.fill_shared(lo, dst_lo, hi - lo, cv.prefill_prot()) }
-                .map_err(map_err)?;
+            unsafe {
+                child
+                    .mmu
+                    .fill_shared(lo, dst_lo, hi - lo, cv.prefill_prot())
+            }
+            .map_err(map_err)?;
             cv.note_present(lo, hi);
         }
         Ok(())
@@ -15368,26 +15422,42 @@ mod tests {
         mm.map_anonymous(adj_a, 4 * PAGE_SIZE, RW).unwrap();
         mm.map_anonymous(adj_b, 4 * PAGE_SIZE, RW).unwrap();
         spans.clear();
-        mm.for_each_page(adj_a, (8 * PAGE_SIZE) as usize, prot::WRITE, |host, done, chunk| {
-            spans.push((done, chunk));
-            unsafe { std::ptr::write_bytes(host, 0x33, chunk) };
-        })
+        mm.for_each_page(
+            adj_a,
+            (8 * PAGE_SIZE) as usize,
+            prot::WRITE,
+            |host, done, chunk| {
+                spans.push((done, chunk));
+                unsafe { std::ptr::write_bytes(host, 0x33, chunk) };
+            },
+        )
         .unwrap();
         assert_eq!(
             spans,
-            vec![(0, (4 * PAGE_SIZE) as usize), ((4 * PAGE_SIZE) as usize, (4 * PAGE_SIZE) as usize)]
+            vec![
+                (0, (4 * PAGE_SIZE) as usize),
+                ((4 * PAGE_SIZE) as usize, (4 * PAGE_SIZE) as usize)
+            ]
         );
         // Crossing into an unmapped page after `adj_b` delivers valid prefix then returns EFAULT.
         spans.clear();
         assert_eq!(
-            mm.for_each_page(adj_a, (9 * PAGE_SIZE) as usize, prot::READ, |_, done, chunk| {
-                spans.push((done, chunk));
-            }),
+            mm.for_each_page(
+                adj_a,
+                (9 * PAGE_SIZE) as usize,
+                prot::READ,
+                |_, done, chunk| {
+                    spans.push((done, chunk));
+                }
+            ),
             Err(Errno::EFAULT)
         );
         assert_eq!(
             spans,
-            vec![(0, (4 * PAGE_SIZE) as usize), ((4 * PAGE_SIZE) as usize, (4 * PAGE_SIZE) as usize)]
+            vec![
+                (0, (4 * PAGE_SIZE) as usize),
+                ((4 * PAGE_SIZE) as usize, (4 * PAGE_SIZE) as usize)
+            ]
         );
 
         // Fork and verify CoW-borrowed reads and CoW-breaking writes preserve isolation.

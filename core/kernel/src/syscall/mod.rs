@@ -899,6 +899,49 @@ fn exec_done(cx: &mut Cx<'_>, cpu: &mut Cpu, old_tid: crate::kernel::Tid, doomed
     }
 }
 
+/// Guest path bytes stored inline on the stack for typical paths (up to 256 bytes) and spilled
+/// to the heap only for longer paths up to `PATH_MAX - 1`.
+#[allow(clippy::large_enum_variant)]
+pub(super) enum PathBytes {
+    Inline { buf: [u8; 256], len: u16 },
+    Heap(Vec<u8>),
+}
+
+impl PathBytes {
+    #[inline]
+    pub(super) fn empty() -> Self {
+        Self::Inline {
+            buf: [0; 256],
+            len: 0,
+        }
+    }
+}
+
+impl std::ops::Deref for PathBytes {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Inline { buf, len } => &buf[..*len as usize],
+            Self::Heap(v) => v,
+        }
+    }
+}
+
+/// Reads a guest path argument without heap allocation when it fits in 256 bytes.
+pub(super) fn read_path_buf(cx: &Cx<'_>, addr: u64) -> Result<PathBytes, Errno> {
+    let mut buf = [0u8; 256];
+    let mm = cx.mm();
+    if let Some(len) = mm.read_cstr_into(addr, &mut buf, PATH_MAX - 1)? {
+        return Ok(PathBytes::Inline {
+            buf,
+            len: len as u16,
+        });
+    }
+    mm.read_cstr(addr, PATH_MAX - 1).map(PathBytes::Heap)
+}
+
 /// Reads a guest path argument.
 fn read_path(cx: &Cx<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
     cx.mm().read_cstr(addr, PATH_MAX - 1)

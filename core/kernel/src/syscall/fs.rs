@@ -16,7 +16,10 @@ use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use super::SocketRef;
-use super::{FUSE_CHUNK, IO_CHUNK, MAX_COPY, SysResult, get, inotify, put, read_path, tty};
+use super::{
+    FUSE_CHUNK, IO_CHUNK, MAX_COPY, PathBytes, SysResult, get, inotify, put,
+    read_path_buf as read_path, tty,
+};
 use crate::cell::RefCell;
 use crate::cred::{Cred, MAY_EXEC, MAY_READ, MAY_WRITE, cap};
 use crate::errno::Errno;
@@ -255,7 +258,7 @@ pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u
         validate_tmpfile_flags(flags)?;
     }
     let path = read_path(cx, path)?;
-    let file = open_path(cx, dirfd, path, flags, perm)?;
+    let file = open_path(cx, dirfd, &path, flags, perm)?;
     cx.install_fd(file, flags & oflags::O_CLOEXEC != 0)
         .map(|fd| fd as u64)
 }
@@ -347,7 +350,7 @@ pub(super) fn openat2(cx: &mut Cx<'_>, dirfd: i32, path: u64, how: u64, size: us
     }
     let path = read_path(cx, path)?;
     let flags = flags as u32;
-    let file = open_path_with(cx, dirfd, path, flags, mode as u32, res)?;
+    let file = open_path_with(cx, dirfd, &path, flags, mode as u32, res)?;
     cx.install_fd(file, flags & oflags::O_CLOEXEC != 0)
         .map(|fd| fd as u64)
 }
@@ -356,13 +359,13 @@ pub(super) fn openat2(cx: &mut Cx<'_>, dirfd: i32, path: u64, how: u64, size: us
 /// it already exists, symlinks not followed, opened write-only.
 pub(crate) fn create_exclusive(cx: &mut Cx<'_>, path: &[u8], perm: u32) -> Result<FileRef, Errno> {
     let flags = oflags::O_CREAT | oflags::O_EXCL | oflags::O_NOFOLLOW | oflags::O_WRONLY;
-    open_path(cx, AT_FDCWD, path.to_vec(), flags, perm)
+    open_path(cx, AT_FDCWD, path, flags, perm)
 }
 
 /// The kernel deletes a file itself (the old file of the same name before a core dump), relative
 /// to the current directory.
 pub(crate) fn unlink_path(cx: &mut Cx<'_>, path: &[u8]) -> Result<(), Errno> {
-    unlink(cx, AT_FDCWD, path.to_vec(), 0)
+    unlink(cx, AT_FDCWD, path, 0)
 }
 
 /// The kernel writes an open file itself at `offset` (core dump), as pwrite does.
@@ -379,28 +382,211 @@ pub(crate) fn write_at(
 fn open_path(
     cx: &mut Cx<'_>,
     dirfd: i32,
-    path: Vec<u8>,
+    path: &[u8],
     flags: u32,
     perm: u32,
 ) -> Result<FileRef, Errno> {
     open_path_with(cx, dirfd, path, flags, perm, 0)
 }
 
+/// Returns the final component name when `path` has no trailing slash and does not end in `.` or
+/// `..` (eligible for single-walk parent-first `O_CREAT` resolution).
+fn create_leaf_name(path: &[u8]) -> Option<&[u8]> {
+    if path.ends_with(b"/") {
+        return None;
+    }
+    let name = match path.iter().rposition(|&b| b == b'/') {
+        Some(i) => &path[i + 1..],
+        None => path,
+    };
+    (!name.is_empty() && name != b"." && name != b"..").then_some(name)
+}
+
+struct CreatedNode {
+    node: Node,
+    created: Option<std::fs::File>,
+    parent: Option<Dentry>,
+    mq_created: bool,
+    fuse_created: Option<FileKind>,
+}
+
+/// Creates a missing `O_CREAT` target, following any dangling trailing symlink. When `initial` is
+/// `Some((dir, name))`, the first iteration uses the already-resolved parent directly instead of
+/// walking the path a second time.
+#[allow(clippy::too_many_arguments)]
+fn open_create_target(
+    cx: &mut Cx<'_>,
+    vfs: &Vfs,
+    cred: &Cred,
+    root: &Node,
+    start: &Node,
+    path: &[u8],
+    flags: u32,
+    perm: u32,
+    res: u64,
+    follow: bool,
+    mut initial: Option<(Node, Vec<u8>)>,
+) -> Result<CreatedNode, Errno> {
+    use crate::vfs::resolve;
+    // When the last component is a dangling symlink, follow it and create the target file, as on
+    // Linux
+    let mut root_set = path.first() == Some(&b'/')
+        || res & resolve::SCOPED != 0
+        || path.split(|&b| b == b'/').any(|c| c == b"..");
+    let mut cur_start = start.clone();
+    let mut cur_path: Option<Vec<u8>> = None;
+    let mut links = 0;
+    loop {
+        let (dir, name_owned);
+        let name: &[u8] = if let Some((d, n)) = initial.take() {
+            dir = d;
+            name_owned = n;
+            &name_owned
+        } else {
+            let p = cur_path.as_deref().unwrap_or(path);
+            let (d, n) = vfs.resolve_parent_with(&cx.view(vfs), cred, root, &cur_start, p, res)?;
+            if p.ends_with(b"/") || n == b"." || n == b".." {
+                return Err(Errno::EISDIR);
+            }
+            dir = d;
+            n
+        };
+        // In the mqueue filesystem a message queue is created (Linux's mqueue_create), with
+        // default attributes
+        if let Node::Pseudo(mnt, PseudoNode::MqRoot(ns)) = dir {
+            if vfs.readonly(&dir) {
+                return Err(Errno::EROFS);
+            }
+            if flags & oflags::O_DIRECTORY != 0 {
+                return Err(Errno::ENOTDIR);
+            }
+            cx.fds().free_slot(0..cx.nofile())?;
+            let ipc = cx.kr().ipc(ns);
+            let dir_st = ipc.mq_dir.borrow().stat(ipc.mqueues.len());
+            cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
+            let perm = perm & !cx.umask();
+            let q = super::mqueue::new_queue(cx, ns, cred, perm, None)?;
+            let ino = q.borrow().ino;
+            super::mqueue::insert_queue(cx.k().ipc_mut(ns), name.to_vec(), q);
+            return Ok(CreatedNode {
+                node: Node::Pseudo(mnt, PseudoNode::Mq(ns, ino)),
+                created: None,
+                parent: Some((dir, name.to_vec())),
+                mq_created: true,
+                fuse_created: None,
+            });
+        }
+        // Files cannot be created in cgroup directories (they have no create; Linux's vfs_create
+        // is EACCES)
+        if let Node::Pseudo(_, PseudoNode::Cgroup(..)) = dir
+            && !vfs.readonly(&dir)
+        {
+            return Err(Errno::EACCES);
+        }
+        // A dangling symlink under the name (in an overlay, as the overlay shows it)
+        let link = match &dir {
+            Node::Overlay(mnt, o) => vfs.overlay_child((*mnt, *o), name).ok(),
+            Node::Fuse(mnt, d) => match vfs.fuse_child(*d, name) {
+                Ok(c) => Some(Node::Fuse(*mnt, c)),
+                Err(e) if e == Errno::ENOENT => None,
+                Err(e) => return Err(e),
+            },
+            _ => {
+                let (mnt, d) = store_dir(vfs, &dir)?;
+                vfs.store().lookup(d, name)?.map(|i| Node::Store(mnt, i))
+            }
+        };
+        if let Some(link) = link
+            && follow
+            && vfs.kind(&cx.view(vfs), &link)? == mode::S_IFLNK
+        {
+            links += 1;
+            if links > crate::vfs::MAX_SYMLINKS {
+                return Err(Errno::ELOOP);
+            }
+            // As in walk (pick_link, nd_jump_root): RESOLVE_NO_SYMLINKS and nosymfollow mounts do
+            // not follow; under NO_XDEV an absolute target must be in the same mount as the root
+            if res & resolve::NO_SYMLINKS != 0
+                || vfs
+                    .mount_flags(&link)
+                    .is_some_and(|f| f & ms::NOSYMFOLLOW != 0)
+            {
+                return Err(Errno::ELOOP);
+            }
+            let target = vfs.readlink(&cx.view(vfs), &link)?;
+            // Whether resolution has taken the root: approximated from the original path
+            // (absolute, scoped, containing `..`, or a jump already made here); those in earlier
+            // symlinks do not count
+            if target.first() == Some(&b'/')
+                && res & resolve::NO_XDEV != 0
+                && (!root_set || dir.mnt() != root.mnt())
+            {
+                return Err(Errno::EXDEV);
+            }
+            root_set |= target.first() == Some(&b'/');
+            cur_path = Some(target);
+            cur_start = dir;
+            continue;
+        }
+        // In a FUSE filesystem the daemon creates and opens it
+        if let Node::Fuse(mnt, d) = dir {
+            let (id, kind) = super::fuse::create(cx, cred, vfs, (mnt, d), name, perm, flags)?;
+            return Ok(CreatedNode {
+                node: Node::Fuse(mnt, id),
+                created: None,
+                parent: Some((dir, name.to_vec())),
+                mq_created: false,
+                fuse_created: Some(kind),
+            });
+        }
+        // Check permissions and tmpfs room before copying up an overlay parent directory
+        let (mnt, d, dir_st, _) =
+            prepare_create_dir(vfs, cred, &cx.view(vfs), &dir, name, None, 0)?;
+        let (uid, gid, perm) = cred.new_owner(&dir_st, perm, cx.umask(), false);
+        let tmpfs = tmpfs_reserve_name(vfs, (mnt, d), name, 0)?;
+        let (ino, file) = create_in(
+            vfs,
+            (mnt, d),
+            name,
+            dir_st.default_acl.as_deref(),
+            || vfs.store().create_file(d, name, perm, uid, gid),
+            |(ino, _)| *ino,
+        )?;
+        tmpfs_created_name(vfs, tmpfs, 0);
+        // In an overlay the new file is the overlay's node of that name
+        if let Node::Overlay(mnt, o) = dir {
+            return Ok(CreatedNode {
+                node: vfs.overlay_child((mnt, o), name)?,
+                created: Some(file),
+                parent: Some((dir, name.to_vec())),
+                mq_created: false,
+                fuse_created: None,
+            });
+        }
+        return Ok(CreatedNode {
+            node: Node::Store(mnt, ino),
+            created: Some(file),
+            parent: Some((Node::Store(mnt, d), name.to_vec())),
+            mq_created: false,
+            fuse_created: None,
+        });
+    }
+}
+
 /// [`open_path`], with path resolution carrying openat2's restrictions ([`crate::vfs::resolve`]).
 fn open_path_with(
     cx: &mut Cx<'_>,
     dirfd: i32,
-    path: Vec<u8>,
+    path: &[u8],
     flags: u32,
     perm: u32,
     res: u64,
 ) -> Result<FileRef, Errno> {
-    use crate::vfs::resolve;
     let vfs = cx.vfs()?;
     let (start, root) = if res == 0 {
-        (start_dir(cx, dirfd, &path)?, cx.root())
+        (start_dir(cx, dirfd, path)?, cx.root())
     } else {
-        openat2_start(cx, dirfd, &path, res)?
+        openat2_start(cx, dirfd, path, res)?
     };
     let path_only = flags & oflags::O_PATH != 0;
     let create = !path_only && flags & oflags::O_CREAT != 0;
@@ -412,11 +598,6 @@ fn open_path_with(
         opening: true,
         ..cx.view(&vfs)
     };
-    let resolved = vfs.walk_resolve(&view, &cred, &root, &start, &path, follow, res);
-    if !path_only && flags & oflags::O_TMPFILE_BIT != 0 {
-        let (dir, _) = resolved?;
-        return open_tmpfile(cx, &vfs, &cred, &dir, (&start, &path), flags, perm);
-    }
     // A queue was created in the mqueue filesystem (open permission is not checked again, as for
     // files just created in the store)
     let mut mq_created = false;
@@ -424,155 +605,125 @@ fn open_path_with(
     let mut fuse_created = None;
     // parent is the last directory and name passed through, for reporting inotify events
     let mut unlinked_name = false;
-    let (mut node, created, parent) = match resolved {
-        Ok(_) if excl => return Err(Errno::EEXIST),
-        Ok((node, found)) => {
-            if create {
-                may_create_in_sticky(cx, &vfs, &cred, &node, found.as_ref().map(|d| &d.entry.0))?;
+
+    let (mut node, created, parent) = if create
+        && res == 0
+        && flags & oflags::O_TMPFILE_BIT == 0
+        && create_leaf_name(path).is_some()
+    {
+        // Single-walk O_CREAT fast path: resolve the parent directory once. If the leaf does not
+        // exist in a store directory we create it directly without re-walking the parent prefix;
+        // if it exists (or lives in another filesystem) we resolve only the single final component
+        // from the resolved parent (falling back to a full walk only for non-O_EXCL symlinks to
+        // preserve cumulative 40-link counting across parent + leaf).
+        let (dir, name) = vfs.resolve_parent_with(&view, &cred, &root, &start, path, 0)?;
+        let direct_missing = match &dir {
+            Node::Store(_, d) => match vfs.store().lookup(*d, name)? {
+                None => Some(None),
+                Some(ino) => Some(Some(ino)),
+            },
+            _ => None,
+        };
+        if direct_missing == Some(None) {
+            let c = open_create_target(
+                cx,
+                &vfs,
+                &cred,
+                &root,
+                &start,
+                path,
+                flags,
+                perm,
+                0,
+                follow,
+                Some((dir, name.to_vec())),
+            )?;
+            mq_created = c.mq_created;
+            fuse_created = c.fuse_created;
+            (c.node, c.created, c.parent)
+        } else {
+            let existing_symlink = matches!(direct_missing, Some(Some(ino)) if !excl && vfs.store().kind(ino)? == mode::S_IFLNK);
+            let resolved = if existing_symlink {
+                vfs.walk_resolve(&view, &cred, &root, &start, path, follow, 0)
+            } else {
+                vfs.walk_resolve(&view, &cred, &root, &dir, name, follow, 0)
+            };
+            match resolved {
+                Ok(_) if excl => return Err(Errno::EEXIST),
+                Ok((node, found)) => {
+                    may_create_in_sticky(
+                        cx,
+                        &vfs,
+                        &cred,
+                        &node,
+                        found.as_ref().map(|d| &d.entry.0),
+                    )?;
+                    unlinked_name = found.as_ref().is_some_and(|d| d.unlinked);
+                    (node, None, found.map(|d| d.entry))
+                }
+                Err(e) if e == Errno::ENOENT => {
+                    let c = open_create_target(
+                        cx,
+                        &vfs,
+                        &cred,
+                        &root,
+                        &start,
+                        path,
+                        flags,
+                        perm,
+                        0,
+                        follow,
+                        Some((dir, name.to_vec())),
+                    )?;
+                    mq_created = c.mq_created;
+                    fuse_created = c.fuse_created;
+                    (c.node, c.created, c.parent)
+                }
+                Err(e) => return Err(e),
             }
-            unlinked_name = found.as_ref().is_some_and(|d| d.unlinked);
-            (node, None, found.map(|d| d.entry))
         }
-        Err(e) if e == Errno::ENOENT && create => {
-            // When the last component is a dangling symlink, follow it and create the target
-            // file, as on Linux
-            let mut root_set = path.first() == Some(&b'/')
-                || res & resolve::SCOPED != 0
-                || path.split(|&b| b == b'/').any(|c| c == b"..");
-            let (mut start, mut path) = (start.clone(), path.clone());
-            let mut links = 0;
-            loop {
-                let (dir, name) =
-                    vfs.resolve_parent_with(&cx.view(&vfs), &cred, &root, &start, &path, res)?;
-                if path.ends_with(b"/") || name == b"." || name == b".." {
-                    return Err(Errno::EISDIR);
+    } else {
+        let resolved = vfs.walk_resolve(&view, &cred, &root, &start, path, follow, res);
+        if !path_only && flags & oflags::O_TMPFILE_BIT != 0 {
+            let (dir, _) = resolved?;
+            return open_tmpfile(cx, &vfs, &cred, &dir, (&start, path), flags, perm);
+        }
+        match resolved {
+            Ok(_) if excl => return Err(Errno::EEXIST),
+            Ok((node, found)) => {
+                if create {
+                    may_create_in_sticky(
+                        cx,
+                        &vfs,
+                        &cred,
+                        &node,
+                        found.as_ref().map(|d| &d.entry.0),
+                    )?;
                 }
-                // In the mqueue filesystem a message queue is created (Linux's mqueue_create),
-                // with default attributes
-                if let Node::Pseudo(mnt, PseudoNode::MqRoot(ns)) = dir {
-                    if vfs.readonly(&dir) {
-                        return Err(Errno::EROFS);
-                    }
-                    if flags & oflags::O_DIRECTORY != 0 {
-                        return Err(Errno::ENOTDIR);
-                    }
-                    cx.fds().free_slot(0..cx.nofile())?;
-                    let ipc = cx.kr().ipc(ns);
-                    let dir_st = ipc.mq_dir.borrow().stat(ipc.mqueues.len());
-                    cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
-                    let perm = perm & !cx.umask();
-                    let q = super::mqueue::new_queue(cx, ns, &cred, perm, None)?;
-                    let ino = q.borrow().ino;
-                    super::mqueue::insert_queue(cx.k().ipc_mut(ns), name.to_vec(), q);
-                    mq_created = true;
-                    break (
-                        Node::Pseudo(mnt, PseudoNode::Mq(ns, ino)),
-                        None,
-                        Some((dir.clone(), name.to_vec())),
-                    );
-                }
-                // Files cannot be created in cgroup directories (they have no create; Linux's
-                // vfs_create is EACCES)
-                if let Node::Pseudo(_, PseudoNode::Cgroup(..)) = dir
-                    && !vfs.readonly(&dir)
-                {
-                    return Err(Errno::EACCES);
-                }
-                // A dangling symlink under the name (in an overlay, as the overlay shows it)
-                let link = match &dir {
-                    Node::Overlay(mnt, o) => vfs.overlay_child((*mnt, *o), name).ok(),
-                    Node::Fuse(mnt, d) => match vfs.fuse_child(*d, name) {
-                        Ok(c) => Some(Node::Fuse(*mnt, c)),
-                        Err(e) if e == Errno::ENOENT => None,
-                        Err(e) => return Err(e),
-                    },
-                    _ => {
-                        let (mnt, d) = store_dir(&vfs, &dir)?;
-                        vfs.store().lookup(d, name)?.map(|i| Node::Store(mnt, i))
-                    }
-                };
-                if let Some(link) = link
-                    && follow
-                    && vfs.kind(&cx.view(&vfs), &link)? == mode::S_IFLNK
-                {
-                    links += 1;
-                    if links > crate::vfs::MAX_SYMLINKS {
-                        return Err(Errno::ELOOP);
-                    }
-                    // As in walk (pick_link, nd_jump_root): RESOLVE_NO_SYMLINKS and nosymfollow
-                    // mounts do not follow; under NO_XDEV an absolute target must be in the same
-                    // mount as the root
-                    if res & resolve::NO_SYMLINKS != 0
-                        || vfs
-                            .mount_flags(&link)
-                            .is_some_and(|f| f & ms::NOSYMFOLLOW != 0)
-                    {
-                        return Err(Errno::ELOOP);
-                    }
-                    path = vfs.readlink(&cx.view(&vfs), &link)?;
-                    // Whether resolution has taken the root: approximated from the original path
-                    // (absolute, scoped, containing `..`, or a jump already made here); those in
-                    // earlier symlinks do not count
-                    if path.first() == Some(&b'/')
-                        && res & resolve::NO_XDEV != 0
-                        && (!root_set || dir.mnt() != root.mnt())
-                    {
-                        return Err(Errno::EXDEV);
-                    }
-                    root_set |= path.first() == Some(&b'/');
-                    start = dir;
-                    continue;
-                }
-                // In a FUSE filesystem the daemon creates and opens it
-                if let Node::Fuse(mnt, d) = dir {
-                    let (id, kind) =
-                        super::fuse::create(cx, &cred, &vfs, (mnt, d), name, perm, flags)?;
-                    fuse_created = Some(kind);
-                    break (
-                        Node::Fuse(mnt, id),
-                        None,
-                        Some((dir.clone(), name.to_vec())),
-                    );
-                }
-                // Check permissions and tmpfs room before copying up an overlay parent directory
-                let (mnt, d, dir_st, _) =
-                    prepare_create_dir(&vfs, &cred, &cx.view(&vfs), &dir, name, None, 0)?;
-                let (uid, gid, perm) = cred.new_owner(&dir_st, perm, cx.umask(), false);
-                let tmpfs = tmpfs_reserve_name(&vfs, (mnt, d), name, 0)?;
-                let (ino, file) = create_in(
-                    &vfs,
-                    (mnt, d),
-                    name,
-                    dir_st.default_acl.as_deref(),
-                    || vfs.store().create_file(d, name, perm, uid, gid),
-                    |(ino, _)| *ino,
+                unlinked_name = found.as_ref().is_some_and(|d| d.unlinked);
+                (node, None, found.map(|d| d.entry))
+            }
+            Err(e) if e == Errno::ENOENT && create => {
+                let c = open_create_target(
+                    cx, &vfs, &cred, &root, &start, path, flags, perm, res, follow, None,
                 )?;
-                tmpfs_created_name(&vfs, tmpfs, 0);
-                // In an overlay the new file is the overlay's node of that name
-                if let Node::Overlay(mnt, o) = dir {
-                    break (
-                        vfs.overlay_child((mnt, o), name)?,
-                        Some(file),
-                        Some((dir.clone(), name.to_vec())),
-                    );
-                }
-                break (
-                    Node::Store(mnt, ino),
-                    Some(file),
-                    Some((Node::Store(mnt, d), name.to_vec())),
-                );
+                mq_created = c.mq_created;
+                fuse_created = c.fuse_created;
+                (c.node, c.created, c.parent)
             }
+            Err(e) => return Err(e),
         }
-        Err(e) => return Err(e),
     };
 
-    let mut display = display_path(cx, &vfs, &start, &path, &node, parent.as_ref());
+    let mut display: Option<Rc<[u8]>> = None;
+    let mut display_set = false;
     // A namespace shows as `mnt:[number]` and the like in `/proc/<pid>/fd/<n>`; a namespace file
     // bind-mounted elsewhere opens as the mount point's path (Linux's d_path)
     if let Node::Pseudo(mnt, p @ PseudoNode::NsFile(..)) = &node
         && vfs.mount(*mnt).is_none_or(|m| m.fs != Fs::Nsfs)
     {
         display = Some(Rc::from(cx.view(&vfs).name(*mnt, p)));
+        display_set = true;
     }
     let was_created = created.is_some() || fuse_created.is_some();
     let via_devpts = matches!(node, Node::Pseudo(_, PseudoNode::Pts(..)));
@@ -602,6 +753,7 @@ fn open_path_with(
             if !path_only || backing.is_some() {
                 opened_mnt = Some(source.mnt);
                 display = source.path.clone();
+                display_set = true;
                 overlay = source.ovl.map(|o| (source.mnt, o));
                 opened_ino = source
                     .ovl
@@ -630,6 +782,7 @@ fn open_path_with(
         Node::Pseudo(_, PseudoNode::OpenExe(proc)) => {
             let exe = exe_file(cx, *proc)?;
             display = Some(exe.path.clone());
+            display_set = true;
             unlinked_name = true;
             if let Some(f) = &exe.fuse {
                 opened_mnt = Some(f.mnt);
@@ -651,6 +804,9 @@ fn open_path_with(
         _ => {}
     }
     unlinked_name |= matches!(node, Node::Overlay(_, o) if !vfs.overlay().linked(o));
+    // Only clone `node` for `display_path` in the rare case where `parent` is `None` (e.g. `/` or
+    // `.`); when `parent` is `Some((dir, name))`, `found_path` does not consult `node`.
+    let display_node = (!display_set && parent.is_none()).then(|| node.clone());
     let kind = if path_only {
         if flags & oflags::O_DIRECTORY != 0 && !vfs.is_dir(&cx.view(&vfs), &node)? {
             return Err(Errno::ENOTDIR);
@@ -703,6 +859,18 @@ fn open_path_with(
         && !via_devpts
     {
         display = None;
+        display_set = true;
+    }
+    if !display_set {
+        display = display_path(
+            cx,
+            &vfs,
+            &root,
+            &start,
+            path,
+            display_node.as_ref(),
+            parent.as_ref(),
+        );
     }
     let overlay = overlay.filter(|_| {
         path_object.is_some()
@@ -804,7 +972,8 @@ fn open_tmpfile(
         vfs.tmpfs_unlinked(dev, ino, 0, tracked);
     }
     // The unnamed dentry is displayed as <dir>/#<ino>, including at the root.
-    let base = display_path(cx, vfs, start, path, dir, None);
+    let root = cx.root();
+    let base = display_path(cx, vfs, &root, start, path, Some(dir), None);
     let mut name = base.as_deref().unwrap_or_default().to_vec();
     if !name.ends_with(b"/") {
         name.push(b'/');
@@ -5130,11 +5299,10 @@ fn write_file_inner(
                     let node = f
                         .ovl
                         .map_or(Node::Store(f.mnt, *ino), |o| Node::Overlay(f.mnt, o));
-                    let is_tmpfs = cx
-                        .t
-                        .vfs
-                        .as_deref()
-                        .is_some_and(|vfs| backing_tmpfs_dev(vfs, &node).is_some());
+                    let is_tmpfs =
+                        cx.t.vfs
+                            .as_deref()
+                            .is_some_and(|vfs| backing_tmpfs_dev(vfs, &node).is_some());
                     let sealed = cx.kr().seals.contains_key(ino);
                     Some((*ino, *cow, flags, append, is_tmpfs, sealed))
                 }
@@ -8515,14 +8683,14 @@ pub(super) fn unlinkat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> Sy
         return Err(Errno::EINVAL);
     }
     let path = read_path(cx, path)?;
-    unlink(cx, dirfd, path, flags).map(|()| 0)
+    unlink(cx, dirfd, &path, flags).map(|()| 0)
 }
 
-fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), Errno> {
-    let start = start_dir(cx, dirfd, &path)?;
+fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Result<(), Errno> {
+    let start = start_dir(cx, dirfd, path)?;
     let vfs = cx.vfs()?;
     let cred = cx.cred();
-    let (parent, name) = vfs.resolve_parent(&cx.view(&vfs), &cred, &cx.root(), &start, &path)?;
+    let (parent, name) = vfs.resolve_parent(&cx.view(&vfs), &cred, &cx.root(), &start, path)?;
     let rmdir = flags & AT_REMOVEDIR != 0;
     let slash = path.ends_with(b"/");
     match parent {
@@ -9969,7 +10137,7 @@ pub(super) fn utimensat(
         if flags != 0 {
             return Err(Errno::EINVAL);
         }
-        (Attrs::of_fd(cx, dirfd)?, Vec::new())
+        (Attrs::of_fd(cx, dirfd)?, PathBytes::empty())
     } else {
         let path = read_path(cx, path)?;
         (Attrs::at(cx, dirfd, &path, flags, follow)?, path)
@@ -11062,18 +11230,29 @@ fn store_ino(cx: &Cx<'_>, node: &Node) -> Result<Ino, Errno> {
 fn display_path(
     cx: &Cx<'_>,
     vfs: &Vfs,
+    root: &Node,
     start: &Node,
     path: &[u8],
-    node: &Node,
+    node: Option<&Node>,
     found: Option<&Dentry>,
 ) -> Option<Rc<[u8]>> {
-    if let Ok(p) = vfs.found_path(&cx.view(vfs), &cx.root(), node, found) {
+    if let Some((dir, name)) = found
+        && dir == root
+    {
+        let mut p = Vec::with_capacity(1 + name.len());
+        p.push(b'/');
+        p.extend_from_slice(name);
+        return Some(Rc::from(p));
+    }
+    if let Some(target) = node.or_else(|| found.map(|(dir, _)| dir))
+        && let Ok(p) = vfs.found_path(&cx.view(vfs), root, target, found)
+    {
         return Some(Rc::from(p));
     }
     let full = if path.first() == Some(&b'/') {
         path.to_vec()
     } else {
-        let mut p = vfs.reach(&cx.view(vfs), &cx.root(), start).ok()?.0;
+        let mut p = vfs.reach(&cx.view(vfs), root, start).ok()?.0;
         p.push(b'/');
         p.extend_from_slice(path);
         p
@@ -13871,8 +14050,12 @@ mod tests {
             let bulk_dst = 0x2100_0000u64;
             let bulk_len = 2 * 1024 * 1024 + 128 * 1024;
             let bulk_map = (bulk_len as u64).next_multiple_of(PAGE_SIZE);
-            cx.mm_mut().mmap(bulk_src, bulk_map, rw, fixed, None).unwrap();
-            cx.mm_mut().mmap(bulk_dst, bulk_map, rw, fixed, None).unwrap();
+            cx.mm_mut()
+                .mmap(bulk_src, bulk_map, rw, fixed, None)
+                .unwrap();
+            cx.mm_mut()
+                .mmap(bulk_dst, bulk_map, rw, fixed, None)
+                .unwrap();
             let pattern: Vec<u8> = (0..bulk_len).map(|i| ((i * 31) ^ (i >> 8)) as u8).collect();
             cx.write_user(UserSlice::new(bulk_src, bulk_len), &pattern)
                 .unwrap();
@@ -13893,8 +14076,12 @@ mod tests {
             // 2. Cross-VMA buffer (two adjacent anonymous VMAs -> multi-span preadv/pwritev).
             let vma_a = 0x2200_0000u64;
             let vma_b = vma_a + 2 * PAGE_SIZE;
-            cx.mm_mut().mmap(vma_a, 2 * PAGE_SIZE, rw, fixed, None).unwrap();
-            cx.mm_mut().mmap(vma_b, 2 * PAGE_SIZE, rw, fixed, None).unwrap();
+            cx.mm_mut()
+                .mmap(vma_a, 2 * PAGE_SIZE, rw, fixed, None)
+                .unwrap();
+            cx.mm_mut()
+                .mmap(vma_b, 2 * PAGE_SIZE, rw, fixed, None)
+                .unwrap();
             let cross_len = (4 * PAGE_SIZE) as usize;
             let cross_data: Vec<u8> = (0..cross_len).map(|i| (i as u8).wrapping_add(7)).collect();
             cx.write_user(UserSlice::new(vma_a, cross_len), &cross_data)
@@ -13907,10 +14094,17 @@ mod tests {
                 0o644,
             )
             .unwrap();
-            assert_eq!(pwrite(cx, fd_cross, vma_a, cross_len, 0), Ok(cross_len as u64));
+            assert_eq!(
+                pwrite(cx, fd_cross, vma_a, cross_len, 0),
+                Ok(cross_len as u64)
+            );
             let zeros = vec![0u8; cross_len];
-            cx.write_user(UserSlice::new(vma_a, cross_len), &zeros).unwrap();
-            assert_eq!(pread(cx, fd_cross, vma_a, cross_len, 0), Ok(cross_len as u64));
+            cx.write_user(UserSlice::new(vma_a, cross_len), &zeros)
+                .unwrap();
+            assert_eq!(
+                pread(cx, fd_cross, vma_a, cross_len, 0),
+                Ok(cross_len as u64)
+            );
             assert_eq!(read_guest(cx, vma_a, cross_len), cross_data);
 
             // 3. Partial EFAULT on read (2 valid pages + unmapped 3rd page): returns valid prefix
@@ -13938,7 +14132,9 @@ mod tests {
             //    from a CoW-borrowed buffer — neither may corrupt the peer.
             let cow_buf = 0x2300_0000u64;
             let cow_len = (4 * PAGE_SIZE) as usize;
-            cx.mm_mut().mmap(cow_buf, cow_len as u64, rw, fixed, None).unwrap();
+            cx.mm_mut()
+                .mmap(cow_buf, cow_len as u64, rw, fixed, None)
+                .unwrap();
             cx.write_user(UserSlice::new(cow_buf, cow_len), &vec![0x44; cow_len])
                 .unwrap();
             let peer_mm = cx.mm_mut().fork().unwrap();
@@ -13962,7 +14158,10 @@ mod tests {
                 0o644,
             )
             .unwrap();
-            assert_eq!(pwrite(cx, fd_cow_w, cow_buf, cow_len, 0), Ok(cow_len as u64));
+            assert_eq!(
+                pwrite(cx, fd_cow_w, cow_buf, cow_len, 0),
+                Ok(cow_len as u64)
+            );
             let mut verify = vec![0u8; cow_len];
             let f_cow_w = cx.fds().get(fd_cow_w).unwrap();
             assert_eq!(read_bytes(cx, &f_cow_w, &mut verify, Some(0)), Ok(cow_len));
@@ -13998,7 +14197,10 @@ mod tests {
             assert_eq!(lseek(cx, fd_app, 0, SEEK_SET), Ok(0));
             assert_eq!(write(cx, fd_app, bulk_src, 100), Ok(100));
             assert_eq!(lseek(cx, fd_app, 0, SEEK_CUR), Ok(app_len as u64 + 100));
-            assert_eq!(pread(cx, fd_app, bulk_dst, app_len + 100, 0), Ok(app_len as u64 + 100));
+            assert_eq!(
+                pread(cx, fd_app, bulk_dst, app_len + 100, 0),
+                Ok(app_len as u64 + 100)
+            );
             assert_eq!(read_guest(cx, bulk_dst, app_len), pattern[..app_len]);
             assert_eq!(
                 read_guest(cx, bulk_dst + app_len as u64, 100),
@@ -14018,7 +14220,10 @@ mod tests {
                 .unwrap();
             let below_stack = stack_top - 2 * PAGE_SIZE;
             assert!(!cx.mm().is_mapped(below_stack));
-            assert_eq!(pread(cx, fd_cross, below_stack, PAGE_SIZE as usize, 0), Ok(PAGE_SIZE));
+            assert_eq!(
+                pread(cx, fd_cross, below_stack, PAGE_SIZE as usize, 0),
+                Ok(PAGE_SIZE)
+            );
             assert!(cx.mm().is_mapped(below_stack));
             assert_eq!(
                 read_guest(cx, below_stack, PAGE_SIZE as usize),
@@ -14027,13 +14232,15 @@ mod tests {
 
             // 8. Memfd with sparse logical tail falls back cleanly and reads zeros past host EOF.
             let mfd_name = addr + 1024;
-            cx.write_user(UserSlice::new(mfd_name, 5), b"zcmf\0").unwrap();
+            cx.write_user(UserSlice::new(mfd_name, 5), b"zcmf\0")
+                .unwrap();
             let mfd = memfd_create(cx, mfd_name, 0).unwrap() as i32;
             assert_eq!(pwrite(cx, mfd, vma_a, 8, 0), Ok(8));
             let mfd_ino = cx.fds().get(mfd).unwrap().borrow().data_ino().unwrap();
             cx.vfs().unwrap().set_memfd_size(mfd_ino, 32);
             let mfd_out = addr + 2048;
-            cx.write_user(UserSlice::new(mfd_out, 32), &[0xee; 32]).unwrap();
+            cx.write_user(UserSlice::new(mfd_out, 32), &[0xee; 32])
+                .unwrap();
             assert_eq!(pread(cx, mfd, mfd_out, 32, 0), Ok(32));
             let got = read_guest(cx, mfd_out, 32);
             assert_eq!(&got[..8], &cross_data[..8]);
@@ -14042,6 +14249,211 @@ mod tests {
             for f in [fd, fd_cross, fd_cow_w, fd_lim, fd_app, mfd] {
                 close(cx, f).unwrap();
             }
+        });
+    }
+
+    #[test]
+    fn openat_create_edge_cases_and_read_path_buf() {
+        with_guest(0, |cx, addr, _| {
+            let write_str = |cx: &Cx<'_>, at: u64, s: &[u8]| {
+                let mut z = s.to_vec();
+                z.push(0);
+                cx.write_user(UserSlice::new(at, z.len()), &z).unwrap();
+            };
+
+            // 1. Nested directory creation (single-walk parent-first fast path) + O_EXCL.
+            write_str(cx, addr, b"/tmp/nested");
+            assert_eq!(mkdirat(cx, AT_FDCWD, addr, 0o755), Ok(0));
+            let fd = open(
+                cx,
+                addr,
+                b"/tmp/nested/newfile",
+                oflags::O_CREAT | oflags::O_EXCL | oflags::O_RDWR,
+                0o644,
+            )
+            .unwrap();
+            assert_eq!(
+                cx.fds().get(fd).unwrap().borrow().path.as_deref(),
+                Some(b"/tmp/nested/newfile".as_slice())
+            );
+            close(cx, fd).unwrap();
+            // O_CREAT | O_EXCL on existing file returns EEXIST.
+            assert_eq!(
+                open(
+                    cx,
+                    addr,
+                    b"/tmp/nested/newfile",
+                    oflags::O_CREAT | oflags::O_EXCL | oflags::O_RDWR,
+                    0o644,
+                ),
+                Err(Errno::EEXIST)
+            );
+            // Root-level file exercises the `dir == root` display_path fast path.
+            let root_fd = open(
+                cx,
+                addr,
+                b"/root-fast-path",
+                oflags::O_CREAT | oflags::O_EXCL | oflags::O_RDWR,
+                0o644,
+            )
+            .unwrap();
+            assert_eq!(
+                cx.fds().get(root_fd).unwrap().borrow().path.as_deref(),
+                Some(b"/root-fast-path".as_slice())
+            );
+            close(cx, root_fd).unwrap();
+
+            // 2. Dangling symlinks: O_CREAT|O_EXCL -> EEXIST; O_CREAT|O_NOFOLLOW -> ELOOP;
+            //    O_CREAT follows dangling symlink (both relative and absolute) and creates target.
+            let target_addr = addr + 256;
+            write_str(cx, target_addr, b"dangling_target");
+            write_str(cx, addr, b"/tmp/nested/rel_link");
+            assert_eq!(symlinkat(cx, target_addr, AT_FDCWD, addr), Ok(0));
+            assert_eq!(
+                open(
+                    cx,
+                    addr,
+                    b"/tmp/nested/rel_link",
+                    oflags::O_CREAT | oflags::O_EXCL | oflags::O_RDWR,
+                    0o644,
+                ),
+                Err(Errno::EEXIST)
+            );
+            assert_eq!(
+                open(
+                    cx,
+                    addr,
+                    b"/tmp/nested/rel_link",
+                    oflags::O_CREAT | oflags::O_NOFOLLOW | oflags::O_RDWR,
+                    0o644,
+                ),
+                Err(Errno::ELOOP)
+            );
+            let sym_fd = open(
+                cx,
+                addr,
+                b"/tmp/nested/rel_link",
+                oflags::O_CREAT | oflags::O_RDWR,
+                0o644,
+            )
+            .unwrap();
+            assert_eq!(
+                cx.fds().get(sym_fd).unwrap().borrow().path.as_deref(),
+                Some(b"/tmp/nested/dangling_target".as_slice())
+            );
+            close(cx, sym_fd).unwrap();
+
+            write_str(cx, target_addr, b"/tmp/nested/abs_target");
+            write_str(cx, addr, b"/tmp/nested/abs_link");
+            assert_eq!(symlinkat(cx, target_addr, AT_FDCWD, addr), Ok(0));
+            let abs_fd = open(
+                cx,
+                addr,
+                b"/tmp/nested/abs_link",
+                oflags::O_CREAT | oflags::O_RDWR,
+                0o644,
+            )
+            .unwrap();
+            assert_eq!(
+                cx.fds().get(abs_fd).unwrap().borrow().path.as_deref(),
+                Some(b"/tmp/nested/abs_target".as_slice())
+            );
+            close(cx, abs_fd).unwrap();
+
+            // 3. Trailing slash, `.` and `..` with O_CREAT -> EISDIR.
+            for bad in [
+                b"/tmp/nested/trailing/".as_slice(),
+                b"/tmp/nested/.".as_slice(),
+                b"/tmp/nested/..".as_slice(),
+            ] {
+                assert_eq!(
+                    open(cx, addr, bad, oflags::O_CREAT | oflags::O_RDWR, 0o644),
+                    Err(Errno::EISDIR),
+                    "expected EISDIR for {:?}",
+                    std::str::from_utf8(bad)
+                );
+            }
+
+            // 4. Sticky world-writable directory enforces protected_regular on existing O_CREAT.
+            write_str(cx, addr, b"/tmp/sticky");
+            assert_eq!(mkdirat(cx, AT_FDCWD, addr, 0o1777), Ok(0));
+            cx.vfs()
+                .unwrap()
+                .store()
+                .set_owner_mode(
+                    cx.vfs()
+                        .unwrap()
+                        .store()
+                        .lookup(
+                            cx.vfs()
+                                .unwrap()
+                                .store()
+                                .lookup(crate::vfs::store::ROOT, b"tmp")
+                                .unwrap()
+                                .unwrap(),
+                            b"sticky",
+                        )
+                        .unwrap()
+                        .unwrap(),
+                    0o1777,
+                    0,
+                    0,
+                )
+                .unwrap();
+            // Owner uid 1000 creates file in root-owned sticky 01777 dir; uid 2000 opening it with
+            // O_CREAT must fail with EACCES under default protected_regular = 2.
+            let saved_cred = cx.cred();
+            {
+                let mut c = saved_cred.clone();
+                c.ruid = 1000;
+                c.euid = 1000;
+                c.fsuid = 1000;
+                c.cap_effective = 0;
+                cx.set_cred(c);
+            }
+            let sticky_fd = open(
+                cx,
+                addr,
+                b"/tmp/sticky/victim",
+                oflags::O_CREAT | oflags::O_RDWR,
+                0o666,
+            )
+            .unwrap();
+            close(cx, sticky_fd).unwrap();
+            {
+                let mut c = saved_cred.clone();
+                c.ruid = 2000;
+                c.euid = 2000;
+                c.fsuid = 2000;
+                c.cap_effective = 0;
+                cx.set_cred(c);
+            }
+            assert_eq!(
+                open(
+                    cx,
+                    addr,
+                    b"/tmp/sticky/victim",
+                    oflags::O_CREAT | oflags::O_RDWR,
+                    0o666,
+                ),
+                Err(Errno::EACCES)
+            );
+            cx.set_cred(saved_cred);
+
+            // 5. `read_path_buf` stays inline up to 256 bytes and spills to heap cleanly above 256.
+            let short = b"/tmp/short";
+            write_str(cx, addr, short);
+            let p_short = read_path(cx, addr).unwrap();
+            assert!(matches!(p_short, PathBytes::Inline { .. }));
+            assert_eq!(&*p_short, short);
+
+            let long: Vec<u8> = std::iter::once(b'/')
+                .chain(std::iter::repeat_n(b'a', 300))
+                .collect();
+            write_str(cx, addr, &long);
+            let p_long = read_path(cx, addr).unwrap();
+            assert!(matches!(p_long, PathBytes::Heap(_)));
+            assert_eq!(&*p_long, &long[..]);
         });
     }
 }
