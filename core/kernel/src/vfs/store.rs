@@ -651,6 +651,7 @@ impl Store {
                 ..Cache::default()
             }),
             commits,
+            mutations: AtomicU64::new(0),
             store_id,
             objects_dir,
             reaper: Reaper::default(),
@@ -888,7 +889,10 @@ impl Store {
         )?;
         self.exec("DELETE FROM shared WHERE ino NOT IN (SELECT ino FROM inodes WHERE nlink > 0)")?;
         if !released.is_empty() {
-            let old = self.update(|c| c.take_clear(c.generation));
+            let old = self.update(|c| {
+                self.meta.note_mutation();
+                c.take_clear(c.generation)
+            });
             drop(old);
         }
         let orphans = query(
@@ -2339,11 +2343,13 @@ impl Store {
         set: impl FnOnce() -> Result<(), Errno>,
     ) -> Result<(), Errno> {
         if atime.is_none() {
+            self.meta.note_mutation();
             set()?;
             self.object_modified(ino);
             return Ok(());
         }
         self.statement(|s| {
+            s.meta.note_mutation();
             set()?;
             s.object_modified(ino);
             s.write_atime(ino, read_atime()?)
@@ -2485,7 +2491,10 @@ impl Store {
         }
         let commits = self.meta.commits.get();
         let evicted = self.update(|c| {
-            let cleared = (c.generation != commits).then(|| c.take_clear(commits));
+            let cleared = (c.generation != commits).then(|| {
+                self.meta.note_mutation();
+                c.take_clear(commits)
+            });
             let stale = if c.relatime_state != before_users {
                 c.last_relatime = None;
                 c.relatime_state = before_users;
@@ -2689,7 +2698,10 @@ impl Store {
             if !self.db().is_autocommit() {
                 let _ = self.exec("ROLLBACK");
             }
-            let old = self.update(|c| c.take_clear(c.generation));
+            let old = self.update(|c| {
+                self.meta.note_mutation();
+                c.take_clear(c.generation)
+            });
             drop(old);
             *self.changed_backings.borrow_mut() = None;
             self.rollback_tmpfiles(0);
@@ -2712,6 +2724,7 @@ impl Store {
                 c.generation = before + 1;
                 None
             } else {
+                self.meta.note_mutation();
                 Some(c.take_clear(before + 1))
             }
         });
@@ -2809,7 +2822,10 @@ impl Store {
     fn cache_generation(&self) -> Option<u64> {
         let now = self.meta.commits.get();
         if self.cached(|c| c.generation != now) {
-            let old = self.update(|c| c.take_clear(now));
+            let old = self.update(|c| {
+                self.meta.note_mutation();
+                c.take_clear(now)
+            });
             drop(old);
         }
         (!self.writing.get()).then_some(now)
@@ -2851,13 +2867,17 @@ impl Store {
         self.fills
             .borrow_mut()
             .retain(|f| !matches!(f, Fill::Row(st) if st.ino == ino));
-        self.update(|c| c.touch_ino(ino));
+        self.update(|c| {
+            self.meta.note_mutation();
+            c.touch_ino(ino);
+        });
     }
 
     /// Marks regular file `ino`'s host object as modified outside SQLite (data write, truncate,
     /// fallocate, copy, writable shared mapping, or host-only mtime update) so cached regular-file
     /// host stats and `relatime` state are re-checked on the next read.
     pub(crate) fn object_modified(&self, ino: Ino) {
+        self.meta.note_mutation();
         if self.cached(|c| c.has_object_or_relatime(ino)) {
             self.update(|c| c.invalidate_object(ino));
         }
@@ -3044,6 +3064,7 @@ impl Store {
     /// Truncates a regular file.
     pub fn truncate(&self, ino: Ino, len: u64) -> Result<(), Errno> {
         self.make_private(ino, Some(len))?;
+        self.meta.note_mutation();
         self.open_object(ino, true)?.set_len(len).map_err(io_err)?;
         self.object_modified(ino);
         Ok(())
@@ -3378,6 +3399,7 @@ impl Store {
     /// on the object, whose ctime becomes now (the file is about to change anyway), and its row in
     /// `shared` goes when the object is the file's own.
     fn settle(&self, ino: Ino, object: Ino, (atime, mtime): (i64, i64)) -> Result<(), Errno> {
+        self.meta.note_mutation();
         let mut name = [0u8; 21];
         appine_hal::set_times_at(
             self.meta.objects_dir.as_raw_fd(),
@@ -3615,6 +3637,10 @@ pub(crate) struct Meta {
     cache: UnsafeCell<Cache>,
     /// The commit counter at the start of the `lock` file (module docs).
     commits: Commits,
+    /// Monotonic counter bumped on local cache/object invalidations and mutations (including
+    /// deferred uncommitted transactions) so an unlocked [`Reader::stat`] miss cannot return a
+    /// torn `Stat` combining a pre-mutation row with post-mutation host object metadata.
+    mutations: AtomicU64,
     /// The store's identity (`(st_dev, st_ino)` of `objects/`), matching [`HOST_WRITERS`].
     store_id: (u64, u64),
     /// The `objects` directory (a host `O_PATH`), so stat-ing an object by inode number need not
@@ -3691,6 +3717,11 @@ impl Meta {
         self.durable.fetch_max(seen + 1, Ordering::AcqRel);
         self.reaper.wake_retry();
     }
+
+    #[inline]
+    fn note_mutation(&self) {
+        self.mutations.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 // SAFETY: the cache is synchronized by the convention above; the commit counter is an atomic in a
@@ -3749,8 +3780,13 @@ impl Reader<'_> {
 
     /// [`Store::stat`]. Returns cached regular-file host metadata when valid; on a miss, snapshots
     /// the row and releases the cache read lock before calling host `fstatat` so BKL writers
-    /// waiting on the write lock are never stalled behind host I/O. None on a miss or host error.
+    /// waiting on the write lock are never stalled behind host I/O. Bails (`None`) if any commit
+    /// or local deferred mutation raced with the unlocked host stat.
     pub fn stat(self, ino: Ino) -> Option<Stat> {
+        self.stat_in(ino, || {})
+    }
+
+    fn stat_in(self, ino: Ino, on_miss: impl FnOnce()) -> Option<Stat> {
         let (mut st, data) = self.cache.row(ino)?.clone();
         if st.kind() != mode::S_IFREG {
             return Some(st);
@@ -3762,9 +3798,11 @@ impl Reader<'_> {
         // Snapshot what host fstatat needs and release Meta::lock.read() before touching the host.
         let meta = self.meta;
         let gen_before = self.cache.generation;
+        let mut_before = meta.mutations.load(Ordering::Acquire);
         drop(self);
+        on_miss();
         let obj = stat_host_object(meta, data.object).ok()?;
-        if meta.commits.get() != gen_before {
+        if meta.commits.get() != gen_before || meta.mutations.load(Ordering::SeqCst) != mut_before {
             return None;
         }
         apply_object_stat(&mut st, obj, data);
@@ -7085,5 +7123,75 @@ mod tests {
         assert_eq!(cache.lookup(ROOT, b"g0"), Some(Some(1_000_000)));
         assert_eq!(cache.hot.entries, 0);
         assert_eq!(cache.cold.entries, Cache::GEN_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn reader_stat_releases_lock_and_bails_on_uncommitted_mutations() {
+        let (s, dir) = temp_store("reader-stat-uncommitted-race");
+        let (f, mut file) = s.create_file(ROOT, b"f", 0o644, 0, 0).unwrap();
+        let (g, _) = s.create_file(ROOT, b"g", 0o644, 0, 0).unwrap();
+        file.write_all(b"hello world").unwrap();
+        s.object_modified(f);
+        s.commit().unwrap();
+
+        // Populate `rows` without populating `object_stats` by reading `attrs(f)` (and verifying
+        // `stat_in` enters the unlocked miss path).
+        let gen_before = s.meta.commits.get();
+        let _ = s.attrs(f).unwrap();
+
+        // Each mutation below runs inside `on_miss` AFTER `Reader` drops `Meta::lock.read()` and
+        // BEFORE `stat_host_object`. Running on the same thread proves `Meta::lock.read()` was
+        // released (otherwise `Meta::lock.write()` would deadlock), and `temp_store`'s 3600s delay
+        // keeps `commits` unchanged while proving `Reader::stat` bails (`None`) instead of
+        // returning a torn `Stat`.
+
+        // 1. Deferred `set_mode` (chmod) mutates row + host ctime without committing.
+        let r = s.meta().reader().unwrap().stat_in(f, || {
+            s.set_mode(f, 0o600).unwrap();
+        });
+        assert_eq!(r, None, "uncommitted set_mode must make Reader::stat bail");
+        assert_eq!(s.meta.commits.get(), gen_before);
+
+        // 2. Re-populate `rows`, then run `truncate` without committing.
+        let _ = s.attrs(f).unwrap();
+        let r = s.meta().reader().unwrap().stat_in(f, || {
+            s.truncate(f, 5).unwrap();
+        });
+        assert_eq!(r, None, "uncommitted truncate must make Reader::stat bail");
+        assert_eq!(s.meta.commits.get(), gen_before);
+
+        // 3. Re-populate `rows`, then run mtime-only `set_times` without committing.
+        let _ = s.attrs(f).unwrap();
+        let r = s.meta().reader().unwrap().stat_in(f, || {
+            s.set_times(f, None, Some(FileTime::At(3_000_000_000)))
+                .unwrap();
+        });
+        assert_eq!(r, None, "uncommitted set_times must make Reader::stat bail");
+        assert_eq!(s.meta.commits.get(), gen_before);
+
+        // 4. Re-populate `rows`, then call `object_modified` (even when `f` is absent from
+        // `object_stats` and `relatime_fresh`).
+        let _ = s.attrs(f).unwrap();
+        let r = s.meta().reader().unwrap().stat_in(f, || {
+            s.object_modified(f);
+        });
+        assert_eq!(r, None, "object_modified must make Reader::stat bail");
+        assert_eq!(s.meta.commits.get(), gen_before);
+
+        // 5. Re-populate `rows`, then run deferred `share` (transitions `f` to held).
+        let _ = s.attrs(f).unwrap();
+        let r = s.meta().reader().unwrap().stat_in(f, || {
+            s.share(f, g).unwrap();
+        });
+        assert_eq!(r, None, "uncommitted share must make Reader::stat bail");
+        assert_eq!(s.meta.commits.get(), gen_before);
+
+        // 6. Without a racing mutation, the unlocked miss succeeds with accurate metadata.
+        let _ = s.attrs(f).unwrap();
+        let st = s.meta().reader().unwrap().stat_in(f, || {}).unwrap();
+        assert_eq!((st.mode & 0o7777, st.size), (0o600, 5));
+
+        drop((file, s));
+        let _ = fs::remove_dir_all(&dir);
     }
 }
