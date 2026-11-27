@@ -392,8 +392,7 @@ static uint32_t *emit_lookup(struct xlate *x, struct appine_dbt *d)
     patch_branch(x->wdelta, found[1], here(x));
     emit_seq_step(x);
     emit(x, enc_ldr_x(0, CTX, offsetof(struct appine_cpu, dbt_jump_cache)));
-    emit(x, enc_eor_lsr(1, T0, T0, JC_BITS));
-    emit(x, enc_ubfx(1, 1, 2, JC_BITS));
+    emit(x, enc_ubfx(1, T0, 2, JC_BITS));
     emit(x, enc_add_lsl(0, 0, 1, 4));
     emit(x, enc_stp_x(T0, T2, 0, 0));
     emit(x, enc_mov(T1, T2));
@@ -430,16 +429,15 @@ static void move_guest_regs(struct xlate *x, unsigned base, bool store)
 }
 
 /*
- * Shared RET X30 shadow-stack miss path: probe the thread-local jump cache with the XOR-folded
- * index for raw X30 and jump directly on hit, else fall through to d->lookup (which applies TBI0).
+ * Shared RET X30 shadow-stack miss path: probe the thread-local jump cache for raw X30 and jump
+ * directly on hit, else fall through to d->lookup (which applies TBI0).
  */
 static uint32_t *emit_ret_miss(struct xlate *x, struct appine_dbt *d)
 {
     uint32_t *entry = here(x);
     emit(x, enc_mov(T0, 30));
     emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, dbt_jump_cache)));
-    emit(x, enc_eor_lsr(T2, T0, T0, JC_BITS));
-    emit(x, enc_ubfx(T2, T2, 2, JC_BITS));
+    emit(x, enc_ubfx(T2, T0, 2, JC_BITS));
     emit(x, enc_add_lsl(T1, T1, T2, 4));
     emit(x, enc_ldp_x(T2, T1, T1, 0));
     emit(x, enc_eor_lsr(T2, T2, T0, 0));

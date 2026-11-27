@@ -6765,16 +6765,16 @@ fn eager_inline_linking_and_multithreaded_cond_pretranslate() {
     target_arch = "aarch64",
     any(target_os = "linux", target_os = "android")
 ))]
-fn ret_miss_out_of_line_and_xor_folded_jump_cache() {
+fn ret_miss_out_of_line_jump_cache_and_tbi0() {
     for regs in [DbtRegs::Default, DbtRegs::Go] {
-        // Map two code pages separated by exactly 16 KiB (JC_SIZE * 4) so naive (pc >> 2) & 0xfff
-        // collides, while XOR-folded ((pc ^ (pc >> 12)) >> 2) & 0xfff maps them to distinct slots.
+        // Map three code pages at distinct jump-cache indices to exercise d->ret_miss hits,
+        // misses, warm reuse with zero exits_lookup, and TBI0-tagged X30 fallback.
         let mut pages: Box<[Page]> = (0..4).map(|_| Page([0; 4096])).collect();
         let mut mmu = Mmu::new();
         let base = NonNull::new(pages.as_mut_ptr().cast::<u8>()).unwrap();
         let code_a = 0x40_0000u64;
-        let code_b = code_a + 16 * 1024;
-        let code_c = code_a + 32 * 1024;
+        let code_b = code_a + PAGE_SIZE;
+        let code_c = code_a + 2 * PAGE_SIZE;
         let stack = 0x80_0000u64;
         unsafe {
             mmu.map(code_a, base, PAGE_SIZE, prot::READ | prot::EXEC).unwrap();
@@ -6789,18 +6789,12 @@ fn ret_miss_out_of_line_and_xor_folded_jump_cache() {
                 pages[page_idx].0[at..at + 4].copy_from_slice(&w.to_le_bytes());
             }
         };
-        // Dispatcher loop at code_c: loads x30 = target (alternating code_a and code_b via x2/x3),
-        // executes RET X30 (mispredicted shadow stack -> d->ret_miss -> jump cache!)
-        // code_a and code_b each increment x1, swap x2/x3, decrement x0, and RET to code_c if x0 > 0.
-        // Simpler: code_c has [mov x30, x2; ret] (mispredicted -> ret_miss -> target),
-        // code_a has [add x1, x1, #1; mov x2, x3; mov x3, x4; subs x0, x0, #1; b.eq done; mov x30, x5; ret; done: svc]
-        // Even simpler: use BR X2 in a loop alternating code_a and code_b, plus RET X30 mismatch!
         let br_x2 = 0xd61f_0040u32; // br x2
         let mov_x30_x2 = 0xaa02_03feu32; // mov x30, x2
         let mov_x30_x3 = 0xaa03_03feu32; // mov x30, x3
         let mov_x30_x4 = 0xaa04_03feu32; // mov x30, x4
         let subs_x0_1 = 0xf100_0400u32; // subs x0, x0, #1
-        // code_a (+0): add x1, x1, #1; mov x30, x3; ret (jumps to code_b via ret_miss)
+        // code_a (+0): add x1, x1, #1; mov x30, x3; ret (jumps to code_b via d->ret_miss)
         write_code(&mut pages, 0, 0, &[ADD_X1_1, mov_x30_x3, RET]);
         // code_b (+0): add x1, x1, #2; subs x0, x0, #1; cbz x0, +8; mov x30, x2; ret; svc
         write_code(
@@ -6836,8 +6830,7 @@ fn ret_miss_out_of_line_and_xor_folded_jump_cache() {
         assert_eq!(cpu.state().x[1], 150);
         let lookups_after_warm = dbt.stats().exits_lookup;
 
-        // Second run: both 16 KiB-aliased targets (code_a, code_b) must stay resident in t->jc
-        // with zero additional exits_lookup!
+        // Second run: both targets stay resident in t->jc via d->ret_miss with zero exits_lookup.
         {
             let s = cpu.state_mut();
             s.x[0] = 50;
@@ -6849,7 +6842,7 @@ fn ret_miss_out_of_line_and_xor_folded_jump_cache() {
         assert_eq!(
             dbt.stats().exits_lookup,
             lookups_after_warm,
-            "16 KiB-spaced targets should not collide in XOR-folded t->jc ({regs:?})"
+            "warm d->ret_miss targets should hit t->jc without exits_lookup ({regs:?})"
         );
 
         // Tagged X30 (TBI0) on RET X30 -> d->ret_miss -> d->lookup untags and succeeds.
@@ -7039,8 +7032,6 @@ fn inlined_sysregs_dit_fpsr_and_128bit_exclusives_match_tier0() {
         // 3. 128-bit and 64-bit pair exclusives (LDAXP/STLXP, LDXP/STXP): success, mismatch,
         //    stolen registers, and alignment fault.
         let f_excl = CODE + 0x300;
-        let ldaxp_stolen = 0xc87f_8160 | (stolen << 10) | stolen; // ldaxp xS, xS, [x11] -> wait: use distinct regs
-        let _ = ldaxp_stolen;
         let s1 = stolen;
         let s2 = match regs {
             DbtRegs::Default => 17u32,

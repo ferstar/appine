@@ -1272,8 +1272,7 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
         if (reg_branch == 0xd63f0000)
             emit_call(x, pc);
         emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, dbt_jump_cache)));
-        emit(x, enc_eor_lsr(T2, T0, T0, JC_BITS));
-        emit(x, enc_ubfx(T2, T2, 2, JC_BITS));
+        emit(x, enc_ubfx(T2, T0, 2, JC_BITS));
         emit(x, enc_add_lsl(T1, T1, T2, 4));
         emit(x, enc_ldp_x(T2, T1, T1, 0));
         emit(x, enc_eor_lsr(T2, T2, T0, 0));

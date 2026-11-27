@@ -176,11 +176,9 @@ _Static_assert(offsetof(struct appine_cpu, dbt_fp_loaded) < TLB_OFF,
 _Static_assert(offsetof(struct appine_cpu, nwatch) < TLB_OFF,
                "nwatch is read directly with ldr in refill and fast-loop prologues");
 
-/* XOR-fold bits [25:14] into [13:2] to eliminate 16 KiB aliasing in the 4096-entry jump cache.
- * Empty entries (jc_empty) have all bits >= 14 clear, so their folded index still differs from i. */
 static inline unsigned jc_index(uint64_t pc)
 {
-    return (unsigned)(((pc ^ (pc >> JC_BITS)) >> 2) & (JC_SIZE - 1));
+    return (unsigned)((pc >> 2) & (JC_SIZE - 1));
 }
 
 struct slot {
