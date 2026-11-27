@@ -6489,20 +6489,10 @@ fn lazy_fp_state_across_blocks_exits_and_fpsr_fpcr() {
                 ],
             );
             g.code(f_mrs_fpsr, &[ADD_X1_1, MRS_FPSR_X2, SVC]);
-            g.code(
-                f_kick_loop,
-                &[
-                    SUB_X0_1,
-                    b(f_kick_loop + 4, f_kick_fp),
-                ],
-            );
+            g.code(f_kick_loop, &[SUB_X0_1, b(f_kick_loop + 4, f_kick_fp)]);
             g.code(
                 f_kick_fp,
-                &[
-                    FADD_D0_D1_D2,
-                    cbnz_x0(f_kick_fp + 4, f_kick_loop),
-                    SVC,
-                ],
+                &[FADD_D0_D1_D2, cbnz_x0(f_kick_fp + 4, f_kick_loop), SVC],
             );
             g.code(f_simd_ldst, &[LDR_Q4_X5, STR_Q0_X5, SVC]);
         }
@@ -6777,11 +6767,24 @@ fn ret_miss_out_of_line_jump_cache_and_tbi0() {
         let code_c = code_a + 2 * PAGE_SIZE;
         let stack = 0x80_0000u64;
         unsafe {
-            mmu.map(code_a, base, PAGE_SIZE, prot::READ | prot::EXEC).unwrap();
-            mmu.map(code_b, base.add(4096), PAGE_SIZE, prot::READ | prot::EXEC).unwrap();
-            mmu.map(code_c, base.add(2 * 4096), PAGE_SIZE, prot::READ | prot::EXEC).unwrap();
-            mmu.map(stack - PAGE_SIZE, base.add(3 * 4096), PAGE_SIZE, prot::READ | prot::WRITE)
+            mmu.map(code_a, base, PAGE_SIZE, prot::READ | prot::EXEC)
                 .unwrap();
+            mmu.map(code_b, base.add(4096), PAGE_SIZE, prot::READ | prot::EXEC)
+                .unwrap();
+            mmu.map(
+                code_c,
+                base.add(2 * 4096),
+                PAGE_SIZE,
+                prot::READ | prot::EXEC,
+            )
+            .unwrap();
+            mmu.map(
+                stack - PAGE_SIZE,
+                base.add(3 * 4096),
+                PAGE_SIZE,
+                prot::READ | prot::WRITE,
+            )
+            .unwrap();
         }
         let write_code = |pages: &mut [Page], page_idx: usize, off: usize, insns: &[u32]| {
             for (i, &w) in insns.iter().enumerate() {
@@ -6877,15 +6880,15 @@ fn grouping_continues_past_out_of_span_tpidr_and_ldar_stlr_and_wide_span() {
         let mut g_t0 = Guest::with_data();
         let mut dbt = Dbt::with_regs(regs).expect("tier 1");
         let prog = [
-            LDR_X0_X2_0,     // leader (offset 0)
-            MRS_X10_TPIDR,   // allowed without breaking group or clobbering T2
-            LDR_X5_X2_16,    // grouped #1 (offset 16)
-            LDAR_X11_X3,     // allowed atomic (clobbers T2 -> reload)
-            LDR_X6_X2_24,    // grouped #2 (offset 24)
-            STLR_X11_X3,     // allowed release store (clobbers T2 -> reload)
-            LDR_X4_X2_3072,  // out-of-span (> GROUP_SPAN=2048): skipped with clobbered=true!
-            LDR_X1_X2_1536,  // grouped #3 (offset 1536 <= GROUP_SPAN=2048!)
-            LDR_X7_X2_32,    // grouped #4 (offset 32)
+            LDR_X0_X2_0,    // leader (offset 0)
+            MRS_X10_TPIDR,  // allowed without breaking group or clobbering T2
+            LDR_X5_X2_16,   // grouped #1 (offset 16)
+            LDAR_X11_X3,    // allowed atomic (clobbers T2 -> reload)
+            LDR_X6_X2_24,   // grouped #2 (offset 24)
+            STLR_X11_X3,    // allowed release store (clobbers T2 -> reload)
+            LDR_X4_X2_3072, // out-of-span (> GROUP_SPAN=2048): skipped with clobbered=true!
+            LDR_X1_X2_1536, // grouped #3 (offset 1536 <= GROUP_SPAN=2048!)
+            LDR_X7_X2_32,   // grouped #4 (offset 32)
             SVC,
         ];
         g_t1.code(CODE, &prog);
@@ -7017,7 +7020,11 @@ fn inlined_sysregs_dit_fpsr_and_128bit_exclusives_match_tier0() {
             let interp_d = dbt.stats().exits_interp;
             assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
             assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
-            assert_eq!(dbt.stats().exits_interp, interp_d, "DIT should be inline ({regs:?})");
+            assert_eq!(
+                dbt.stats().exits_interp,
+                interp_d,
+                "DIT should be inline ({regs:?})"
+            );
             assert_eq!(g_t1.cpu.state().x, g_t0.cpu.state().x);
             assert_eq!(g_t1.cpu.state().dit, 1);
             assert_eq!(g_t1.cpu.state().nzcv, 0xa000_0000);
@@ -7075,9 +7082,21 @@ fn inlined_sysregs_dit_fpsr_and_128bit_exclusives_match_tier0() {
         assert_eq!(g_t1.cpu.state().nzcv, 0x5000_0000);
         assert_eq!(g_t1.data(0, 0), g_t0.data(0, 0));
         assert_eq!(g_t1.data(0, 8), g_t0.data(0, 8));
-        assert_eq!(g_t1.cpu.state().x[0], 1, "unreserved stlxp must fail with 1");
-        assert_eq!(g_t1.cpu.state().x[14], 0, "reserved stxp must succeed with 0");
-        assert_eq!(g_t1.cpu.state().x[s1 as usize], 0, "stolen stlxp must succeed with 0");
+        assert_eq!(
+            g_t1.cpu.state().x[0],
+            1,
+            "unreserved stlxp must fail with 1"
+        );
+        assert_eq!(
+            g_t1.cpu.state().x[14],
+            0,
+            "reserved stxp must succeed with 0"
+        );
+        assert_eq!(
+            g_t1.cpu.state().x[s1 as usize],
+            0,
+            "stolen stlxp must succeed with 0"
+        );
 
         // Misaligned 16-byte LDAXP must fault identically to Tier 0.
         let f_align = CODE + 0x380;
