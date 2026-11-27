@@ -97,8 +97,8 @@ triggers (`kernel/oom`).
   to `code`. Blocks whose scan (`scan_block_uses_fp`, plus page-1 rescan for cross-page fast loops)
   finds any FP/SIMD or `FPSR` instruction emit a 2-word `dbt_fp_loaded` check at
   `code[ENTRY_CHECK_WORDS]` (after any integer memop gate, before fast loops or guest code) that
-  calls shared `d->load_fp` to save host `d8–d15`/FPCR, load guest FPCR (skipping `msr fpcr` when
-  unchanged), FPSR (`emit_set_fpsr_if_changed`) and `V0–V31`, and set `dbt_fp_loaded = 1`.
+  calls shared `d->load_fp` to save host `d8–d15`/FPCR, load guest FPCR and FPSR (skipping `msr`
+  when unchanged via `emit_msr_if_changed`) and `V0–V31`, and set `dbt_fp_loaded = 1`.
   `d->exit` saves `T0/T1/T2` (`pc`, `dbt_site`), NZCV, non-stolen GPRs and `SP_HOST`, and saves
   `V0–V31`/host FPSR and restores host `d8–d15`/FPCR only when `dbt_fp_loaded != 0` (clearing it;
   `guard.c` also clears `dbt_fp_loaded` on host-fault recovery). `appine_dbt_run` syncs host
@@ -212,7 +212,7 @@ triggers (`kernel/oom`).
   instruction.
 - Supports up to 7 pointer-opaque root bases (including zero-stride `M_OFFSET` SP bases and live
   end-of-iteration affine aliases not read before write) and up to 16 coalesced streams (positive
-  and negative constant strides, offset/pre/post-index, shifted-`ADD` derived pointers `sym_pidx`
+  and negative constant strides, offset/pre/post-index, shifted-`ADD` derived pointers (`fl_pidx`)
   feeding `LDP`/`STP`/`LD1–LD4`/`ST1–ST4`/`LDUR`, `M_REG` with loop-invariant, 64-bit or 32-bit
   `UXTW`/`SXTW` monotonic induction, derived shifted-sum `(r0 + r1 + off) << 0..4`, or
   intra-iteration bit-width-bounded table-lookup `u_bits` indices with `(1 << u_bits) << shift <= 4096`,
@@ -437,9 +437,8 @@ triggers (`kernel/oom`).
   bucket because fast loops never emit `R_UNGROUP`.
 - `appine_dbt_run` absorbs `R_CODE` and Tier 0 `APPINE_EXIT_CODE` in place, but returns immediately
   on other Tier 0 exits leaving any pending `c->ivau_page` for the kernel caller to invalidate.
-- `dbt_routines.c` has a minor comment/code discrepancy (`emit_refill` comment says `x0–x4` while
-  saving `x0–x5`). Any new Tier 1 instruction touching host V/FPCR/FPSR must be included in
-  `insn_uses_fp`, and any new exit bypassing `d->exit` must clear `dbt_fp_loaded`.
+- Any new Tier 1 instruction touching host V/FPCR/FPSR must be included in `insn_uses_fp`, and any
+  new exit bypassing `d->exit` must clear `dbt_fp_loaded`.
 
 ## Confirmed bugs / technical debt
 
