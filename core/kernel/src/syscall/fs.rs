@@ -4790,6 +4790,69 @@ fn read_file_inner(
     let _pos = PosGuard::lock_positioned(cx, file, !pos_held && offset.is_none(), io.nowait)?;
     let held = pos_held || _pos.is_some();
     verify_read_range(&file.borrow(), offset, requested)?;
+    // Zero-copy path for regular store files without a sparse memfd logical tail: pin the guest
+    // buffer's covering `Arc<HostRegion>`s (settling CoW and holding `io_write_pins` so
+    // concurrent `Mm::fork` copies instead of lending) and run host `pread`/`preadv` directly.
+    let mut done = 0;
+    if matches!(file.borrow().kind, FileKind::Regular { .. }) {
+        if !file.borrow().readable() {
+            return Err(Errno::EBADF);
+        }
+        let logical = file
+            .borrow()
+            .data_ino()
+            .and_then(|ino| cx.t.vfs.as_ref()?.memfd_size(ino));
+        if logical.is_none() {
+            let mut fallback = false;
+            while done < len {
+                follow_copy_up(cx, file)?;
+                let Some(fd) = regular_fd(&file.borrow()) else {
+                    fallback = true;
+                    break;
+                };
+                let want = (len - done).min(ZERO_COPY_CHUNK);
+                let mut pinned = pin_user_io(cx, buf.wrapping_add(done as u64), want, true);
+                if pinned.len == 0 {
+                    // Fall back to `IoScratch` when byte 0 faults (so EOF reads into an invalid
+                    // buffer still return `Ok(0)` and touch atime) or when hitting an unpinnable
+                    // VMA (FUSE `Fill`, tmpfs/tracked `pages`, etc.).
+                    if done == 0 || !pinned.faulted {
+                        fallback = true;
+                    }
+                    break;
+                }
+                let want_n = pinned.len;
+                let io_res = unlocked_io(
+                    cx,
+                    file,
+                    fd,
+                    (offset.map(|o| o + done as u64), held),
+                    |fd, pos| pinned.io.pread(fd, pos),
+                );
+                drop(pinned.io);
+                let k = match io_res {
+                    Ok(k) => k,
+                    Err(_) if done > 0 => break,
+                    Err(e) => return Err(e),
+                };
+                if touch_atime {
+                    file_accessed(cx, &file.borrow());
+                    touch_atime = false;
+                }
+                done += k;
+                if k < want_n || pinned.faulted {
+                    break;
+                }
+            }
+            if done > 0 {
+                note_read(cx, file, done);
+                inotify::file_io_event(cx.kr(), &file.borrow(), inotify::IN_ACCESS);
+            }
+            if !fallback {
+                return Ok(done as u64);
+            }
+        }
+    }
     // Each read of a terminal or pipe returns only data already ready and must not block again
     // to fill the buffer; /dev/zero and /dev/urandom fill it in one read as on Linux
     // (`dd bs=256M` reads whole blocks)
@@ -4803,8 +4866,7 @@ fn read_file_inner(
             }
     ) || matches!(file.borrow().kind, FileKind::Host(fd) if host_regular(fd));
     let step = io_chunk(&file.borrow());
-    let mut chunk = IoScratch::take(len.min(step));
-    let mut done = 0;
+    let mut chunk = IoScratch::take((len - done).min(step));
     while done < len {
         let n = (len - done).min(step);
         let before = file.borrow().pos;
@@ -4848,6 +4910,30 @@ fn read_file_inner(
         }
     }
     Ok(done as u64)
+}
+
+/// Maximum byte span transferred in one pinned zero-copy regular-file `pread`/`pwrite` batch.
+const ZERO_COPY_CHUNK: usize = 2 * 1024 * 1024;
+
+/// Grows any grows-down mapping or refreshes a stale file extent covering `[addr, addr + len)`.
+fn grow_user_range(cx: &Cx<'_>, addr: u64, len: usize) -> bool {
+    let limit = cx.stack_limit();
+    let memlock = cx.memlock_limit();
+    cx.mm_mut().grow_for_limited(addr, len, limit, memlock)
+}
+
+/// Pins guest buffer `[addr, addr + len)` for unlocked zero-copy regular-file I/O, growing a
+/// grows-down stack or refreshing a mapped file extent if the first attempt faults.
+fn pin_user_io(cx: &Cx<'_>, addr: u64, len: usize, write: bool) -> crate::mm::PinnedRange {
+    let pinned = cx.mm().pin_io(addr, len, write);
+    if pinned.len < len
+        && pinned.faulted
+        && grow_user_range(cx, addr.wrapping_add(pinned.len as u64), len - pinned.len)
+    {
+        drop(pinned);
+        return cx.mm().pin_io(addr, len, write);
+    }
+    pinned
 }
 
 /// How much one read or write of open file `f` moves at once: [`FUSE_CHUNK`] for `/dev/fuse` and
@@ -5031,9 +5117,223 @@ fn write_file_inner(
     // that ends at the limit only shortens it, without SIGXFSZ for the next
     let (len, mut prechecked_flags) =
         fsize_allowed_flags(cx, &file.borrow(), offset, len, io.append)?;
-    let step = io_chunk(&file.borrow());
-    let mut chunk = IoScratch::take(len.min(step));
     let mut done = 0;
+    if len > 0 {
+        let regular_info = {
+            let f = file.borrow();
+            match &f.kind {
+                FileKind::Regular { ino, cow, .. } => {
+                    let flags = prechecked_flags.unwrap_or(0);
+                    let append = io.append
+                        || f.flags & oflags::O_APPEND != 0
+                        || flags & inode_flags::APPEND != 0;
+                    let node = f
+                        .ovl
+                        .map_or(Node::Store(f.mnt, *ino), |o| Node::Overlay(f.mnt, o));
+                    let is_tmpfs = cx
+                        .t
+                        .vfs
+                        .as_deref()
+                        .is_some_and(|vfs| backing_tmpfs_dev(vfs, &node).is_some());
+                    let sealed = cx.kr().seals.contains_key(ino);
+                    Some((*ino, *cow, flags, append, is_tmpfs, sealed))
+                }
+                _ => None,
+            }
+        };
+        // Fast zero-copy path for ordinary regular store files (non-append, non-tmpfs, non-sealed):
+        // hoist prepare_write / remove_privs / object_modified / inotify out of the transfer loop
+        // and write directly from pinned `HostRegion` spans via unlocked `pwrite`/`pwritev`.
+        if let Some((ino, mut cow, _flags, false, false, false)) = regular_info {
+            let mut fallback = false;
+            let mut prepped = false;
+            while done < len {
+                if done > 0 {
+                    let flags = match checked_write_flags(cx, &file.borrow()) {
+                        Ok(flags) => flags,
+                        Err(_) => break,
+                    };
+                    if flags & inode_flags::APPEND != 0 || cx.kr().seals.contains_key(&ino) {
+                        fallback = true;
+                        break;
+                    }
+                    cow = matches!(file.borrow().kind, FileKind::Regular { cow: true, .. });
+                }
+                let want = (len - done).min(ZERO_COPY_CHUNK);
+                let mut pinned = pin_user_io(cx, buf.wrapping_add(done as u64), want, false);
+                if pinned.len == 0 {
+                    if done == 0 && pinned.faulted {
+                        return Err(Errno::EFAULT);
+                    }
+                    if !pinned.faulted {
+                        fallback = true;
+                    }
+                    break;
+                }
+                if !prepped || cow {
+                    if cow {
+                        prepare_write(cx, file, None)?;
+                        cow = false;
+                        // `make_private` released the BKL; re-verify flags and seals.
+                        let flags = checked_write_flags(cx, &file.borrow())?;
+                        if flags & inode_flags::APPEND != 0 || cx.kr().seals.contains_key(&ino) {
+                            drop(pinned);
+                            fallback = true;
+                            break;
+                        }
+                    }
+                    if !prepped {
+                        remove_privs(cx, ino)?;
+                        prepped = true;
+                    }
+                }
+                let Some(fd) = regular_fd(&file.borrow()) else {
+                    drop(pinned);
+                    fallback = true;
+                    break;
+                };
+                let want_n = pinned.len;
+                let io_res = unlocked_io(
+                    cx,
+                    file,
+                    fd,
+                    (offset.map(|o| o + done as u64), held),
+                    |fd, pos| pinned.io.pwrite(fd, pos),
+                );
+                drop(pinned.io);
+                match io_res {
+                    Ok(k) => {
+                        done += k;
+                        if k < want_n || pinned.faulted {
+                            break;
+                        }
+                    }
+                    Err(_) if done > 0 => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            if done > 0 {
+                if let Ok(vfs) = cx.vfs() {
+                    vfs.store().object_modified(ino);
+                }
+                inotify::file_io_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
+            }
+            if !fallback {
+                if done > 0 && !defer_sync {
+                    write_sync(cx, file, 0)?;
+                }
+                return Ok(done as u64);
+            }
+            prechecked_flags = None;
+        } else if let Some((ino, cow, flags, append, is_tmpfs, _)) = regular_info
+            && (append || is_tmpfs)
+        {
+            // BKL-held regular-file writes (`O_APPEND`, `FS_APPEND_FL`, or tmpfs): hoist
+            // checked_write_flags, check_seals, tmpfs_write_room, prepare_write, remove_privs,
+            // tmpfs_resized, object_modified and inotify across multi-chunk transfers.
+            let mut eff_offset = if offset.is_some() && flags & inode_flags::APPEND != 0 {
+                let f = file.borrow();
+                let (ino, host, _) = f.regular_backing().ok_or(Errno::EBADF)?;
+                Some(regular_size(&*cx.vfs()?, ino, host)?)
+            } else {
+                offset
+            };
+            let (mut allowed, mut tmpfs) =
+                tmpfs_write_room(cx, &file.borrow(), eff_offset, len, append)?;
+            check_seals(cx, &file.borrow(), true, |size| {
+                let f = file.borrow();
+                let pos = match eff_offset {
+                    Some(off) => off,
+                    None if append => size,
+                    None => f.pos,
+                };
+                size.max(pos + allowed as u64)
+            })?;
+            let step = IO_CHUNK;
+            let mut chunk = IoScratch::take(allowed.min(step));
+            let mut prepped = false;
+            while done < allowed {
+                let n = (allowed - done).min(step);
+                if let Err(e) = cx.read_user(
+                    UserSlice::new(buf.wrapping_add(done as u64), n),
+                    &mut chunk[..n],
+                ) {
+                    if done > 0 {
+                        break;
+                    }
+                    return Err(e);
+                }
+                if !prepped {
+                    if cow {
+                        prepare_write(cx, file, None)?;
+                        // `make_private` released the BKL; refresh flags, offset, tmpfs room and seals.
+                        let flags = checked_write_flags(cx, &file.borrow())?;
+                        let append_now = append || flags & inode_flags::APPEND != 0;
+                        eff_offset = if offset.is_some() && flags & inode_flags::APPEND != 0 {
+                            let f = file.borrow();
+                            let (ino, host, _) = f.regular_backing().ok_or(Errno::EBADF)?;
+                            Some(regular_size(&*cx.vfs()?, ino, host)?)
+                        } else {
+                            offset
+                        };
+                        allowed = fsize_room_for_write(
+                            cx,
+                            &file.borrow(),
+                            eff_offset,
+                            len,
+                            append_now,
+                            flags,
+                        )?;
+                        let (room, before) =
+                            tmpfs_write_room(cx, &file.borrow(), eff_offset, allowed, append_now)?;
+                        tmpfs = before;
+                        allowed = room;
+                        check_seals(cx, &file.borrow(), true, |size| {
+                            let f = file.borrow();
+                            let pos = match eff_offset {
+                                Some(off) => off,
+                                None if append_now => size,
+                                None => f.pos,
+                            };
+                            size.max(pos + allowed as u64)
+                        })?;
+                    }
+                    remove_privs(cx, ino)?;
+                    prepped = true;
+                }
+                let n = n.min(allowed - done);
+                if n == 0 {
+                    break;
+                }
+                let chunk_off = eff_offset.map(|o| o + done as u64);
+                match local_write(cx, &mut file.borrow_mut(), &chunk[..n], chunk_off, append) {
+                    Ok(k) => {
+                        done += k;
+                        if k < n {
+                            break;
+                        }
+                    }
+                    Err(_) if done > 0 => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            if let (Some(t), FileKind::Regular { file: host, .. }) = (tmpfs, &file.borrow().kind) {
+                tmpfs_resized(&*cx.vfs()?, Some(t), host);
+            }
+            if done > 0 {
+                if let Ok(vfs) = cx.vfs() {
+                    vfs.store().object_modified(ino);
+                }
+                inotify::file_io_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
+                if !defer_sync {
+                    write_sync(cx, file, 0)?;
+                }
+            }
+            return Ok(done as u64);
+        }
+    }
+    let step = io_chunk(&file.borrow());
+    let mut chunk = IoScratch::take((len - done).min(step));
     while done < len {
         let n = (len - done).min(step);
         let copied = cx.read_user(
@@ -11364,12 +11664,31 @@ fn seals_permit(
 /// bit when group-executable or when the caller is not in the file's group (Linux 6.2+
 /// `setattr_should_drop_sgid`, aligned with `chown`); file capabilities are always removed.
 fn remove_privs(cx: &Cx<'_>, ino: Ino) -> Result<(), Errno> {
-    let cred = cx.cred();
     let vfs = cx.vfs()?;
-    let st = vfs.store().attrs(ino)?;
+    let store = vfs.store();
+    let st = store.attrs(ino)?;
+    if st.kind() != mode::S_IFREG {
+        return Ok(());
+    }
+    let has_setid = st.mode & (mode::S_ISUID | mode::S_ISGID) != 0;
+    let has_caps = store.has_file_caps(ino)?;
+    if !has_setid && !has_caps {
+        return Ok(());
+    }
+    let cred = cx.cred();
     let keep_setid = cred.capable_wrt(&st, cap::FSETID);
     let keep_sgid = keep_setid || cred.in_group(st.gid);
-    vfs.store().remove_privs(ino, keep_setid, keep_sgid)
+    let mut perm = st.mode & 0o7777;
+    if !keep_setid {
+        perm &= !mode::S_ISUID;
+        if perm & 0o010 != 0 || !keep_sgid {
+            perm &= !mode::S_ISGID;
+        }
+    }
+    if !has_caps && perm == st.mode & 0o7777 {
+        return Ok(());
+    }
+    store.remove_privs(ino, keep_setid, keep_sgid)
 }
 
 /// Called before a file is cut to `len` bytes: in every address space, pages mapping it beyond
@@ -13534,6 +13853,195 @@ mod tests {
                 .unwrap();
             assert_eq!(&pout[..4], b"pipe");
             assert_eq!(&pout[4..], &[0xdd; 60]);
+        });
+    }
+
+    #[test]
+    fn zero_copy_regular_file_io_bulk_cross_vma_cow_efault_fsize_append_memfd() {
+        use appine_engine::PAGE_SIZE;
+        with_guest(0, |cx, addr, _| {
+            let fixed = crate::mm::flags::MAP_PRIVATE
+                | crate::mm::flags::MAP_ANONYMOUS
+                | crate::mm::flags::MAP_FIXED;
+            let rw = appine_engine::prot::READ | appine_engine::prot::WRITE;
+
+            // 1. Bulk >2 MiB write & read across a single large anonymous VMA (multi-batch
+            //    ZERO_COPY_CHUNK + hoisted checks).
+            let bulk_src = 0x2000_0000u64;
+            let bulk_dst = 0x2100_0000u64;
+            let bulk_len = 2 * 1024 * 1024 + 128 * 1024;
+            let bulk_map = (bulk_len as u64).next_multiple_of(PAGE_SIZE);
+            cx.mm_mut().mmap(bulk_src, bulk_map, rw, fixed, None).unwrap();
+            cx.mm_mut().mmap(bulk_dst, bulk_map, rw, fixed, None).unwrap();
+            let pattern: Vec<u8> = (0..bulk_len).map(|i| ((i * 31) ^ (i >> 8)) as u8).collect();
+            cx.write_user(UserSlice::new(bulk_src, bulk_len), &pattern)
+                .unwrap();
+
+            let fd = open(
+                cx,
+                addr,
+                b"/tmp/zc-bulk",
+                oflags::O_CREAT | oflags::O_RDWR | oflags::O_TRUNC,
+                0o644,
+            )
+            .unwrap();
+            assert_eq!(write(cx, fd, bulk_src, bulk_len), Ok(bulk_len as u64));
+            assert_eq!(lseek(cx, fd, 0, SEEK_SET), Ok(0));
+            assert_eq!(read(cx, fd, bulk_dst, bulk_len), Ok(bulk_len as u64));
+            assert_eq!(read_guest(cx, bulk_dst, bulk_len), pattern);
+
+            // 2. Cross-VMA buffer (two adjacent anonymous VMAs -> multi-span preadv/pwritev).
+            let vma_a = 0x2200_0000u64;
+            let vma_b = vma_a + 2 * PAGE_SIZE;
+            cx.mm_mut().mmap(vma_a, 2 * PAGE_SIZE, rw, fixed, None).unwrap();
+            cx.mm_mut().mmap(vma_b, 2 * PAGE_SIZE, rw, fixed, None).unwrap();
+            let cross_len = (4 * PAGE_SIZE) as usize;
+            let cross_data: Vec<u8> = (0..cross_len).map(|i| (i as u8).wrapping_add(7)).collect();
+            cx.write_user(UserSlice::new(vma_a, cross_len), &cross_data)
+                .unwrap();
+            let fd_cross = open(
+                cx,
+                addr,
+                b"/tmp/zc-cross",
+                oflags::O_CREAT | oflags::O_RDWR | oflags::O_TRUNC,
+                0o644,
+            )
+            .unwrap();
+            assert_eq!(pwrite(cx, fd_cross, vma_a, cross_len, 0), Ok(cross_len as u64));
+            let zeros = vec![0u8; cross_len];
+            cx.write_user(UserSlice::new(vma_a, cross_len), &zeros).unwrap();
+            assert_eq!(pread(cx, fd_cross, vma_a, cross_len, 0), Ok(cross_len as u64));
+            assert_eq!(read_guest(cx, vma_a, cross_len), cross_data);
+
+            // 3. Partial EFAULT on read (2 valid pages + unmapped 3rd page): returns valid prefix
+            //    and advances file position by exactly the bytes copied; EOF with NULL buffer
+            //    returns Ok(0); non-EOF with NULL buffer returns EFAULT and rolls back pos.
+            assert_eq!(lseek(cx, fd_cross, 0, SEEK_SET), Ok(0));
+            let partial_dst = vma_b; // 2 pages mapped, then unmapped gap
+            assert_eq!(
+                read(cx, fd_cross, partial_dst, (3 * PAGE_SIZE) as usize),
+                Ok(2 * PAGE_SIZE)
+            );
+            assert_eq!(lseek(cx, fd_cross, 0, SEEK_CUR), Ok(2 * PAGE_SIZE));
+            assert_eq!(
+                read_guest(cx, partial_dst, (2 * PAGE_SIZE) as usize),
+                cross_data[..(2 * PAGE_SIZE) as usize]
+            );
+            // Non-EOF read into unmapped address -> EFAULT and pos unchanged.
+            assert_eq!(read(cx, fd_cross, 0, 64), Err(Errno::EFAULT));
+            assert_eq!(lseek(cx, fd_cross, 0, SEEK_CUR), Ok(2 * PAGE_SIZE));
+            // EOF read into unmapped address -> Ok(0).
+            assert_eq!(lseek(cx, fd_cross, 0, SEEK_END), Ok(cross_len as u64));
+            assert_eq!(read(cx, fd_cross, 0, 64), Ok(0));
+
+            // 4. CoW interaction: fork parent Mm, then read() into a CoW-lent buffer and write()
+            //    from a CoW-borrowed buffer — neither may corrupt the peer.
+            let cow_buf = 0x2300_0000u64;
+            let cow_len = (4 * PAGE_SIZE) as usize;
+            cx.mm_mut().mmap(cow_buf, cow_len as u64, rw, fixed, None).unwrap();
+            cx.write_user(UserSlice::new(cow_buf, cow_len), &vec![0x44; cow_len])
+                .unwrap();
+            let peer_mm = cx.mm_mut().fork().unwrap();
+            // `read()` into parent's CoW-lent pages must settle CoW so `peer_mm` keeps 0x44.
+            assert_eq!(pread(cx, fd_cross, cow_buf, cow_len, 0), Ok(cow_len as u64));
+            assert_eq!(read_guest(cx, cow_buf, cow_len), cross_data);
+            let mut peer_out = vec![0u8; cow_len];
+            peer_mm
+                .borrow()
+                .read(UserSlice::new(cow_buf, cow_len), &mut peer_out)
+                .unwrap();
+            assert!(peer_out.iter().all(|&b| b == 0x44));
+            // `write()` from a CoW-borrowed buffer (after swapping in `peer_mm` or via another
+            // fork) reads the exact borrowed bytes via fallback without corrupting them.
+            let old_mm = std::mem::replace(&mut cx.t.mm, peer_mm.clone());
+            let fd_cow_w = open(
+                cx,
+                addr,
+                b"/tmp/zc-cow-w",
+                oflags::O_CREAT | oflags::O_RDWR | oflags::O_TRUNC,
+                0o644,
+            )
+            .unwrap();
+            assert_eq!(pwrite(cx, fd_cow_w, cow_buf, cow_len, 0), Ok(cow_len as u64));
+            let mut verify = vec![0u8; cow_len];
+            let f_cow_w = cx.fds().get(fd_cow_w).unwrap();
+            assert_eq!(read_bytes(cx, &f_cow_w, &mut verify, Some(0)), Ok(cow_len));
+            assert!(verify.iter().all(|&b| b == 0x44));
+            cx.t.mm = old_mm;
+
+            // 5. RLIMIT_FSIZE truncates write and raises EFBIG at/past limit.
+            let saved_fsize = cx.t.group.borrow().rlimits[RLIMIT_FSIZE as usize];
+            cx.t.group.borrow_mut().rlimits[RLIMIT_FSIZE as usize] = (100, 100);
+            let fd_lim = open(
+                cx,
+                addr,
+                b"/tmp/zc-fsize",
+                oflags::O_CREAT | oflags::O_RDWR | oflags::O_TRUNC,
+                0o644,
+            )
+            .unwrap();
+            assert_eq!(write(cx, fd_lim, vma_a, 256), Ok(100));
+            assert_eq!(write(cx, fd_lim, vma_a, 16), Err(Errno::EFBIG));
+            cx.t.group.borrow_mut().rlimits[RLIMIT_FSIZE as usize] = saved_fsize;
+
+            // 6. Multi-chunk O_APPEND write (> IO_CHUNK) appends cleanly and advances pos.
+            let fd_app = open(
+                cx,
+                addr,
+                b"/tmp/zc-append",
+                oflags::O_CREAT | oflags::O_RDWR | oflags::O_TRUNC | oflags::O_APPEND,
+                0o644,
+            )
+            .unwrap();
+            let app_len = IO_CHUNK * 2 + 1234;
+            assert_eq!(write(cx, fd_app, bulk_src, app_len), Ok(app_len as u64));
+            assert_eq!(lseek(cx, fd_app, 0, SEEK_SET), Ok(0));
+            assert_eq!(write(cx, fd_app, bulk_src, 100), Ok(100));
+            assert_eq!(lseek(cx, fd_app, 0, SEEK_CUR), Ok(app_len as u64 + 100));
+            assert_eq!(pread(cx, fd_app, bulk_dst, app_len + 100, 0), Ok(app_len as u64 + 100));
+            assert_eq!(read_guest(cx, bulk_dst, app_len), pattern[..app_len]);
+            assert_eq!(
+                read_guest(cx, bulk_dst + app_len as u64, 100),
+                pattern[..100]
+            );
+
+            // 7. Grows-down stack growth on zero-copy read.
+            let stack_top = 0x2500_0000u64;
+            cx.mm_mut()
+                .mmap(
+                    stack_top - PAGE_SIZE,
+                    PAGE_SIZE,
+                    rw,
+                    fixed | crate::mm::flags::MAP_GROWSDOWN,
+                    None,
+                )
+                .unwrap();
+            let below_stack = stack_top - 2 * PAGE_SIZE;
+            assert!(!cx.mm().is_mapped(below_stack));
+            assert_eq!(pread(cx, fd_cross, below_stack, PAGE_SIZE as usize, 0), Ok(PAGE_SIZE));
+            assert!(cx.mm().is_mapped(below_stack));
+            assert_eq!(
+                read_guest(cx, below_stack, PAGE_SIZE as usize),
+                cross_data[..PAGE_SIZE as usize]
+            );
+
+            // 8. Memfd with sparse logical tail falls back cleanly and reads zeros past host EOF.
+            let mfd_name = addr + 1024;
+            cx.write_user(UserSlice::new(mfd_name, 5), b"zcmf\0").unwrap();
+            let mfd = memfd_create(cx, mfd_name, 0).unwrap() as i32;
+            assert_eq!(pwrite(cx, mfd, vma_a, 8, 0), Ok(8));
+            let mfd_ino = cx.fds().get(mfd).unwrap().borrow().data_ino().unwrap();
+            cx.vfs().unwrap().set_memfd_size(mfd_ino, 32);
+            let mfd_out = addr + 2048;
+            cx.write_user(UserSlice::new(mfd_out, 32), &[0xee; 32]).unwrap();
+            assert_eq!(pread(cx, mfd, mfd_out, 32, 0), Ok(32));
+            let got = read_guest(cx, mfd_out, 32);
+            assert_eq!(&got[..8], &cross_data[..8]);
+            assert_eq!(&got[8..], &[0u8; 24]);
+
+            for f in [fd, fd_cross, fd_cow_w, fd_lim, fd_app, mfd] {
+                close(cx, f).unwrap();
+            }
         });
     }
 }

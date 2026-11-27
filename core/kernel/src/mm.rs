@@ -45,7 +45,7 @@ use std::ops::Range;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::ptr::NonNull;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use appine_engine::{MapError, Mmu, PAGE_SIZE, VA_BITS, prot};
@@ -270,6 +270,191 @@ impl MsyncHost {
             r => r.map_err(Errno),
         }
     }
+}
+
+/// Maximum number of host spans pinned for one unlocked `preadv`/`pwritev` batch.
+const MAX_PIN_SPANS: usize = 16;
+
+/// Maximum span settled in one batch when an unlocked `read` targets CoW-shared pages, so a huge
+/// read of a small file does not materialize megabytes of untouched CoW pages.
+const COW_PIN_MAX: usize = 64 * 1024;
+
+struct PinnedSpan {
+    region: Arc<HostRegion>,
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+enum PinnedSpans {
+    Empty,
+    One(PinnedSpan),
+    Many(Vec<PinnedSpan>),
+}
+
+/// Pinned host memory spans covering a guest I/O buffer across a BKL release.
+///
+/// Retaining `Arc<HostRegion>` keeps every target host mapping alive and unrecycled until the host
+/// `pread`/`pwrite` finishes. When `write_pin` is true (host reading into guest memory), each
+/// span also holds an `io_write_pins` count on its [`HostRegion`] so a concurrent [`Mm::fork`]
+/// copies instead of lending or sharing those pages.
+pub(crate) struct PinnedIo {
+    spans: PinnedSpans,
+    write_pin: bool,
+}
+
+// SAFETY: Every `PinnedSpan` retains an `Arc<HostRegion>` keeping `[ptr, ptr + len)` mapped for
+// the lifetime of `PinnedIo`. For `write_pin == true`, `io_write_pins` prevents concurrent
+// `Mm::fork` from CoW-lending or sharing the region while host `pread`/`preadv` writes into it.
+unsafe impl Send for PinnedIo {}
+
+impl PinnedIo {
+    fn new(write_pin: bool) -> Self {
+        Self {
+            spans: PinnedSpans::Empty,
+            write_pin,
+        }
+    }
+
+    fn push(&mut self, span: PinnedSpan) {
+        if self.write_pin {
+            span.region.io_write_pins.fetch_add(1, Ordering::AcqRel);
+        }
+        match &mut self.spans {
+            PinnedSpans::Empty => self.spans = PinnedSpans::One(span),
+            PinnedSpans::One(_) => {
+                let PinnedSpans::One(first) =
+                    std::mem::replace(&mut self.spans, PinnedSpans::Empty)
+                else {
+                    unreachable!()
+                };
+                let mut v = Vec::with_capacity(4);
+                v.push(first);
+                v.push(span);
+                self.spans = PinnedSpans::Many(v);
+            }
+            PinnedSpans::Many(v) => v.push(span),
+        }
+    }
+
+    fn span_count(&self) -> usize {
+        match &self.spans {
+            PinnedSpans::Empty => 0,
+            PinnedSpans::One(_) => 1,
+            PinnedSpans::Many(v) => v.len(),
+        }
+    }
+
+    /// Reads directly from host `fd` at `offset` into the pinned guest spans, retrying on `EINTR`.
+    pub(crate) fn pread(&mut self, fd: i32, offset: u64) -> Result<usize, i32> {
+        debug_assert!(self.write_pin);
+        match &self.spans {
+            PinnedSpans::Empty => Ok(0),
+            PinnedSpans::One(s) => {
+                // SAFETY: `s.region` keeps `[s.ptr, s.ptr + s.len)` mapped and host-writable,
+                // CoW was settled ahead of pinning, and `io_write_pins` prevents fork lending.
+                let buf = unsafe { std::slice::from_raw_parts_mut(s.ptr.as_ptr(), s.len) };
+                appine_hal::pread(fd, buf, offset)
+            }
+            PinnedSpans::Many(v) => {
+                let mut iov = [libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                }; MAX_PIN_SPANS];
+                for (dst, s) in iov.iter_mut().zip(v.iter()) {
+                    dst.iov_base = s.ptr.as_ptr().cast();
+                    dst.iov_len = s.len;
+                }
+                loop {
+                    // SAFETY: `iov[..v.len()]` points into live writable `HostRegion`s pinned by
+                    // `self` with `io_write_pins` held.
+                    let n = unsafe {
+                        libc::preadv(fd, iov.as_ptr(), v.len() as libc::c_int, offset as libc::off_t)
+                    };
+                    if n >= 0 {
+                        return Ok(n as usize);
+                    }
+                    let err = std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EIO);
+                    if err != libc::EINTR {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Writes directly from the pinned guest spans to host `fd` at `offset`, retrying on `EINTR`.
+    pub(crate) fn pwrite(&mut self, fd: i32, offset: u64) -> Result<usize, i32> {
+        match &self.spans {
+            PinnedSpans::Empty => Ok(0),
+            PinnedSpans::One(s) => {
+                // SAFETY: `s.region` keeps `[s.ptr, s.ptr + s.len)` mapped and host-readable.
+                let buf = unsafe { std::slice::from_raw_parts(s.ptr.as_ptr(), s.len) };
+                appine_hal::pwrite(fd, buf, offset)
+            }
+            PinnedSpans::Many(v) => {
+                let mut iov = [libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                }; MAX_PIN_SPANS];
+                for (dst, s) in iov.iter_mut().zip(v.iter()) {
+                    dst.iov_base = s.ptr.as_ptr().cast();
+                    dst.iov_len = s.len;
+                }
+                loop {
+                    // SAFETY: `iov[..v.len()]` points into live readable `HostRegion`s pinned by
+                    // `self`.
+                    let n = unsafe {
+                        libc::pwritev(
+                            fd,
+                            iov.as_ptr(),
+                            v.len() as libc::c_int,
+                            offset as libc::off_t,
+                        )
+                    };
+                    if n >= 0 {
+                        return Ok(n as usize);
+                    }
+                    let err = std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EIO);
+                    if err != libc::EINTR {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for PinnedIo {
+    fn drop(&mut self) {
+        if !self.write_pin {
+            return;
+        }
+        match &self.spans {
+            PinnedSpans::Empty => {}
+            PinnedSpans::One(s) => {
+                s.region.io_write_pins.fetch_sub(1, Ordering::Release);
+            }
+            PinnedSpans::Many(v) => {
+                for s in v {
+                    s.region.io_write_pins.fetch_sub(1, Ordering::Release);
+                }
+            }
+        }
+    }
+}
+
+/// Result of pinning a guest buffer prefix for unlocked zero-copy regular-file I/O.
+pub(crate) struct PinnedRange {
+    pub io: PinnedIo,
+    pub len: usize,
+    /// True if pinning stopped because the next guest byte is unmapped, lacks permission, or lies
+    /// past file EOF; false if it stopped at `len`, `MAX_PIN_SPANS`, `COW_PIN_MAX`, or a VMA that
+    /// requires the `IoScratch` fallback (FUSE `Fill`, tmpfs/tracked `pages`, borrowed CoW read).
+    pub faulted: bool,
 }
 
 /// What a single VMA slice in `msync(2)` needs to sync when `MS_SYNC` is set.
@@ -1485,6 +1670,7 @@ impl Mm {
             anonymous: None,
             used_start: AtomicUsize::new(0),
             used_end: AtomicUsize::new(0),
+            io_write_pins: AtomicU32::new(0),
             reserved: false,
             foreign: true,
             gpu: None,
@@ -2648,8 +2834,8 @@ impl Mm {
         })
     }
 
-    /// Walks `[addr, addr + len)` page by page, calling `f(host pointer, bytes done, chunk length)`
-    /// for each chunk.
+    /// Walks `[addr, addr + len)` across contiguous translated host spans, calling
+    /// `f(host pointer, bytes done, chunk length)` for each span.
     fn for_each_page(
         &self,
         addr: u64,
@@ -2657,34 +2843,289 @@ impl Mm {
         required_prot: u32,
         mut f: impl FnMut(*mut u8, usize, usize),
     ) -> Result<(), Errno> {
+        if len == 0 {
+            return Ok(());
+        }
+        // Fast path for single-page accesses (the common case for small get/put transfers): avoid
+        // the VMA BTreeMap lookup when the PTE is already populated.
+        if (addr % PAGE_SIZE) as usize + len <= PAGE_SIZE as usize
+            && let Some(host) = self.mmu.translate(addr, required_prot)
+        {
+            f(host.as_ptr(), 0, len);
+            return Ok(());
+        }
+        let write = required_prot & prot::WRITE != 0;
         let mut done = 0;
         while done < len {
             let cur = addr.checked_add(done as u64).ok_or(Errno::EFAULT)?;
+            let remain = len - done;
             let page_left = (PAGE_SIZE - cur % PAGE_SIZE) as usize;
-            let chunk = page_left.min(len - done);
-            let host = match self.mmu.translate(cur, required_prot) {
-                Some(host) => host,
-                // Copy-on-write pages: make them writable first (Mm::cow_break); pages without
-                // entries yet are filled on demand
-                None => {
-                    let demand = (cur % PAGE_SIZE + (len - done).min(LEAF_SPAN as usize) as u64)
-                        .next_multiple_of(PAGE_SIZE);
-                    if !(required_prot & prot::WRITE != 0 && self.cow_break(cur)
-                        || self
+            if remain <= page_left
+                && let Some(host) = self.mmu.translate(cur, required_prot)
+            {
+                f(host.as_ptr(), done, remain);
+                return Ok(());
+            }
+            let (&s, v) = self
+                .vmas
+                .range(..=cur)
+                .next_back()
+                .filter(|&(&s, v)| cur < s + v.len)
+                .ok_or(Errno::EFAULT)?;
+            let p = mmu_prot(v.prot);
+            let vma_end = s + v.contents_len().min(v.len);
+            if cur >= vma_end || p == 0 || p & required_prot != required_prot {
+                return Err(self.miss(cur, required_prot));
+            }
+            // FUSE on-demand (`Fill`) and tmpfs / software-tracked private file (`pages`) VMAs
+            // need per-page admission and fill-run checks; handle one page through the page table.
+            if v.fill.is_some() || v.pages.is_some() {
+                let chunk = page_left.min(remain);
+                let host = match self.mmu.translate(cur, required_prot) {
+                    Some(host) => host,
+                    None => {
+                        let demand = (cur % PAGE_SIZE + remain.min(LEAF_SPAN as usize) as u64)
+                            .next_multiple_of(PAGE_SIZE);
+                        if !self
                             .fault_range(cur, required_prot, demand)
-                            .unwrap_or(false))
-                    {
-                        return Err(self.miss(cur, required_prot));
+                            .unwrap_or(false)
+                        {
+                            return Err(self.miss(cur, required_prot));
+                        }
+                        self.mmu
+                            .translate(cur, required_prot)
+                            .ok_or(Errno::EFAULT)?
                     }
-                    self.mmu
-                        .translate(cur, required_prot)
-                        .ok_or(Errno::EFAULT)?
+                };
+                f(host.as_ptr(), done, chunk);
+                done += chunk;
+                continue;
+            }
+            let want_end = cur
+                .checked_add(remain as u64)
+                .map_or(vma_end, |e| e.min(vma_end));
+            if v.backing == Backing::Anonymous {
+                let page = cur & !(PAGE_SIZE - 1);
+                if write {
+                    self.prepare_anon_write(s, v).map_err(|_| Errno::EFAULT)?;
+                    let cow_stop = {
+                        let c = self.cow.borrow();
+                        if c.borrowed.is_empty() && c.lent.is_empty() {
+                            want_end
+                        } else {
+                            let b = c.borrowed.range(page..want_end).next().map(|(&p, _)| p);
+                            let l = c.lent.range(page..want_end).next().copied();
+                            match (b, l) {
+                                (Some(a), Some(b)) => a.min(b),
+                                (Some(a), None) | (None, Some(a)) => a,
+                                (None, None) => want_end,
+                            }
+                        }
+                    };
+                    if cow_stop == page {
+                        if !self.cow_break(page) {
+                            return Err(Errno::EFAULT);
+                        }
+                        let chunk = ((page + PAGE_SIZE).min(want_end) - cur) as usize;
+                        // SAFETY: `cow_break` materialized/repossessed `page` into `v.host`.
+                        let host = unsafe { v.host.as_ptr().add((cur - s) as usize) };
+                        f(host, done, chunk);
+                        done += chunk;
+                        continue;
+                    }
+                    let stop_page = cow_stop.next_multiple_of(PAGE_SIZE);
+                    let (known_lo, known_hi) = v.present_run.get();
+                    if !(known_lo <= page && stop_page <= known_hi) {
+                        let host_page = Self::own_page(s, v, page);
+                        // SAFETY: `[page, stop_page)` has no CoW pages and belongs to `v`.
+                        unsafe { self.mmu.fill_shared(page, host_page, stop_page - page, p) }
+                            .map_err(|_| Errno::EFAULT)?;
+                        v.note_present(page, stop_page);
+                    }
+                    let chunk = (cow_stop - cur) as usize;
+                    // SAFETY: `[cur, cow_stop)` is own-backed writable memory inside `v`.
+                    let host = unsafe { v.host.as_ptr().add((cur - s) as usize) };
+                    f(host, done, chunk);
+                    done += chunk;
+                } else {
+                    // Lent pages still live at `v.host`; only borrowed pages break host contiguity.
+                    let borrowed = {
+                        let c = self.cow.borrow();
+                        if c.borrowed.is_empty() {
+                            None
+                        } else {
+                            c.borrowed
+                                .range(page..want_end)
+                                .next()
+                                .map(|(&p, b)| (p, b.host))
+                        }
+                    };
+                    match borrowed {
+                        Some((bp, bhost)) if bp == page => {
+                            let chunk = ((page + PAGE_SIZE).min(want_end) - cur) as usize;
+                            // SAFETY: `bhost` stays alive in `self.cow.borrowed` for this borrow.
+                            let host = unsafe { bhost.as_ptr().add((cur - page) as usize) };
+                            f(host, done, chunk);
+                            done += chunk;
+                        }
+                        Some((bp, _)) => {
+                            let chunk = (bp - cur) as usize;
+                            // SAFETY: `[cur, bp)` has no borrowed pages and lives in `v.host`.
+                            let host = unsafe { v.host.as_ptr().add((cur - s) as usize) };
+                            f(host, done, chunk);
+                            done += chunk;
+                        }
+                        None => {
+                            let chunk = (want_end - cur) as usize;
+                            // SAFETY: `[cur, want_end)` has no borrowed pages and lives in `v.host`.
+                            let host = unsafe { v.host.as_ptr().add((cur - s) as usize) };
+                            f(host, done, chunk);
+                            done += chunk;
+                        }
+                    }
                 }
-            };
-            f(host.as_ptr(), done, chunk);
-            done += chunk;
+            } else {
+                // `Backing::PrivateFile` or `Backing::Shared` without `Fill` or `pages`:
+                // contiguous host memory up to `vma_end`.
+                debug_assert!(!write || !v.cow);
+                let chunk = (want_end - cur) as usize;
+                // SAFETY: `[cur, want_end)` lies within `v`'s backed contents and permits `need`.
+                let host = unsafe { v.host.as_ptr().add((cur - s) as usize) };
+                f(host, done, chunk);
+                done += chunk;
+            }
         }
         Ok(())
+    }
+
+    /// Pins up to `MAX_PIN_SPANS` contiguous host spans covering a prefix of `[addr, addr + len)`
+    /// for unlocked zero-copy regular-file I/O.
+    ///
+    /// When `write` is true (host `pread` writing into guest memory), this prepares anonymous
+    /// writes, settles CoW (capped at [`COW_PIN_MAX`] when CoW pages overlap), ensures soft PTEs
+    /// exist so `Mm::fork` sees the written pages, and increments `HostRegion::io_write_pins` so
+    /// concurrent `Mm::fork` copies instead of lending or sharing the region.
+    /// When `write` is false (host `pwrite` reading from guest memory), it stops before any
+    /// `cow.borrowed` page so an owner's concurrent CoW recall cannot overwrite pinned bytes.
+    pub(crate) fn pin_io(&self, addr: u64, len: usize, write: bool) -> PinnedRange {
+        let mut io = PinnedIo::new(write);
+        let mut total = 0usize;
+        let mut faulted = false;
+        let need = if write { prot::WRITE } else { prot::READ };
+
+        while total < len && io.span_count() < MAX_PIN_SPANS {
+            let Some(cur) = addr.checked_add(total as u64) else {
+                faulted = true;
+                break;
+            };
+            let Some((&s, v)) = self
+                .vmas
+                .range(..=cur)
+                .next_back()
+                .filter(|&(&s, v)| cur < s + v.len)
+            else {
+                faulted = true;
+                break;
+            };
+            let p = mmu_prot(v.prot);
+            let vma_end = s + v.contents_len().min(v.len);
+            if cur >= vma_end || p == 0 || p & need != need {
+                // An unread FUSE `Fill` page is not an EFAULT: fall back to `IoScratch` so
+                // `Mm::read`/`Mm::write` raises `FUSE_RETRY` cleanly.
+                faulted = !(v.fill.is_some() && v.unread(s, cur).is_some());
+                break;
+            }
+            if v.fill.is_some()
+                || v.pages.is_some()
+                || v.reserved()
+                || v.foreign()
+                || v.region.gpu.is_some()
+                || (write && v.cow)
+            {
+                break;
+            }
+            let remain = len - total;
+            let mut want_end = cur
+                .checked_add(remain as u64)
+                .map_or(vma_end, |e| e.min(vma_end));
+            let mut stop_after = false;
+
+            if v.backing == Backing::Anonymous {
+                let page = cur & !(PAGE_SIZE - 1);
+                if write {
+                    if self.prepare_anon_write(s, v).is_err() {
+                        break;
+                    }
+                    let has_cow = {
+                        let c = self.cow.borrow();
+                        (!c.borrowed.is_empty()
+                            && c.borrowed.range(page..want_end).next().is_some())
+                            || (!c.lent.is_empty() && c.lent.range(page..want_end).next().is_some())
+                    };
+                    if has_cow {
+                        let cap = cur.saturating_add(COW_PIN_MAX as u64);
+                        if want_end > cap {
+                            want_end = cap;
+                            stop_after = true;
+                        }
+                        let stop_page = want_end.next_multiple_of(PAGE_SIZE);
+                        if self.cow_settle(page, stop_page).is_err() {
+                            break;
+                        }
+                    }
+                    let stop_page = want_end.next_multiple_of(PAGE_SIZE);
+                    let (known_lo, known_hi) = v.present_run.get();
+                    if !(known_lo <= page && stop_page <= known_hi) {
+                        let host_page = Self::own_page(s, v, page);
+                        // SAFETY: `[page, stop_page)` has CoW settled and belongs to `v`.
+                        if unsafe { self.mmu.fill_shared(page, host_page, stop_page - page, p) }
+                            .is_err()
+                        {
+                            break;
+                        }
+                        v.note_present(page, stop_page);
+                    }
+                } else {
+                    // Never pin an owner's borrowed page across `Cx::unlocked` for `pwrite`: a
+                    // concurrent recall by the owner could let the owner overwrite its page while
+                    // our unlocked `pwrite` reads it.
+                    let borrowed_hit = {
+                        let c = self.cow.borrow();
+                        if c.borrowed.is_empty() {
+                            None
+                        } else {
+                            c.borrowed.range(page..want_end).next().map(|(&bp, _)| bp)
+                        }
+                    };
+                    if let Some(bp) = borrowed_hit {
+                        if bp == page {
+                            break;
+                        }
+                        want_end = bp;
+                        stop_after = true;
+                    }
+                }
+            }
+
+            let chunk = (want_end - cur) as usize;
+            // SAFETY: `[cur, want_end)` lies inside `v`'s backed contents.
+            let ptr = unsafe { v.host.add((cur - s) as usize) };
+            io.push(PinnedSpan {
+                region: v.region.clone(),
+                ptr,
+                len: chunk,
+            });
+            total += chunk;
+            if stop_after {
+                break;
+            }
+        }
+
+        PinnedRange {
+            io,
+            len: total,
+            faulted,
+        }
     }
 
     /// The host pointer the kernel layer finds for guest address `addr` through the page table,
@@ -2968,6 +3409,7 @@ impl Mm {
             anonymous: None,
             used_start: AtomicUsize::new(0),
             used_end: AtomicUsize::new(0),
+            io_write_pins: AtomicU32::new(0),
             reserved: false,
             foreign: false,
             gpu: Some(mapping),
@@ -5771,20 +6213,27 @@ impl Mm {
             prev = Some((s + v.len, v, id));
         }
         // Written private anonymous mappings are copy-on-write: map the child's own (all-zero)
-        // host memory first, then lend to it
+        // host memory first, then lend to it. Any VMA whose HostRegion currently has an in-flight
+        // unlocked regular-file read (`io_write_pins > 0`) is copied eagerly instead of lent or
+        // shared so the in-flight read can never write into the child's memory.
         let mut cow = Vec::new();
+        let mut eager_copy = Vec::new();
         for (&start, v) in self.vmas.iter_mut() {
             if v.dontfork {
                 continue;
             }
+            let io_pinned = v.region.has_io_write_pins();
             // A reservation has no contents, and the child's is a reservation too
             // (HostRegion::reserved)
             let share = v.reserved()
                 || match v.backing {
                     Backing::Shared => true,
                     // Neither side can write, so the contents cannot diverge; whoever makes it
-                    // writable copies its own
-                    Backing::PrivateFile if v.prot & prot::WRITE == 0 && v.tmpfs().is_none() => {
+                    // writable copies its own (unless an in-flight unlocked read still pins this
+                    // region after a concurrent mprotect(PROT_READ))
+                    Backing::PrivateFile
+                        if v.prot & prot::WRITE == 0 && v.tmpfs().is_none() && !io_pinned =>
+                    {
                         v.cow = true;
                         true
                     }
@@ -5839,7 +6288,11 @@ impl Mm {
                     Self::new_anonymous(v.len, v.prot & prot::WRITE != 0 && !v.noreserve)?
                 };
                 if v.written.get() && !v.wipeonfork {
-                    cow.push(start);
+                    if io_pinned {
+                        eager_copy.push(start);
+                    } else {
+                        cow.push(start);
+                    }
                 }
                 (region, host)
             };
@@ -5857,6 +6310,9 @@ impl Mm {
                 ..v.clone()
             };
             child.insert_vma(start, c)?;
+        }
+        for start in eager_copy {
+            self.copy_pinned_anon(start, &child)?;
         }
         for start in cow {
             self.lend(start, &mut plan);
@@ -7886,6 +8342,62 @@ impl LendingPlan {
 /// writes into guest memory it has only `&Mm`, and an owner recalling pages must also change its
 /// borrowers' page tables.
 impl Mm {
+    /// Copies a private anonymous VMA whose backing [`HostRegion`] has an active unlocked I/O
+    /// write pin (`io_write_pins > 0`) directly into the child's fresh memory instead of lending
+    /// it, installing child PTEs for the copied windows so future forks observe all contents.
+    fn copy_pinned_anon(&self, start: u64, child: &Mm) -> Result<(), Errno> {
+        let v = &self.vmas[&start];
+        let cv = &child.vmas[&start];
+        let end = start + v.len;
+        let small = v.len <= LEND_ALL_MAX;
+        let windows = if small {
+            vec![(start, end)]
+        } else {
+            self.touched_windows(start)
+        };
+        let cow = self.cow.borrow();
+        let mut mine = cow.borrowed.range(start..end).peekable();
+        for (lo, hi) in windows {
+            let touched = (!small)
+                .then(|| {
+                    let host = Self::own_page(start, v, lo);
+                    appine_hal::touched_pages(host.as_ptr(), (hi - lo) as usize)
+                })
+                .flatten();
+            for (i, page) in (lo..hi).step_by(PAGE_SIZE as usize).enumerate() {
+                let dst = Self::own_page(start, cv, page);
+                if let Some((_, b)) = mine.next_if(|&(&p, _)| p == page) {
+                    // SAFETY: both `b.host` and `dst` are whole mapped pages.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            b.host.as_ptr(),
+                            dst.as_ptr(),
+                            PAGE_SIZE as usize,
+                        );
+                    }
+                } else if touched.as_ref().is_none_or(|t| t[i]) {
+                    let src = Self::own_page(start, v, page);
+                    // SAFETY: both `src` and `dst` are whole mapped pages inside their VMAs.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src.as_ptr(),
+                            dst.as_ptr(),
+                            PAGE_SIZE as usize,
+                        );
+                    }
+                }
+            }
+            // Ensure the child's soft page table has entries for the copied window (including
+            // prot-0 entries for PROT_NONE VMAs) so future forks' `touched_windows` find them.
+            let dst_lo = Self::own_page(start, cv, lo);
+            // SAFETY: `[lo, hi)` belongs to `cv` and uses its own host backing.
+            unsafe { child.mmu.fill_shared(lo, dst_lo, hi - lo, cv.prefill_prot()) }
+                .map_err(map_err)?;
+            cv.note_present(lo, hi);
+        }
+        Ok(())
+    }
+
     /// Plan lending the written pages of one private anonymous VMA. The child borrows
     /// any pages we borrowed ourselves directly from their original owner.
     fn lend(&self, start: u64, plan: &mut LendingPlan) {
@@ -8094,6 +8606,9 @@ impl Mm {
 
     /// Returns private anonymous pages to the host around any outstanding loans.
     fn discard_unlent_in(&self, s: u64, v: &Vma, retained: &BTreeSet<u64>) {
+        if v.region.has_io_write_pins() {
+            return;
+        }
         let end = s + v.len;
         for (start, len) in Self::non_cow_runs(s, end, retained.range(s..end).copied()) {
             // The PTE stays readable after the host page starts returning zeros.
@@ -8536,6 +9051,9 @@ struct HostRegion {
     /// what could have been touched.
     used_start: AtomicUsize,
     used_end: AtomicUsize,
+    /// Number of in-flight unlocked regular-file reads currently writing into this region via
+    /// [`PinnedIo`]. While non-zero, [`Mm::fork`] copies instead of lending or sharing this region.
+    io_write_pins: AtomicU32,
     /// No host memory ([`HostRegion::reserved`]).
     reserved: bool,
     /// Host memory the kernel layer does not own and only reads: the host's vvar page
@@ -8545,6 +9063,10 @@ struct HostRegion {
 }
 
 impl HostRegion {
+    fn has_io_write_pins(&self) -> bool {
+        self.io_write_pins.load(Ordering::Acquire) != 0
+    }
+
     fn anonymous(base: NonNull<u8>, len: usize, reserve: bool, full: bool) -> Arc<HostRegion> {
         let (used_start, used_end) = if full { (0, len) } else { (len, 0) };
         Arc::new(HostRegion {
@@ -8554,6 +9076,7 @@ impl HostRegion {
             anonymous: Some(reserve),
             used_start: AtomicUsize::new(used_start),
             used_end: AtomicUsize::new(used_end),
+            io_write_pins: AtomicU32::new(0),
             reserved: false,
             foreign: false,
             gpu: None,
@@ -8568,6 +9091,7 @@ impl HostRegion {
             anonymous: None,
             used_start: AtomicUsize::new(0),
             used_end: AtomicUsize::new(0),
+            io_write_pins: AtomicU32::new(0),
             reserved: false,
             foreign: false,
             gpu: None,
@@ -8589,6 +9113,7 @@ impl HostRegion {
             anonymous: None,
             used_start: AtomicUsize::new(0),
             used_end: AtomicUsize::new(0),
+            io_write_pins: AtomicU32::new(0),
             reserved: true,
             foreign: false,
             gpu: None,
@@ -14797,5 +15322,150 @@ mod tests {
         mm.remove_user(&active);
         mm.remove_user(&parked);
         mm.remove_user(&current);
+    }
+
+    #[test]
+    fn for_each_page_coalesces_across_contiguous_spans_and_cow_boundaries() {
+        let mut mm = Mm::new();
+        let base = 0x3000_0000u64;
+        let len = 3 * 1024 * 1024usize; // 3 MiB (> EAGER_MAX, lazy demand-paged)
+        mm.mmap(
+            base,
+            len as u64,
+            RW,
+            flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_FIXED,
+            None,
+        )
+        .unwrap();
+
+        // A 3 MiB write across one anonymous VMA coalesces into a single span callback and
+        // populates soft-MMU entries + written/has_anon_vma state for fork.
+        let mut spans = Vec::new();
+        mm.for_each_page(base, len, prot::WRITE, |host, done, chunk| {
+            spans.push((done, chunk));
+            unsafe { std::ptr::write_bytes(host, 0x5a, chunk) };
+        })
+        .unwrap();
+        assert_eq!(spans, vec![(0, len)]);
+        assert!(mm.vmas[&base].written.get());
+        assert!(mm.vmas[&base].has_anon_vma.get());
+        assert_eq!(mm.mmu.next_present(base, base + len as u64), base);
+
+        // Reading the entire 3 MiB span also coalesces into one callback.
+        spans.clear();
+        mm.for_each_page(base, len, prot::READ, |host, done, chunk| {
+            spans.push((done, chunk));
+            let s = unsafe { std::slice::from_raw_parts(host, chunk) };
+            assert_eq!(s[0], 0x5a);
+            assert_eq!(s[chunk - 1], 0x5a);
+        })
+        .unwrap();
+        assert_eq!(spans, vec![(0, len)]);
+
+        // Adjacent distinct VMAs coalesce per VMA (2 callbacks total) and stop at unmapped gaps.
+        let adj_a = 0x4000_0000u64;
+        let adj_b = adj_a + 4 * PAGE_SIZE;
+        mm.map_anonymous(adj_a, 4 * PAGE_SIZE, RW).unwrap();
+        mm.map_anonymous(adj_b, 4 * PAGE_SIZE, RW).unwrap();
+        spans.clear();
+        mm.for_each_page(adj_a, (8 * PAGE_SIZE) as usize, prot::WRITE, |host, done, chunk| {
+            spans.push((done, chunk));
+            unsafe { std::ptr::write_bytes(host, 0x33, chunk) };
+        })
+        .unwrap();
+        assert_eq!(
+            spans,
+            vec![(0, (4 * PAGE_SIZE) as usize), ((4 * PAGE_SIZE) as usize, (4 * PAGE_SIZE) as usize)]
+        );
+        // Crossing into an unmapped page after `adj_b` delivers valid prefix then returns EFAULT.
+        spans.clear();
+        assert_eq!(
+            mm.for_each_page(adj_a, (9 * PAGE_SIZE) as usize, prot::READ, |_, done, chunk| {
+                spans.push((done, chunk));
+            }),
+            Err(Errno::EFAULT)
+        );
+        assert_eq!(
+            spans,
+            vec![(0, (4 * PAGE_SIZE) as usize), ((4 * PAGE_SIZE) as usize, (4 * PAGE_SIZE) as usize)]
+        );
+
+        // Fork and verify CoW-borrowed reads and CoW-breaking writes preserve isolation.
+        let shared = mm.into_shared();
+        let child = shared.borrow_mut().fork().unwrap();
+        let mut buf = vec![0u8; (4 * PAGE_SIZE) as usize];
+        child
+            .borrow()
+            .read(UserSlice::new(adj_a, buf.len()), &mut buf)
+            .unwrap();
+        assert!(buf.iter().all(|&b| b == 0x33));
+        let new_data = vec![0x77u8; (4 * PAGE_SIZE) as usize];
+        child
+            .borrow()
+            .write(UserSlice::new(adj_a, new_data.len()), &new_data)
+            .unwrap();
+        let mut parent_buf = vec![0u8; (4 * PAGE_SIZE) as usize];
+        shared
+            .borrow()
+            .read(UserSlice::new(adj_a, parent_buf.len()), &mut parent_buf)
+            .unwrap();
+        assert!(parent_buf.iter().all(|&b| b == 0x33));
+    }
+
+    #[test]
+    fn fork_copies_instead_of_lending_region_with_active_io_write_pin() {
+        let mut mm = Mm::new();
+        let base = 0x3800_0000u64;
+        let len = (16 * PAGE_SIZE) as usize;
+        mm.map_anonymous(base, len as u64, RW).unwrap();
+        let initial = vec![0x11u8; len];
+        mm.write(UserSlice::new(base, len), &initial).unwrap();
+
+        let shared = mm.into_shared();
+        // Pin `base..base+len` as an in-flight unlocked read destination.
+        let mut pinned = shared.borrow().pin_io(base, len, true);
+        assert_eq!(pinned.len, len);
+        assert!(!pinned.faulted);
+        assert!(shared.borrow().vmas[&base].region.has_io_write_pins());
+
+        // Forking while `pinned` is held must copy instead of CoW-lending the pinned region.
+        let child = shared.borrow_mut().fork().unwrap();
+        assert!(child.borrow().cow.borrow().borrowed.is_empty());
+        assert!(shared.borrow().cow.borrow().lent.is_empty());
+
+        // Simulate the in-flight unlocked host `pread` overwriting the pinned host pages.
+        let memfd = appine_hal::memfd(c"pin-fork-test").unwrap();
+        let updated = vec![0x22u8; len];
+        assert_eq!(
+            appine_hal::pwrite(std::os::fd::AsRawFd::as_raw_fd(&memfd), &updated, 0).unwrap(),
+            len
+        );
+        assert_eq!(
+            pinned
+                .io
+                .pread(std::os::fd::AsRawFd::as_raw_fd(&memfd), 0)
+                .unwrap(),
+            len
+        );
+
+        // Parent sees the newly read bytes; child retains its pre-fork snapshot intact.
+        let mut parent_out = vec![0u8; len];
+        let mut child_out = vec![0u8; len];
+        shared
+            .borrow()
+            .read(UserSlice::new(base, len), &mut parent_out)
+            .unwrap();
+        child
+            .borrow()
+            .read(UserSlice::new(base, len), &mut child_out)
+            .unwrap();
+        assert!(parent_out.iter().all(|&b| b == 0x22));
+        assert!(child_out.iter().all(|&b| b == 0x11));
+
+        // After releasing the pin, `io_write_pins` drops to 0 and a subsequent fork lends normally.
+        drop(pinned);
+        assert!(!shared.borrow().vmas[&base].region.has_io_write_pins());
+        let child2 = shared.borrow_mut().fork().unwrap();
+        assert!(!child2.borrow().cow.borrow().borrowed.is_empty());
     }
 }
