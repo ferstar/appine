@@ -272,12 +272,11 @@ fn futex_wait(
     let shared = cx.shared;
     // No-BKL wakes (syscall::fast) also take the bucket lock, so nothing is missed between
     // checking the value and registering
-    let Some(waiter) =
-        shared
-            .futexes()
-            .enqueue_if(key, bitset, cx.task.event.clone(), || {
-                Ok(u32::from_le_bytes(get(cx, uaddr)?) == val)
-            })?
+    let Some(waiter) = shared
+        .futexes()
+        .enqueue_if(key, bitset, cx.task.event.clone(), || {
+            Ok(u32::from_le_bytes(get(cx, uaddr)?) == val)
+        })?
     else {
         return Err(Errno::EAGAIN);
     };

@@ -162,8 +162,14 @@ impl BucketGuard<'_> {
             .pi_count
             .fetch_add(1, Ordering::Relaxed);
         self.futexes.pi_count.fetch_add(1, Ordering::Release);
-        self.futexes
-            .push_locked(&mut self.entries, self.index, key, u32::MAX, event, Some(waiter))
+        self.futexes.push_locked(
+            &mut self.entries,
+            self.index,
+            key,
+            u32::MAX,
+            event,
+            Some(waiter),
+        )
     }
 
     /// Wakes PI waiter `id`, the new owner of the lock it waited for.
