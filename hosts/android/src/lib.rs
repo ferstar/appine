@@ -320,7 +320,11 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_readFile<'l>(
     })
 }
 
-fn read_file_result(env: &mut JNIEnv<'_>, path: &str, result: Result<Vec<u8>, Errno>) -> jbyteArray {
+fn read_file_result(
+    env: &mut JNIEnv<'_>,
+    path: &str,
+    result: Result<Vec<u8>, Errno>,
+) -> jbyteArray {
     match result {
         Ok(data) => env
             .byte_array_from_slice(&data)
@@ -376,7 +380,10 @@ impl Drop for StoreSessionGuard {
     }
 }
 
-fn with_store_session<R>(handle: jlong, f: impl FnOnce(&Store) -> Result<R, Errno>) -> Result<R, Errno> {
+fn with_store_session<R>(
+    handle: jlong,
+    f: impl FnOnce(&Store) -> Result<R, Errno>,
+) -> Result<R, Errno> {
     let ptr = STORE_SESSIONS.with(|sessions| {
         let mut map = sessions.borrow_mut();
         let entry = map.get_mut(&handle)?;

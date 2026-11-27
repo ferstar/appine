@@ -149,7 +149,8 @@ pub fn write_file_in(
 
 /// Reads a regular file on an already-open [`Store`] (from [`with_store`]). See [`vfs::read_file`].
 pub fn read_file_in(store: &Store, path: &str) -> Result<Vec<u8>, Errno> {
-    bug::host_call("read_file", || vfs::read_file(store, path.as_bytes())).unwrap_or(Err(Errno::EIO))
+    bug::host_call("read_file", || vfs::read_file(store, path.as_bytes()))
+        .unwrap_or(Err(Errno::EIO))
 }
 
 /// Writes a file in the inode store (for the host to prepare configuration files, such as

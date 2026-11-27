@@ -7217,7 +7217,10 @@ mod tests {
         drop(s);
 
         crate::with_store(&dir, |store| {
-            assert!(store.reaper.is_none(), "open_short must not spawn a reaper thread");
+            assert!(
+                store.reaper.is_none(),
+                "open_short must not spawn a reaper thread"
+            );
             let syncs_after_open = store.meta.syncs.load(Ordering::Relaxed);
             assert_eq!(syncs_after_open, 1, "exclusive open syncs metadata once");
 
@@ -7227,7 +7230,10 @@ mod tests {
             crate::write_file_in(store, "/etc/a", b"changed", 0o644, false, 0, 0)?;
             assert_eq!(crate::read_file_in(store, "/etc/a")?, b"alpha");
             assert_eq!(crate::read_file_in(store, "/etc/b")?, b"beta");
-            assert_eq!(crate::read_file_in(store, "/etc/missing"), Err(Errno::ENOENT));
+            assert_eq!(
+                crate::read_file_in(store, "/etc/missing"),
+                Err(Errno::ENOENT)
+            );
 
             // A failing step (obstructed path) must leave prior committed writes intact.
             let etc = store.lookup(ROOT, b"etc")?.unwrap();
