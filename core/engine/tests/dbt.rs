@@ -6167,18 +6167,22 @@ fn stlb_fast_path_in_emit_fill() {
     }
 }
 
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
+fn host_fpcr() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mrs {}, fpcr", out(reg) v, options(nomem, nostack)) };
+    v
+}
+
 #[test]
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "linux", target_os = "android")
 ))]
 fn enter_exit_fpcr_skip_and_restore() {
-    fn host_fpcr() -> u64 {
-        let v: u64;
-        unsafe { core::arch::asm!("mrs {}, fpcr", out(reg) v, options(nomem, nostack)) };
-        v
-    }
-
     const FADD_D0_D1_D2: u32 = 0x1e62_2820; // fadd d0, d1, d2
     const FDIV_D0_D1_D2: u32 = 0x1e62_1820; // fdiv d0, d1, d2
     const FMOV_X0_D0: u32 = 0x9e66_0000; // fmov x0, d0
@@ -6415,18 +6419,26 @@ fn stolen_rd_write_only_and_read_modify_write() {
     any(target_os = "linux", target_os = "android")
 ))]
 fn lazy_fp_state_across_blocks_exits_and_fpsr_fpcr() {
-    fn host_fpcr() -> u64 {
-        let v: u64;
-        unsafe { core::arch::asm!("mrs {}, fpcr", out(reg) v, options(nomem, nostack)) };
-        v
-    }
-    fn host_fpsr() -> u64 {
-        let v: u64;
-        unsafe { core::arch::asm!("mrs {}, fpsr", out(reg) v, options(nomem, nostack)) };
-        v
-    }
     fn set_host_fpsr(v: u64) {
         unsafe { core::arch::asm!("msr fpsr, {}", in(reg) v, options(nomem, nostack)) };
+    }
+
+    fn run_case(
+        g_t1: &mut Guest,
+        g_t0: &mut Guest,
+        dbt: &mut Dbt,
+        orig_fpcr: u64,
+        pc: u64,
+        init: impl Fn(&mut appine_engine::CpuState),
+    ) {
+        for g in [&mut *g_t1, &mut *g_t0] {
+            let s = g.cpu.state_mut();
+            init(s);
+            s.pc = pc;
+        }
+        assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
+        assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
+        assert_eq!(host_fpcr(), orig_fpcr);
     }
 
     const FADD_D0_D1_D2: u32 = 0x1e62_2820; // fadd d0, d1, d2
@@ -6457,9 +6469,6 @@ fn lazy_fp_state_across_blocks_exits_and_fpsr_fpcr() {
         let f_interp_mix = CODE + 0x200;
         // 4. Integer -> MRS FPSR (must lazily load guest FPSR) -> SVC
         let f_mrs_fpsr = CODE + 0x240;
-        // 5. Loop: integer -> FP -> back-edge (R_KICK after kick) -> SVC
-        let f_kick_loop = CODE + 0x280;
-        let f_kick_fp = CODE + 0x2c0;
         // 6. SIMD load/store block (no SIMD DP, only LDR/STR Q) -> SVC
         let f_simd_ldst = CODE + 0x300;
 
@@ -6482,25 +6491,19 @@ fn lazy_fp_state_across_blocks_exits_and_fpsr_fpcr() {
                     FADD_D0_D1_D2,
                     MSR_FPCR_X4, // changes FPCR -> R_INTERP
                     FADD_D0_D1_D2,
-                    MSR_FPSR_X3, // writes FPSR -> R_INTERP (or inline)
+                    MSR_FPSR_X3, // writes FPSR -> inline
                     MRS_FPSR_X2,
                     FMOV_X0_D0,
                     SVC,
                 ],
             );
             g.code(f_mrs_fpsr, &[ADD_X1_1, MRS_FPSR_X2, SVC]);
-            g.code(f_kick_loop, &[SUB_X0_1, b(f_kick_loop + 4, f_kick_fp)]);
-            g.code(
-                f_kick_fp,
-                &[FADD_D0_D1_D2, cbnz_x0(f_kick_fp + 4, f_kick_loop), SVC],
-            );
             g.code(f_simd_ldst, &[LDR_Q4_X5, STR_Q0_X5, SVC]);
         }
 
         // Case 1: integer-only run preserves all V0-V31, FPCR, FPSR even with different host FPSR.
         set_host_fpsr(IXC);
-        for g in [&mut g_t1, &mut g_t0] {
-            let s = g.cpu.state_mut();
+        run_case(&mut g_t1, &mut g_t0, &mut dbt, orig_fpcr, f_int_only, |s| {
             s.x[1] = 10;
             s.fpcr = orig_fpcr ^ FZ;
             s.fpsr = 0x1; // IOC only (different from host IXC)
@@ -6508,11 +6511,7 @@ fn lazy_fp_state_across_blocks_exits_and_fpsr_fpcr() {
             for i in 0..32 {
                 s.v[i] = [0x1111_0000 + i as u64, 0x2222_0000 + i as u64];
             }
-            s.pc = f_int_only;
-        }
-        assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
-        assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
-        assert_eq!(host_fpcr(), orig_fpcr);
+        });
         assert_eq!(g_t1.cpu.state().x[1], g_t0.cpu.state().x[1]);
         assert_eq!(g_t1.cpu.state().v, g_t0.cpu.state().v);
         assert_eq!(g_t1.cpu.state().fpsr, 0x1);
@@ -6522,22 +6521,24 @@ fn lazy_fp_state_across_blocks_exits_and_fpsr_fpcr() {
         // Case 2: integer -> forward B -> FP -> forward B -> integer -> SVC (cold + warm linked).
         for round in 0..2 {
             set_host_fpsr(if round == 0 { 0 } else { 0x0800_0001 });
-            for g in [&mut g_t1, &mut g_t0] {
-                let s = g.cpu.state_mut();
-                s.x[1] = 100;
-                s.fpcr = orig_fpcr;
-                s.fpsr = 0;
-                s.nzcv = 0x5000_0000;
-                s.v[0] = [0, 0];
-                s.v[1] = [1.0_f64.to_bits(), 0];
-                s.v[2] = [3.0_f64.to_bits(), 0];
-                s.v[3] = [0, 0];
-                s.v[15] = [0xdead_beef_cafe_0001, 0x0123_4567_89ab_cdef];
-                s.pc = f_int_to_fp;
-            }
-            assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
-            assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
-            assert_eq!(host_fpcr(), orig_fpcr);
+            run_case(
+                &mut g_t1,
+                &mut g_t0,
+                &mut dbt,
+                orig_fpcr,
+                f_int_to_fp,
+                |s| {
+                    s.x[1] = 100;
+                    s.fpcr = orig_fpcr;
+                    s.fpsr = 0;
+                    s.nzcv = 0x5000_0000;
+                    s.v[0] = [0, 0];
+                    s.v[1] = [1.0_f64.to_bits(), 0];
+                    s.v[2] = [3.0_f64.to_bits(), 0];
+                    s.v[3] = [0, 0];
+                    s.v[15] = [0xdead_beef_cafe_0001, 0x0123_4567_89ab_cdef];
+                },
+            );
             assert_eq!(g_t1.cpu.state().x[0], g_t0.cpu.state().x[0]);
             assert_eq!(g_t1.cpu.state().x[1], 102);
             assert_eq!(g_t1.cpu.state().v[0], g_t0.cpu.state().v[0]);
@@ -6549,20 +6550,22 @@ fn lazy_fp_state_across_blocks_exits_and_fpsr_fpcr() {
         }
 
         // Case 3: FP -> R_INTERP (MSR FPCR change) -> FP -> MSR/MRS FPSR -> SVC.
-        for g in [&mut g_t1, &mut g_t0] {
-            let s = g.cpu.state_mut();
-            s.fpcr = orig_fpcr;
-            s.fpsr = 0;
-            s.nzcv = 0x9000_0000;
-            s.v[1] = [1, 0]; // subnormal
-            s.v[2] = [0, 0];
-            s.x[4] = orig_fpcr ^ FZ;
-            s.x[3] = 0x0800_0005; // QC | OFC | IOC
-            s.pc = f_interp_mix;
-        }
-        assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
-        assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
-        assert_eq!(host_fpcr(), orig_fpcr);
+        run_case(
+            &mut g_t1,
+            &mut g_t0,
+            &mut dbt,
+            orig_fpcr,
+            f_interp_mix,
+            |s| {
+                s.fpcr = orig_fpcr;
+                s.fpsr = 0;
+                s.nzcv = 0x9000_0000;
+                s.v[1] = [1, 0]; // subnormal
+                s.v[2] = [0, 0];
+                s.x[4] = orig_fpcr ^ FZ;
+                s.x[3] = 0x0800_0005; // QC | OFC | IOC
+            },
+        );
         assert_eq!(g_t1.cpu.state().x[0], g_t0.cpu.state().x[0]);
         assert_eq!(g_t1.cpu.state().x[2], g_t0.cpu.state().x[2]);
         assert_eq!(g_t1.cpu.state().fpcr, orig_fpcr ^ FZ);
@@ -6571,14 +6574,10 @@ fn lazy_fp_state_across_blocks_exits_and_fpsr_fpcr() {
 
         // Case 4: integer block containing MRS FPSR must read guest FPSR, not stale host FPSR.
         set_host_fpsr(0);
-        for g in [&mut g_t1, &mut g_t0] {
-            let s = g.cpu.state_mut();
+        run_case(&mut g_t1, &mut g_t0, &mut dbt, orig_fpcr, f_mrs_fpsr, |s| {
             s.fpsr = 0x17;
             s.fpcr = orig_fpcr;
-            s.pc = f_mrs_fpsr;
-        }
-        assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
-        assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
+        });
         assert_eq!(g_t1.cpu.state().x[2], 0x17);
         assert_eq!(g_t1.cpu.state().fpsr, 0x17);
 
@@ -6617,19 +6616,21 @@ fn lazy_fp_state_across_blocks_exits_and_fpsr_fpcr() {
         }
 
         // Case 6: SIMD load/store-only block lazily loads and flushes V registers.
-        for g in [&mut g_t1, &mut g_t0] {
-            let s = g.cpu.state_mut();
-            s.x[5] = DATA;
-            s.v[0] = [0x1122_3344_5566_7788, 0x99aa_bbcc_ddee_ff00];
-            s.v[4] = [0, 0];
-            s.pc = f_simd_ldst;
-        }
-        assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
-        assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
+        run_case(
+            &mut g_t1,
+            &mut g_t0,
+            &mut dbt,
+            orig_fpcr,
+            f_simd_ldst,
+            |s| {
+                s.x[5] = DATA;
+                s.v[0] = [0x1122_3344_5566_7788, 0x99aa_bbcc_ddee_ff00];
+                s.v[4] = [0, 0];
+            },
+        );
         assert_eq!(g_t1.cpu.state().v[4], g_t0.cpu.state().v[4]);
         assert_eq!(g_t1.data(0, 0), 0x1122_3344_5566_7788);
         assert_eq!(g_t1.data(0, 8), 0x99aa_bbcc_ddee_ff00);
-        let _ = host_fpsr();
     }
     set_host_fpsr(0);
 }
@@ -6767,17 +6768,8 @@ fn ret_miss_out_of_line_jump_cache_and_tbi0() {
         let code_c = code_a + 2 * PAGE_SIZE;
         let stack = 0x80_0000u64;
         unsafe {
-            mmu.map(code_a, base, PAGE_SIZE, prot::READ | prot::EXEC)
+            mmu.map(code_a, base, 3 * PAGE_SIZE, prot::READ | prot::EXEC)
                 .unwrap();
-            mmu.map(code_b, base.add(4096), PAGE_SIZE, prot::READ | prot::EXEC)
-                .unwrap();
-            mmu.map(
-                code_c,
-                base.add(2 * 4096),
-                PAGE_SIZE,
-                prot::READ | prot::EXEC,
-            )
-            .unwrap();
             mmu.map(
                 stack - PAGE_SIZE,
                 base.add(3 * 4096),
@@ -6938,6 +6930,32 @@ fn inlined_sysregs_dit_fpsr_and_128bit_exclusives_match_tier0() {
     const LDXP_W20_W19_X11: u32 = 0x887f_4d74; // ldxp w20, w19, [x11]
     const STXP_W14_W15_W20_X11: u32 = 0x882e_516f; // stxp w14, w15, w20, [x11]
 
+    fn run_inline(
+        [g_t1, g_t0]: [&mut Guest; 2],
+        dbt: &mut Dbt,
+        regs: DbtRegs,
+        pc: u64,
+        prog: &[u32],
+        label: &str,
+        init: impl Fn(&mut appine_engine::CpuState),
+    ) {
+        for g in [&mut *g_t1, &mut *g_t0] {
+            g.code(pc, prog);
+            let s = g.cpu.state_mut();
+            init(s);
+            s.pc = pc;
+        }
+        let interp_before = dbt.stats().exits_interp;
+        assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
+        assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
+        assert_eq!(
+            dbt.stats().exits_interp,
+            interp_before,
+            "{label} should stay inline ({regs:?})"
+        );
+        assert_eq!(g_t1.cpu.state().x, g_t0.cpu.state().x);
+    }
+
     for regs in [DbtRegs::Default, DbtRegs::Go] {
         let mut g_t1 = Guest::with_data();
         let mut g_t0 = Guest::with_data();
@@ -6968,23 +6986,19 @@ fn inlined_sysregs_dit_fpsr_and_128bit_exclusives_match_tier0() {
             mrs_ctr_stolen,
             SVC,
         ];
-        for g in [&mut g_t1, &mut g_t0] {
-            g.code(f_sys, &prog_sys);
-            let s = g.cpu.state_mut();
-            s.x[8] = u64::MAX; // must mask to FPSR_MASK (0x0800_009f)
-            s.x[stolen as usize] = 0x0800_0015;
-            s.nzcv = 0x6000_0000;
-            s.pc = f_sys;
-        }
-        let interp0 = dbt.stats().exits_interp;
-        assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
-        assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
-        assert_eq!(
-            dbt.stats().exits_interp,
-            interp0,
-            "inlined sysregs and MSR FPSR should not exit to Tier 0 ({regs:?})"
+        run_inline(
+            [&mut g_t1, &mut g_t0],
+            &mut dbt,
+            regs,
+            f_sys,
+            &prog_sys,
+            "inlined sysregs and MSR FPSR",
+            |s| {
+                s.x[8] = u64::MAX; // must mask to FPSR_MASK (0x0800_009f)
+                s.x[stolen as usize] = 0x0800_0015;
+                s.nzcv = 0x6000_0000;
+            },
         );
-        assert_eq!(g_t1.cpu.state().x, g_t0.cpu.state().x);
         assert_eq!(g_t1.cpu.state().fpsr, g_t0.cpu.state().fpsr);
         assert_eq!(g_t1.cpu.state().nzcv, 0x6000_0000);
 
@@ -7008,24 +7022,20 @@ fn inlined_sysregs_dit_fpsr_and_128bit_exclusives_match_tier0() {
                 msr_dit_stolen,
                 SVC,
             ];
-            for g in [&mut g_t1, &mut g_t0] {
-                g.code(f_dit, &prog_dit);
-                let s = g.cpu.state_mut();
-                s.dit = 0;
-                s.x[2] = 1 << 24;
-                s.x[stolen as usize] = 1 << 24;
-                s.nzcv = 0xa000_0000;
-                s.pc = f_dit;
-            }
-            let interp_d = dbt.stats().exits_interp;
-            assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
-            assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
-            assert_eq!(
-                dbt.stats().exits_interp,
-                interp_d,
-                "DIT should be inline ({regs:?})"
+            run_inline(
+                [&mut g_t1, &mut g_t0],
+                &mut dbt,
+                regs,
+                f_dit,
+                &prog_dit,
+                "DIT",
+                |s| {
+                    s.dit = 0;
+                    s.x[2] = 1 << 24;
+                    s.x[stolen as usize] = 1 << 24;
+                    s.nzcv = 0xa000_0000;
+                },
             );
-            assert_eq!(g_t1.cpu.state().x, g_t0.cpu.state().x);
             assert_eq!(g_t1.cpu.state().dit, 1);
             assert_eq!(g_t1.cpu.state().nzcv, 0xa000_0000);
             // Reset DIT back to 0 so host DIT stays clean.
@@ -7060,25 +7070,21 @@ fn inlined_sysregs_dit_fpsr_and_128bit_exclusives_match_tier0() {
             STXP_W14_W15_W20_X11,
             SVC,
         ];
-        for g in [&mut g_t1, &mut g_t0] {
-            g.code(f_excl, &prog_excl);
-            let s = g.cpu.state_mut();
-            s.x = [0; 31];
-            s.x[11] = DATA; // 16-byte aligned
-            s.x[15] = 0xaaaa_bbbb_cccc_dddd;
-            s.x[19] = 0x1111_2222_3333_4444;
-            s.nzcv = 0x5000_0000;
-            s.pc = f_excl;
-        }
-        let interp_e = dbt.stats().exits_interp;
-        assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
-        assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
-        assert_eq!(
-            dbt.stats().exits_interp,
-            interp_e,
-            "pair exclusives should stay inline ({regs:?})"
+        run_inline(
+            [&mut g_t1, &mut g_t0],
+            &mut dbt,
+            regs,
+            f_excl,
+            &prog_excl,
+            "pair exclusives",
+            |s| {
+                s.x = [0; 31];
+                s.x[11] = DATA; // 16-byte aligned
+                s.x[15] = 0xaaaa_bbbb_cccc_dddd;
+                s.x[19] = 0x1111_2222_3333_4444;
+                s.nzcv = 0x5000_0000;
+            },
         );
-        assert_eq!(g_t1.cpu.state().x, g_t0.cpu.state().x);
         assert_eq!(g_t1.cpu.state().nzcv, 0x5000_0000);
         assert_eq!(g_t1.data(0, 0), g_t0.data(0, 0));
         assert_eq!(g_t1.data(0, 8), g_t0.data(0, 8));

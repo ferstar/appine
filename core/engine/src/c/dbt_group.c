@@ -107,6 +107,11 @@ static bool uses_t2(const struct xlate *x, uint32_t insn, const struct operands 
     return false;
 }
 
+static inline bool is_mrs_tpidr_el0(uint32_t insn)
+{
+    return (insn & 0xffffffe0u) == (0xd5200000u | (SYSREG_TPIDR_EL0 << 5));
+}
+
 /*
  * Advance affine alias tracking (bit r set in *alias_mask => register r equals leader's base +
  * alias_off[r], with bit 31 = SP) across a non-memory instruction. Returns 0 if the instruction
@@ -166,17 +171,13 @@ static int keeps_group_step(const struct xlate *x, uint32_t insn, uint32_t *alia
         }
         return *alias_mask ? (uses_t2(x, insn, &o) ? 2 : 1) : 0;
     }
-    if ((insn & 0xffffffe0u) == (0xd5200000u | (SYSREG_TPIDR_EL0 << 5))) { /* MRS Xt, TPIDR_EL0 */
+    if (is_mrs_tpidr_el0(insn)) { /* MRS Xt, TPIDR_EL0 */
         unsigned rt = insn & 31;
         if (rt < 31)
             *alias_mask &= ~(1u << rt);
         return *alias_mask != 0; /* uses at most T0 for stolen Rt, never T2 */
     }
-    return (insn & 0xff000010) == 0x54000000 || /* B.cond */
-           (insn & 0x7e000000) == 0x34000000 || /* CBZ/CBNZ */
-           (insn & 0x7e000000) == 0x36000000 || /* TBZ/TBNZ */
-           (insn & 0xfffff01f) == 0xd503201f || /* HINT */
-           (insn & 0xfffff01f) == 0xd503301f;   /* barriers, CLREX */
+    return dbt_is_nogpr_ctrl(insn);
 }
 
 /* Same as keeps_group_step, for register-offset (M_REG) groups with fixed (rn, rm, option, shift) */
@@ -231,47 +232,53 @@ static int keeps_group_reg(const struct xlate *x, uint32_t insn, unsigned rn, un
         }
         return uses_t2(x, insn, &o) ? 2 : 1;
     }
-    if ((insn & 0xffffffe0u) == (0xd5200000u | (SYSREG_TPIDR_EL0 << 5))) { /* MRS Xt, TPIDR_EL0 */
+    if (is_mrs_tpidr_el0(insn)) { /* MRS Xt, TPIDR_EL0 */
         unsigned rt = insn & 31;
         return (rt == 31 || (rt != rn && rt != rm)) ? 1 : 0;
     }
-    return (insn & 0xff000010) == 0x54000000 || /* B.cond */
-           (insn & 0x7e000000) == 0x34000000 || /* CBZ/CBNZ */
-           (insn & 0x7e000000) == 0x36000000 || /* TBZ/TBNZ */
-           (insn & 0xfffff01f) == 0xd503201f || /* HINT */
-           (insn & 0xfffff01f) == 0xd503301f;   /* barriers, CLREX */
+    return dbt_is_nogpr_ctrl(insn);
 }
+
+#define GROUP_OFF_LIMIT (1 << 23) /* ±8 MiB signed offset limit for emit_add_const */
 
 /* Whether insn is an inline-translated LDAR, STLR or feature-gated LDAPR (clobbers T2 via its
  * own TLB check, writes only Rt when *is_load is true, and never modifies Rn). */
 static bool is_group_safe_atomic(uint32_t insn, bool *is_load)
 {
-    if ((insn & 0x3fa08000u) == 0x08808000u) { /* LDAR / STLR (o2=1, o1=0, o0=1) */
+    if (dbt_is_ldar_stlr(insn)) {
         *is_load = BIT(insn, 22) != 0;
         return true;
     }
-    if ((insn & 0x3ffffc00u) == 0x38bfc000u && appine_has(APPINE_HWCAP_LRCPC)) { /* LDAPR */
+    if (dbt_is_ldapr(insn) && appine_has(APPINE_HWCAP_LRCPC)) {
         *is_load = true;
         return true;
     }
     return false;
 }
 
-/* Update affine aliases across a non-joining memory access that will execute ungrouped. */
-static void skip_memop_aliases(const struct memop *m, uint32_t *alias_mask, int64_t alias_off[32])
+/* Update affine aliases across a memory access (joined or skipped). */
+static void update_memop_aliases(const struct memop *m, uint32_t *alias_mask, int64_t alias_off[32])
 {
-    if (m->load && !m->simd) {
-        if (m->rt < 31)
-            *alias_mask &= ~(1u << m->rt);
-        if (m->pair && m->rt2 < 31)
-            *alias_mask &= ~(1u << m->rt2);
-    }
     if (m->mode == M_PRE || m->mode == M_POST) {
         if (m->wb_reg)
             *alias_mask &= ~(1u << m->rn);
         else if ((*alias_mask >> m->rn) & 1)
             alias_off[m->rn] += m->imm;
     }
+    if (m->load && !m->simd) {
+        if (m->rt < 31)
+            *alias_mask &= ~(1u << m->rt);
+        if (m->pair && m->rt2 < 31)
+            *alias_mask &= ~(1u << m->rt2);
+    }
+}
+
+/* Whether adding member `m` at `start` keeps the group within GROUP_SPAN and emit_add_const range. */
+static bool span_fits(const struct xlate *x, const struct memop *m, int64_t start, int64_t nlo,
+                      int64_t nhi)
+{
+    return nhi - nlo <= GROUP_SPAN && start > -GROUP_OFF_LIMIT && start < GROUP_OFF_LIMIT &&
+           nlo > -GROUP_OFF_LIMIT && nlo < GROUP_OFF_LIMIT && member_fits(x, m, start);
 }
 
 /* When access `m` executes, the base is `delta` more than before the leader executed: the start
@@ -351,8 +358,7 @@ int dbt_plan_group(struct xlate *x, const struct memop *lead)
             }
             int64_t start = delta, end = start + memop_bytes(&m);
             int64_t nlo = start < lo ? start : lo, nhi = end > hi ? end : hi;
-            if (nhi - nlo > GROUP_SPAN || start <= -(1 << 23) || start >= (1 << 23) ||
-                nlo <= -(1 << 23) || nlo >= (1 << 23) || !member_fits(x, &m, start)) {
+            if (!span_fits(x, &m, start, nlo, nhi)) {
                 if (m.load && !m.simd && ((rn < 31 && m.rt == rn) || (rm < 31 && m.rt == rm)))
                     break;
                 clobbered = true;
@@ -389,18 +395,7 @@ int dbt_plan_group(struct xlate *x, const struct memop *lead)
                 }
             }
         }
-        if (lead->mode == M_PRE || lead->mode == M_POST) {
-            if (lead->wb_reg)
-                alias_mask &= ~(1u << rn);
-            else
-                alias_off[rn] += lead->imm;
-        }
-        if (lead->load && !lead->simd) {
-            if (lead->rt < 31)
-                alias_mask &= ~(1u << lead->rt);
-            if (lead->pair && lead->rt2 < 31)
-                alias_mask &= ~(1u << lead->rt2);
-        }
+        update_memop_aliases(lead, &alias_mask, alias_off);
         for (unsigned j = x->idx + 1; alias_mask && j < x->limit && g->n < GROUP_MAX; j++) {
             uint32_t insn = fetch_guest(x, j);
             unsigned top = FIELD(insn, 28, 25);
@@ -432,18 +427,16 @@ int dbt_plan_group(struct xlate *x, const struct memop *lead)
             bool can_join = !is_grouped_idx(x, j) && m.mode != M_LITERAL && m.mode != M_REG &&
                             ((alias_mask >> m.rn) & 1) &&
                             (m.rn != 31 || (rn == 31 && (alias_off[31] & 15) == 0));
-            if (!can_join) {
-                skip_memop_aliases(&m, &alias_mask, alias_off);
-                if (!alias_mask)
-                    break;
-                clobbered = true;
-                continue;
+            int64_t start = 0, nlo = 0, nhi = 0;
+            if (can_join) {
+                start = member_start(&m, alias_off[m.rn]);
+                int64_t end = start + memop_bytes(&m);
+                nlo = start < lo ? start : lo;
+                nhi = end > hi ? end : hi;
+                can_join = span_fits(x, &m, start, nlo, nhi);
             }
-            int64_t start = member_start(&m, alias_off[m.rn]), end = start + memop_bytes(&m);
-            int64_t nlo = start < lo ? start : lo, nhi = end > hi ? end : hi;
-            if (nhi - nlo > GROUP_SPAN || start <= -(1 << 23) || start >= (1 << 23) ||
-                nlo <= -(1 << 23) || nlo >= (1 << 23) || !member_fits(x, &m, start)) {
-                skip_memop_aliases(&m, &alias_mask, alias_off);
+            if (!can_join) {
+                update_memop_aliases(&m, &alias_mask, alias_off);
                 if (!alias_mask)
                     break;
                 clobbered = true;
@@ -458,18 +451,7 @@ int dbt_plan_group(struct xlate *x, const struct memop *lead)
             g->spill |= clobbered;
             clobbered = false;
             g->n++;
-            if (m.mode == M_PRE || m.mode == M_POST) {
-                if (m.wb_reg)
-                    alias_mask &= ~(1u << m.rn);
-                else
-                    alias_off[m.rn] += m.imm;
-            }
-            if (m.load && !m.simd) {
-                if (m.rt < 31)
-                    alias_mask &= ~(1u << m.rt);
-                if (m.pair && m.rt2 < 31)
-                    alias_mask &= ~(1u << m.rt2);
-            }
+            update_memop_aliases(&m, &alias_mask, alias_off);
         }
     }
     if (g->n < 2) {

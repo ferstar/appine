@@ -829,6 +829,28 @@ static inline void patch_local(struct xlate *x, uint32_t *site, const uint32_t *
         patch_branch(x->wdelta, site, target);
 }
 
+/* Execute msr_insn only when target differs from cur (clobbers cur, leaves NZCV untouched). */
+static inline void emit_msr_if_changed(struct xlate *x, unsigned cur, unsigned target,
+                                       uint32_t msr_insn)
+{
+    emit(x, enc_eor_lsr(cur, cur, target, 0));
+    uint32_t *same = here(x);
+    emit(x, enc_cbz_x(cur));
+    emit(x, msr_insn);
+    patch_local(x, same, here(x));
+}
+
+/* Probe the thread-local jump cache for raw target PC in T0; leaves mismatch in T2 and candidate
+ * code pointer in T1 (NZCV-free). */
+static inline void emit_jc_probe(struct xlate *x)
+{
+    emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, dbt_jump_cache)));
+    emit(x, enc_ubfx(T2, T0, 2, JC_BITS));
+    emit(x, enc_add_lsl(T1, T1, T2, 4));
+    emit(x, enc_ldp_x(T2, T1, T1, 0));
+    emit(x, enc_eor_lsr(T2, T2, T0, 0));
+}
+
 /* ---- Shared instruction-decoder and cache data structures ---- */
 
 struct operands {
@@ -996,6 +1018,26 @@ static inline bool dbt_is_atomic(uint32_t insn)
            (insn & 0x3f200c00) == 0x19000000;
 }
 
+static inline bool dbt_is_ldar_stlr(uint32_t insn)
+{
+    return (insn & 0x3fa08000u) == 0x08808000u; /* o2=1, o1=0, o0=1 */
+}
+
+static inline bool dbt_is_ldapr(uint32_t insn)
+{
+    return (insn & 0x3ffffc00u) == 0x38bfc000u;
+}
+
+/* Conditional branches, HINTs, and barriers/CLREX write no general-purpose registers. */
+static inline bool dbt_is_nogpr_ctrl(uint32_t insn)
+{
+    return (insn & 0xff000010) == 0x54000000 || /* B.cond */
+           (insn & 0x7e000000) == 0x34000000 || /* CBZ/CBNZ */
+           (insn & 0x7e000000) == 0x36000000 || /* TBZ/TBNZ */
+           (insn & 0xfffff01f) == 0xd503201f || /* HINT */
+           (insn & 0xfffff01f) == 0xd503301f;   /* barriers, CLREX */
+}
+
 bool dbt_tier0_defined_slow(struct appine_cpu *probe, uint64_t *entry, uint32_t insn, uint64_t pc);
 
 /* Fast path for unconditionally-defined base ARMv8.0 encodings whose validity depends on no
@@ -1009,7 +1051,7 @@ static inline bool dbt_tier0_base_defined(uint32_t insn)
         unsigned g = FIELD(insn, 25, 23);
         if (g <= 2)
             return true; /* ADR, ADRP, ADD/ADDS/SUB/SUBS (imm) */
-        if (g == 5)
+        if (g == 5)      /* MOVN, MOVZ, MOVK */
             return FIELD(insn, 30, 29) != 1 && (BIT(insn, 31) || FIELD(insn, 22, 21) < 2);
         return false;
     }
@@ -1036,17 +1078,17 @@ static inline bool dbt_tier0_base_defined(uint32_t insn)
                (insn & 0x7fe00000) == 0x1b000000;   /* MADD, MSUB */
     case 0x4:
     case 0xc: { /* Integer loads/stores (bit 26 == 0) */
-        if ((insn & 0x3b000000) == 0x39000000)
+        if ((insn & 0x3b000000) == 0x39000000) /* LDR/STR (unsigned imm) */
             return FIELD(insn, 23, 22) < 3 || FIELD(insn, 31, 30) < 2;
-        if ((insn & 0x3b200000) == 0x38000000) {
+        if ((insn & 0x3b200000) == 0x38000000) { /* LDUR/STUR, pre/post-index, PRFUM */
             unsigned sz = FIELD(insn, 31, 30), opc = FIELD(insn, 23, 22);
             return (opc < 3 || sz < 2) && !(sz == 3 && opc == 2 && FIELD(insn, 11, 10) != 0);
         }
-        if ((insn & 0x3b200c00) == 0x38200800)
+        if ((insn & 0x3b200c00) == 0x38200800) /* LDR/STR (register offset) */
             return (FIELD(insn, 23, 22) < 3 || FIELD(insn, 31, 30) < 2) && (FIELD(insn, 15, 13) & 2);
         if ((insn & 0x3b000000) == 0x18000000)
             return true; /* LDR/PRFM (literal) */
-        if ((insn & 0x3a000000) == 0x28000000) {
+        if ((insn & 0x3a000000) == 0x28000000) { /* LDP/STP/LDNP/STNP/LDPSW */
             unsigned opc = FIELD(insn, 31, 30);
             return opc != 3 && !(opc == 1 && (!BIT(insn, 22) || FIELD(insn, 24, 23) == 0));
         }

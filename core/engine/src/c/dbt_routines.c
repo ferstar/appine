@@ -436,11 +436,7 @@ static uint32_t *emit_ret_miss(struct xlate *x, struct appine_dbt *d)
 {
     uint32_t *entry = here(x);
     emit(x, enc_mov(T0, 30));
-    emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, dbt_jump_cache)));
-    emit(x, enc_ubfx(T2, T0, 2, JC_BITS));
-    emit(x, enc_add_lsl(T1, T1, T2, 4));
-    emit(x, enc_ldp_x(T2, T1, T1, 0));
-    emit(x, enc_eor_lsr(T2, T2, T0, 0));
+    emit_jc_probe(x);
     uint32_t *miss = here(x);
     emit(x, enc_cbnz_x(T2));
     patch_branch(x->wdelta, miss, d->lookup);
@@ -902,25 +898,9 @@ static uint32_t *emit_memop_memchr(struct xlate *x, struct appine_dbt *d)
     return entry;
 }
 
-/* Write target to FPCR only when it differs from cur (clobbers cur, leaves NZCV untouched). */
-static void emit_set_fpcr_if_changed(struct xlate *x, unsigned cur, unsigned target)
-{
-    emit(x, enc_eor_lsr(cur, cur, target, 0));
-    uint32_t *same = here(x);
-    emit(x, enc_cbz_x(cur));
-    emit(x, enc_msr_fpcr(target));
-    patch_branch(x->wdelta, same, here(x));
-}
-
-/* Write target to FPSR only when it differs from cur (clobbers cur, leaves NZCV untouched). */
-static void emit_set_fpsr_if_changed(struct xlate *x, unsigned cur, unsigned target)
-{
-    emit(x, enc_eor_lsr(cur, cur, target, 0));
-    uint32_t *same = here(x);
-    emit(x, enc_cbz_x(cur));
-    emit(x, enc_msr_fpsr(target));
-    patch_branch(x->wdelta, same, here(x));
-}
+/* Frame slots inside enter's stack frame reserved for lazy FP/SIMD save/restore */
+#define FRAME_FPCR_OFF 104
+#define FRAME_D8_OFF 112
 
 /* The enter, lazy FP load, and exit routines: placed at the start of the code cache, so that
  * every block and exit stub can reach them with one b */
@@ -930,9 +910,9 @@ void dbt_emit_routines(struct appine_dbt *d)
     size_t x0 = offsetof(struct appine_cpu, x), v0 = offsetof(struct appine_cpu, v);
 
     /* uint64_t enter(struct appine_cpu *cpu, uint32_t *code): save host callee-saved GPRs and
-     * reserve frame slots for host FPCR (+104) and d8–d15 (+112..175). Host FP/SIMD state is not
-     * touched until the first FP/SIMD block invokes d->load_fp, so integer-only runs skip saving
-     * and restoring 512 B of V0–V31, d8–d15, FPCR and FPSR. */
+     * reserve frame slots for host FPCR (+FRAME_FPCR_OFF) and d8–d15 (+FRAME_D8_OFF). Host FP/SIMD
+     * state is not touched until the first FP/SIMD block invokes d->load_fp, so integer-only runs
+     * skip saving and restoring 512 B of V0–V31, d8–d15, FPCR and FPSR. */
     d->enter = here(x);
     emit(x, enc_stp_x_pre(29, 30, 31, -FRAME_BYTES));
     emit(x, enc_stp_x(27, 28, 31, 16));
@@ -956,14 +936,14 @@ void dbt_emit_routines(struct appine_dbt *d)
      * GPRs, SP_HOST and NZCV. */
     d->load_fp = here(x);
     for (unsigned r = 8; r < 16; r += 2)
-        emit(x, enc_stp_d(r, r + 1, 31, (int)(112 + 8 * (r - 8))));
+        emit(x, enc_stp_d(r, r + 1, 31, (int)(FRAME_D8_OFF + 8 * (r - 8))));
     emit(x, enc_mrs_fpcr(T1));
-    emit(x, enc_str_x(T1, 31, 104));
+    emit(x, enc_str_x(T1, 31, FRAME_FPCR_OFF));
     emit(x, enc_ldr_x(T2, CTX, offsetof(struct appine_cpu, fpcr)));
-    emit_set_fpcr_if_changed(x, T1, T2);
+    emit_msr_if_changed(x, T1, T2, enc_msr_fpcr(T2));
     emit(x, enc_mrs_fpsr(T1));
     emit(x, enc_ldr_x(T2, CTX, offsetof(struct appine_cpu, fpsr)));
-    emit_set_fpsr_if_changed(x, T1, T2);
+    emit_msr_if_changed(x, T1, T2, enc_msr_fpsr(T2));
     emit_add_const(x, T1, CTX, (int64_t)v0);
     for (unsigned q = 0; q < 32; q += 2)
         emit(x, enc_ldp_q(q, q + 1, T1, (int)(16 * q)));
@@ -1002,11 +982,11 @@ void dbt_emit_routines(struct appine_dbt *d)
     emit(x, enc_mrs_fpsr(T0));
     emit(x, enc_str_x(T0, CTX, offsetof(struct appine_cpu, fpsr)));
     /* Restore host FPCR only when load_fp changed it (translated code never alters host FPCR). */
-    emit(x, enc_ldr_x(T0, 31, 104));
+    emit(x, enc_ldr_x(T0, 31, FRAME_FPCR_OFF));
     emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, fpcr)));
-    emit_set_fpcr_if_changed(x, T1, T0);
+    emit_msr_if_changed(x, T1, T0, enc_msr_fpcr(T0));
     for (unsigned r = 8; r < 16; r += 2)
-        emit(x, enc_ldp_d(r, r + 1, 31, (int)(112 + 8 * (r - 8))));
+        emit(x, enc_ldp_d(r, r + 1, 31, (int)(FRAME_D8_OFF + 8 * (r - 8))));
     patch_branch(x->wdelta, skip_fp, here(x));
     emit(x, enc_mov(0, T2));
     emit(x, enc_ldp_x(19, 20, 31, 80));

@@ -617,6 +617,28 @@ static void emit_on_host_address(struct xlate *x, uint32_t insn, const struct at
     }
 }
 
+/* Write host register `src` into guest GPR `dst` (31 = XZR, ignored). */
+static void emit_put_xreg(struct xlate *x, unsigned dst, unsigned src)
+{
+    if (dst == 31)
+        return;
+    if (is_stolen(dst))
+        emit_store_guest(x, src, dst);
+    else
+        emit(x, enc_mov(dst, src));
+}
+
+/* Write immediate constant `val` into guest GPR `dst` (31 = XZR, ignored). */
+static void emit_const_to_xreg(struct xlate *x, unsigned dst, uint64_t val)
+{
+    if (dst == 31)
+        return;
+    unsigned h = is_stolen(dst) ? T0 : dst;
+    emit_mov_const(x, h, val);
+    if (h == T0)
+        emit_store_guest(x, T0, dst);
+}
+
 /* Write STXR's status: 0 for success, 1 for failure */
 static void emit_status(struct xlate *x, unsigned rs, unsigned v)
 {
@@ -626,6 +648,36 @@ static void emit_status(struct xlate *x, unsigned rs, unsigned v)
     emit(x, enc_movz(h, v, 0));
     if (h == T0)
         emit_store_guest(x, T0, rs);
+}
+
+/* Verify that cpu->excl_addr == T0 and cpu->excl_size == bytes; branches to mismatch[0..1] on miss. */
+static void emit_excl_monitor_check(struct xlate *x, unsigned bytes, uint32_t *mismatch[2])
+{
+    emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, excl_addr)));
+    emit(x, enc_eor_lsr(T1, T1, T0, 0));
+    mismatch[0] = here(x);
+    emit(x, enc_cbnz_x(T1));
+    emit(x, enc_ldr_w(T1, CTX, offsetof(struct appine_cpu, excl_size)));
+    emit(x, enc_sub_imm(T1, T1, bytes, 0));
+    mismatch[1] = here(x);
+    emit(x, enc_cbnz_x(T1));
+}
+
+/* Pick an unused non-stolen host GPR (x0..x15 are never stolen in Default or Go register sets). */
+static unsigned pick_borrow(uint32_t used_mask)
+{
+    unsigned r = 0;
+    while (used_mask & (1u << r))
+        r++;
+    return r;
+}
+
+static unsigned alloc_borrow(uint32_t *used_mask, unsigned *saved, unsigned *nsaved)
+{
+    unsigned r = pick_borrow(*used_mask);
+    *used_mask |= 1u << r;
+    saved[(*nsaved)++] = r;
+    return r;
 }
 
 /*
@@ -668,21 +720,13 @@ static bool translate_exclusive(struct xlate *x, uint32_t insn, uint64_t pc)
      */
     unsigned v = rt, borrow = 0;
     if (is_stolen(rt)) {
-        while (borrow == rn || borrow == rs)
-            borrow++;
+        borrow = pick_borrow((rn < 31 ? 1u << rn : 0) | (rs < 31 ? 1u << rs : 0));
         emit_store_guest(x, borrow, borrow);
         emit_load_guest(x, borrow, rt);
         v = borrow;
     }
     uint32_t *mismatch[2], *differ, *done;
-    emit(x, enc_ldr_x(T1, CTX, addr));
-    emit(x, enc_eor_lsr(T1, T1, T0, 0));
-    mismatch[0] = here(x);
-    emit(x, enc_cbnz_x(T1));
-    emit(x, enc_ldr_w(T1, CTX, len));
-    emit(x, enc_sub_imm(T1, T1, bytes, 0));
-    mismatch[1] = here(x);
-    emit(x, enc_cbnz_x(T1));
+    emit_excl_monitor_check(x, bytes, mismatch);
     uint32_t *loop = here(x);
     emit(x, enc_ldr_x(T1, CTX, value));
     emit(x, enc_ldaxr(size, T0, T2));
@@ -706,15 +750,6 @@ static bool translate_exclusive(struct xlate *x, uint32_t insn, uint64_t pc)
         emit_load_guest(x, borrow, borrow);
     emit(x, enc_str_w(31, CTX, len));
     return true;
-}
-
-/* Pick an unused non-stolen host GPR (x0..x15 are never stolen in Default or Go register sets). */
-static unsigned pick_borrow(uint32_t used_mask)
-{
-    unsigned r = 0;
-    while (used_mask & (1u << r))
-        r++;
-    return r;
 }
 
 /*
@@ -760,32 +795,15 @@ static bool translate_exclusive_pair(struct xlate *x, uint32_t insn, uint64_t pc
         emit(x, enc_stp_x(T0, T1, CTX, (int)value));
         emit(x, enc_movz(T2, 16, 0));
         emit(x, enc_str_w(T2, CTX, len));
-        if (rt != 31) {
-            if (is_stolen(rt))
-                emit_store_guest(x, T0, rt);
-            else
-                emit(x, enc_mov(rt, T0));
-        }
-        if (rt2 != 31) {
-            if (is_stolen(rt2))
-                emit_store_guest(x, T1, rt2);
-            else
-                emit(x, enc_mov(rt2, T1));
-        }
+        emit_put_xreg(x, rt, T0);
+        emit_put_xreg(x, rt2, T1);
         return true;
     }
 
     /* STXP / STLXP */
     emit_atomic_address(x, rn, bytes, true, pc);
     uint32_t *mismatch[2], *differ, *restore, *done;
-    emit(x, enc_ldr_x(T1, CTX, addr));
-    emit(x, enc_eor_lsr(T1, T1, T0, 0));
-    mismatch[0] = here(x);
-    emit(x, enc_cbnz_x(T1));
-    emit(x, enc_ldr_w(T1, CTX, len));
-    emit(x, enc_sub_imm(T1, T1, bytes, 0));
-    mismatch[1] = here(x);
-    emit(x, enc_cbnz_x(T1));
+    emit_excl_monitor_check(x, bytes, mismatch);
 
     uint32_t used = (rn < 31 ? 1u << rn : 0) | (rs < 31 ? 1u << rs : 0) |
                     (rt < 31 ? 1u << rt : 0) | (rt2 < 31 ? 1u << rt2 : 0);
@@ -816,6 +834,7 @@ static bool translate_exclusive_pair(struct xlate *x, uint32_t insn, uint64_t pc
         uint32_t *again = here(x);
         emit(x, enc_cbnz_x(T1));
         patch_local(x, again, loop);
+        /* T0 is 0 here on success (from the EOR/CBNZ check above). */
         restore = here(x);
         emit(x, enc_b(0));
         patch_local(x, differ, here(x));
@@ -825,27 +844,12 @@ static bool translate_exclusive_pair(struct xlate *x, uint32_t insn, uint64_t pc
         emit_load_guest(x, b0, b0);
     } else {
         unsigned b[4], nb = 0;
-        unsigned exp0 = pick_borrow(used);
-        used |= 1u << exp0;
-        b[nb++] = exp0;
-        unsigned exp1 = pick_borrow(used);
-        used |= 1u << exp1;
-        b[nb++] = exp1;
-        unsigned v0 = rt, v1 = rt2;
-        if (rt < 31 && is_stolen(rt)) {
-            v0 = pick_borrow(used);
-            used |= 1u << v0;
-            b[nb++] = v0;
-        }
-        if (rt2 < 31 && is_stolen(rt2)) {
-            if (rt2 == rt) {
-                v1 = v0;
-            } else {
-                v1 = pick_borrow(used);
-                used |= 1u << v1;
-                b[nb++] = v1;
-            }
-        }
+        unsigned exp0 = alloc_borrow(&used, b, &nb);
+        unsigned exp1 = alloc_borrow(&used, b, &nb);
+        unsigned v0 = (rt < 31 && is_stolen(rt)) ? alloc_borrow(&used, b, &nb) : rt;
+        unsigned v1 = (rt2 < 31 && is_stolen(rt2))
+                          ? (rt2 == rt ? v0 : alloc_borrow(&used, b, &nb))
+                          : rt2;
         for (unsigned i = 0; i < nb; i++)
             emit_store_guest(x, b[i], b[i]);
         emit(x, enc_ldp_x(exp0, exp1, CTX, (int)value));
@@ -864,6 +868,7 @@ static bool translate_exclusive_pair(struct xlate *x, uint32_t insn, uint64_t pc
         uint32_t *again = here(x);
         emit(x, enc_cbnz_x(T1));
         patch_local(x, again, loop);
+        /* T0 is 0 here on success (from the EOR/ORR/CBNZ check above). */
         restore = here(x);
         emit(x, enc_b(0));
         patch_local(x, differ, here(x));
@@ -879,12 +884,7 @@ static bool translate_exclusive_pair(struct xlate *x, uint32_t insn, uint64_t pc
     patch_local(x, mismatch[1], here(x));
     emit(x, enc_movz(T0, 1, 0));
     patch_local(x, done, here(x));
-    if (rs != 31) {
-        if (is_stolen(rs))
-            emit_store_guest(x, T0, rs);
-        else
-            emit(x, enc_mov(rs, T0));
-    }
+    emit_put_xreg(x, rs, T0);
     emit(x, enc_str_w(31, CTX, len));
     return true;
 }
@@ -934,7 +934,7 @@ static bool translate_atomic(struct xlate *x, uint32_t insn, uint64_t pc)
     }
     /* LDAPR (LRCPC; Tier 0 has confirmed the host has it): executed verbatim on the host address
      * like LDAR; Rs is not an operand */
-    if ((insn & 0x3ffffc00) == 0x38bfc000) {
+    if (dbt_is_ldapr(insn)) {
         struct atomic_operand rt = {0, false, true};
         emit_atomic_address(x, rn, 1u << size, false, pc);
         emit_on_host_address(x, insn, &rt, 1);
@@ -1039,6 +1039,19 @@ static void emit_fpcr_write_check(struct xlate *x, unsigned src, uint64_t pc)
     emit_to_stub(x, enc_cbnz_x(T1), FIX_IMM19, R_INTERP, pc);
 }
 
+/* Store 32-bit host register `reg` (31 = WZR) into cpu->dit (clobbers T1). */
+static void emit_store_dit_w(struct xlate *x, unsigned reg)
+{
+    size_t dit = offsetof(struct appine_cpu, dit);
+    emit_add_const(x, T1, CTX, (int64_t)(dit & ~(size_t)0xfff));
+    emit(x, enc_str_w(reg, T1, dit & 0xfff));
+}
+
+static inline uint32_t enc_msr_dit_imm(unsigned val)
+{
+    return 0xd503405fu | (val & 1u) << 8;
+}
+
 static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
 {
     if ((insn & 0x7c000000) == 0x14000000) { /* B / BL */
@@ -1098,16 +1111,13 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
      * appine_dbt_run syncs cpu.c's host_dit cache on exit and before Tier 0 steps. */
     if ((insn & 0xfffff0ffu) == 0xd503405fu) {
         unsigned val = BIT(insn, 8);
-        size_t dit = offsetof(struct appine_cpu, dit);
-        emit_add_const(x, T1, CTX, (int64_t)(dit & ~(size_t)0xfff));
         if (val) {
             emit(x, enc_movz(T0, 1, 0));
-            emit(x, enc_str_w(T0, T1, dit & 0xfff));
-            emit(x, 0xd503415fu); /* msr dit, #1 */
+            emit_store_dit_w(x, T0);
         } else {
-            emit(x, enc_str_w(31, T1, dit & 0xfff));
-            emit(x, 0xd503405fu); /* msr dit, #0 */
+            emit_store_dit_w(x, 31);
         }
+        emit(x, enc_msr_dit_imm(val));
         x->st->insns_remapped++;
         return true;
     }
@@ -1130,11 +1140,7 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
                     emit(x, enc_and_reg(T0, src, T1));
                 }
                 emit(x, enc_mrs_fpsr(T1));
-                emit(x, enc_eor_lsr(T1, T1, T0, 0));
-                uint32_t *same = here(x);
-                emit(x, enc_cbz_x(T1));
-                emit(x, enc_msr_fpsr(T0));
-                patch_local(x, same, here(x));
+                emit_msr_if_changed(x, T1, T0, enc_msr_fpsr(T0));
                 x->st->insns_remapped++;
                 return true;
             }
@@ -1153,17 +1159,15 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
                 struct operands o = {.n = 1, .pos = {0}, .sp = {false}, .writes_rd = true};
                 return emit_operands(x, insn, &o) || fallback(x, pc);
             }
-            size_t dit = offsetof(struct appine_cpu, dit);
-            emit_add_const(x, T1, CTX, (int64_t)(dit & ~(size_t)0xfff));
             if (rt == 31) {
-                emit(x, enc_str_w(31, T1, dit & 0xfff));
-                emit(x, 0xd503405fu); /* msr dit, #0 */
+                emit_store_dit_w(x, 31);
+                emit(x, enc_msr_dit_imm(0));
             } else {
                 unsigned h = is_stolen(rt) ? T0 : rt;
                 if (h == T0)
                     emit_load_guest(x, T0, rt);
                 emit(x, enc_ubfx(T2, h, 24, 1));
-                emit(x, enc_str_w(T2, T1, dit & 0xfff));
+                emit_store_dit_w(x, T2);
                 emit(x, (insn & ~31u) | h); /* msr dit, <h> */
                 x->t2_group = -1;
             }
@@ -1192,27 +1196,18 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
         }
         case SYSREG_DCZID_EL0:
         case SYSREG_CTR_EL0:
-        case SYSREG_TPIDRRO_EL0: /* read-only, writes already rejected by tier0_defined */
-            if (rt != 31) {
-                unsigned h = is_stolen(rt) ? T0 : rt;
-                uint64_t val = sysreg == SYSREG_CTR_EL0      ? CTR_VALUE
-                               : sysreg == SYSREG_DCZID_EL0  ? DCZID_VALUE
-                                                             : 0;
-                emit_mov_const(x, h, val);
-                if (h == T0)
-                    emit_store_guest(x, T0, rt);
-            }
+        case SYSREG_TPIDRRO_EL0: { /* read-only, writes already rejected by tier0_defined */
+            uint64_t val = sysreg == SYSREG_CTR_EL0      ? CTR_VALUE
+                           : sysreg == SYSREG_DCZID_EL0  ? DCZID_VALUE
+                                                         : 0;
+            emit_const_to_xreg(x, rt, val);
             x->st->insns_remapped++;
             return true;
+        }
         default: {
             uint64_t id;
             if (read && appine_has(APPINE_HWCAP_CPUID) && appine_id_register(sysreg, &id)) {
-                if (rt != 31) {
-                    unsigned h = is_stolen(rt) ? T0 : rt;
-                    emit_mov_const(x, h, id);
-                    if (h == T0)
-                        emit_store_guest(x, T0, rt);
-                }
+                emit_const_to_xreg(x, rt, id);
                 x->st->insns_remapped++;
                 return true;
             }
@@ -1271,11 +1266,7 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
         emit_xreg_to_t0(x, rn);
         if (reg_branch == 0xd63f0000)
             emit_call(x, pc);
-        emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, dbt_jump_cache)));
-        emit(x, enc_ubfx(T2, T0, 2, JC_BITS));
-        emit(x, enc_add_lsl(T1, T1, T2, 4));
-        emit(x, enc_ldp_x(T2, T1, T1, 0));
-        emit(x, enc_eor_lsr(T2, T2, T0, 0));
+        emit_jc_probe(x);
         emit_to_stub(x, enc_cbnz_x(T2), FIX_IMM19, R_LOOKUP, 0);
         emit(x, enc_br(T1));
         return false;
@@ -1377,9 +1368,7 @@ static void konst_update(struct xlate *x, uint32_t insn, uint64_t pc)
     }
     default:
         /* Conditional branches, CBZ, TBZ, HINT and barriers write no registers; MRS only writes Rt */
-        if ((insn & 0xff000010) == 0x54000000 || (insn & 0x7e000000) == 0x34000000 ||
-            (insn & 0x7e000000) == 0x36000000 || (insn & 0xfffff01f) == 0xd503201f ||
-            (insn & 0xfffff01f) == 0xd503301f)
+        if (dbt_is_nogpr_ctrl(insn))
             kill = 0;
         else if ((insn & 0xffe00000u) == 0xd5200000u) /* MRS */
             kill = rd < 31 ? (1u << rd) : 0;
@@ -1498,12 +1487,12 @@ static void affine_update(struct xlate *x, uint32_t insn, uint64_t pc)
     case 0xe: {
         struct memop m;
         if (dbt_is_atomic(insn)) {
-            if ((insn & 0x3fa08000u) == 0x08808000u) { /* LDAR / STLR */
+            if (dbt_is_ldar_stlr(insn)) {
                 if (BIT(insn, 22) && rd < 31)
                     affine_kill(x, rd);
                 break;
             }
-            if ((insn & 0x3ffffc00u) == 0x38bfc000u) { /* LDAPR */
+            if (dbt_is_ldapr(insn)) {
                 if (rd < 31)
                     affine_kill(x, rd);
                 break;
@@ -1546,9 +1535,7 @@ static void affine_update(struct xlate *x, uint32_t insn, uint64_t pc)
         if ((insn & 0xffe00000u) == 0xd5200000u) { /* MRS */
             if (rd < 31)
                 affine_kill(x, rd);
-        } else if (!((insn & 0xff000010) == 0x54000000 || (insn & 0x7e000000) == 0x34000000 ||
-                     (insn & 0x7e000000) == 0x36000000 || (insn & 0xfffff01f) == 0xd503201f ||
-                     (insn & 0xfffff01f) == 0xd503301f)) {
+        } else if (!dbt_is_nogpr_ctrl(insn)) {
             x->affine_valid = 0;
         }
         break;

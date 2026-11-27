@@ -172,7 +172,6 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     p->guest1 = NULL;
     unsigned copied = limit < 32 ? limit : 32;
     memcpy(p->words, p->guest, copied * 4);
-    p->nlinks = 0;
     /* Read the grouping records without the lock: reading stale ones only affects grouping, which
      * is undone again when a check fails (ungroup) */
     uint64_t key = d->nogroup_count ? dbt_nogroup_key(d, pc) : 0;
@@ -1578,7 +1577,6 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
     }
     c->dbt_jump_cache = t->jc;
     c->dbt_tag = t->tag;
-    t->jc_dirty = true; /* the lookup routine fills it */
     if (((uintptr_t)c->dbt_rs & ~(uintptr_t)((1u << RS_SHIFT) - 1)) != (uintptr_t)t->rs)
         c->dbt_rs = t->rs;
     for (;;) {
