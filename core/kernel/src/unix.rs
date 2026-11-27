@@ -1219,12 +1219,12 @@ fn line(s: &mut String, flags: u32, ty: i32, state: u32, ino: u64, addr: &[u8]) 
 
 /// Schedules an AF_UNIX cycle collection on the current thread's next sweep (`collect_deferred`).
 pub(crate) fn defer_collect() {
-    crate::syscall::note_tl_sweep(crate::syscall::tl_sweep::UNIX_DEFERRED);
+    crate::syscall::tl_sweep::note(crate::syscall::tl_sweep::UNIX_DEFERRED);
 }
 
 /// Takes and clears the deferred cycle-collection flag.
 pub(crate) fn take_deferred() -> bool {
-    crate::syscall::take_tl_sweep(crate::syscall::tl_sweep::UNIX_DEFERRED)
+    crate::syscall::tl_sweep::take(crate::syscall::tl_sweep::UNIX_DEFERRED)
 }
 
 /// Runs [`collect`] if a drop path scheduled one and any in-flight channels remain.

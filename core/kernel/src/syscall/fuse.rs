@@ -2224,7 +2224,7 @@ pub(super) fn prefault(cx: &mut Cx<'_>, nr: u64, a: &[u64; 6]) {
 /// Other threads hold nodes through what [`in_use`] finds, O_PATH pins, open handles and
 /// requests in flight ([`fuse::Fuses::evict`]).
 pub(super) fn sweep(cx: &mut Cx<'_>) {
-    if crate::mm::has_unmapped_fills() && !cx.mm().unmapped_fills.is_empty() {
+    if crate::mm::has_unmapped_fills() && cx.mm().has_unmapped_fills() {
         let ranges = cx.mm_mut().take_unmapped_fills();
         let current = cx.task.sync.clone();
         cx.mm_mut().sync(&current);

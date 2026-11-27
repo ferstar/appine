@@ -268,7 +268,20 @@ pub(crate) struct Cgroups {
     /// on the next relevant change if the last observer went away.
     observed: HashMap<(u64, &'static [u8]), Observed>,
     /// At least one observed file needs checking.
-    pub(crate) pending: Cell<bool>,
+    pending: Cell<bool>,
+}
+
+impl Cgroups {
+    /// Whether any watched cgroup file has a pending notification for [`notify_changes`].
+    #[inline]
+    pub(crate) fn has_pending(&self) -> bool {
+        self.pending.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_pending(&self) {
+        self.pending.set(true);
+    }
 }
 
 /// A notifying cgroup file being watched: what it showed at the last mutation, whether any

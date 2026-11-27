@@ -603,7 +603,7 @@ fn maybe_whiteout(store: &Store, e: &DirEntry) -> Result<bool, Errno> {
 }
 
 impl Overlays {
-    pub(crate) fn with_sweep_bits(sweep_bits: Rc<Cell<u32>>) -> Self {
+    pub(super) fn with_sweep_bits(sweep_bits: Rc<Cell<u32>>) -> Self {
         Self {
             sweep_bits,
             ..Self::default()
@@ -612,12 +612,13 @@ impl Overlays {
 
     fn sync_sweep_bit(&self) {
         let bits = self.sweep_bits.get();
-        if self.wants_sweep() {
-            if bits & super::VFS_OVERLAY_SWEEP == 0 {
-                self.sweep_bits.set(bits | super::VFS_OVERLAY_SWEEP);
-            }
-        } else if bits & super::VFS_OVERLAY_SWEEP != 0 {
-            self.sweep_bits.set(bits & !super::VFS_OVERLAY_SWEEP);
+        let next = if self.wants_sweep() {
+            bits | super::VFS_OVERLAY_SWEEP
+        } else {
+            bits & !super::VFS_OVERLAY_SWEEP
+        };
+        if next != bits {
+            self.sweep_bits.set(next);
         }
     }
 
@@ -2004,7 +2005,7 @@ mod tests {
             ((0, 0), Vec::new()),
             Options::default(),
         );
-        assert_eq!(bits.get() & crate::vfs::VFS_OVERLAY_SWEEP, 0);
+        assert_eq!(bits.get() & super::super::VFS_OVERLAY_SWEEP, 0);
         for i in 0..ORPHANS_MIN {
             let id = o.add_node(OvlNode {
                 dev: 1,
@@ -2020,9 +2021,9 @@ mod tests {
             o.orphan(id);
         }
         assert!(o.wants_sweep());
-        assert_ne!(bits.get() & crate::vfs::VFS_OVERLAY_SWEEP, 0);
+        assert_ne!(bits.get() & super::super::VFS_OVERLAY_SWEEP, 0);
         o.sweep(&HashSet::new(), u64::MAX);
         assert!(!o.wants_sweep());
-        assert_eq!(bits.get() & crate::vfs::VFS_OVERLAY_SWEEP, 0);
+        assert_eq!(bits.get() & super::super::VFS_OVERLAY_SWEEP, 0);
     }
 }

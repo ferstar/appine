@@ -326,6 +326,10 @@ const SCHEMA: &str = "
     );
 ";
 
+/// Per-[`Store`] dirty bits for `Store::sweep_bits`.
+const SWEEP_PENDING_RELEASE: u8 = 1 << 0;
+const SWEEP_LINKABLE_TMPFILES: u8 = 1 << 1;
+
 /// An inode store.
 ///
 /// Not Sync: only one thread uses it at a time. The kernel's store relies on the BKL for this
@@ -398,9 +402,9 @@ pub struct Store {
     /// host objects stay on disk until linked once by [`Store::link`] or reaped by
     /// [`Store::release_tmpfile`] after the last guest reference closes.
     linkable_tmpfiles: RefCell<HashSet<Ino>>,
-    /// Bitmask mirroring `!pending_release.is_empty()` (bit 0) and `!linkable_tmpfiles.is_empty()`
-    /// (bit 1) so `post_syscall_sweeps` and `evict_unlinked_tmpfs` skip borrowing either `RefCell`
-    /// when nothing is pending.
+    /// Bitmask mirroring `!pending_release.is_empty()` ([`SWEEP_PENDING_RELEASE`]) and
+    /// `!linkable_tmpfiles.is_empty()` ([`SWEEP_LINKABLE_TMPFILES`]) so `post_syscall_sweeps` and
+    /// `evict_unlinked_tmpfs` skip borrowing either `RefCell` when nothing is pending.
     sweep_bits: Cell<u8>,
     /// Previous linkability at each change in the pending transaction, in operation order.
     tmpfile_undo: RefCell<Vec<(Ino, bool)>>,
@@ -547,7 +551,7 @@ impl Store {
         })?;
         self.commit()?;
         self.pending_release.borrow_mut().clear();
-        self.sweep_bits.set(self.sweep_bits.get() & !1);
+        self.set_sweep_bit(SWEEP_PENDING_RELEASE, false);
         // Even an empty cleanup may follow a prior run's unsynced change of shared object.
         #[cfg(test)]
         on_cleanup(&self, CleanupStep::BeforeSync)?;
@@ -1962,7 +1966,7 @@ impl Store {
                 self.drop_object(ino, data)?;
             } else {
                 self.pending_release.borrow_mut().insert(ino);
-                self.sweep_bits.set(self.sweep_bits.get() | 1);
+                self.set_sweep_bit(SWEEP_PENDING_RELEASE, true);
             }
         } else if kind == mode::S_IFREG && data.held.is_none() {
             self.touch_object_ctime(data.object);
@@ -3150,6 +3154,15 @@ impl Store {
         }
     }
 
+    #[inline]
+    fn set_sweep_bit(&self, bit: u8, active: bool) {
+        let bits = self.sweep_bits.get();
+        let next = if active { bits | bit } else { bits & !bit };
+        if next != bits {
+            self.sweep_bits.set(next);
+        }
+    }
+
     /// Whether either `pending_release` or `linkable_tmpfiles` has entries awaiting sweep.
     #[inline]
     pub(crate) fn has_sweep_work(&self) -> bool {
@@ -3160,7 +3173,7 @@ impl Store {
     /// their shared-object hold can be released.
     #[inline]
     pub(crate) fn has_pending_release(&self) -> bool {
-        self.sweep_bits.get() & 1 != 0
+        self.sweep_bits.get() & SWEEP_PENDING_RELEASE != 0
     }
 
     /// Snapshot of deleted held regular files awaiting release.
@@ -3175,12 +3188,7 @@ impl Store {
         } else {
             links.remove(&ino)
         };
-        let bits = self.sweep_bits.get();
-        if links.is_empty() {
-            self.sweep_bits.set(bits & !2);
-        } else {
-            self.sweep_bits.set(bits | 2);
-        }
+        self.set_sweep_bit(SWEEP_LINKABLE_TMPFILES, !links.is_empty());
         self.tmpfile_undo.borrow_mut().push((ino, was_linkable));
     }
 
@@ -3193,23 +3201,18 @@ impl Store {
                 links.remove(&ino);
             }
         }
-        let bits = self.sweep_bits.get();
-        if links.is_empty() {
-            self.sweep_bits.set(bits & !2);
-        } else {
-            self.sweep_bits.set(bits | 2);
-        }
+        self.set_sweep_bit(SWEEP_LINKABLE_TMPFILES, !links.is_empty());
     }
 
     /// Whether `ino` is an unlinked `O_TMPFILE` that can still be linked into a directory.
     pub(crate) fn is_linkable_tmpfile(&self, ino: Ino) -> bool {
-        self.sweep_bits.get() & 2 != 0 && self.linkable_tmpfiles.borrow().contains(&ino)
+        self.has_linkable_tmpfiles() && self.linkable_tmpfiles.borrow().contains(&ino)
     }
 
     /// Whether any unlinked linkable `O_TMPFILE` inodes are still tracked.
     #[inline]
     pub(crate) fn has_linkable_tmpfiles(&self) -> bool {
-        self.sweep_bits.get() & 2 != 0
+        self.sweep_bits.get() & SWEEP_LINKABLE_TMPFILES != 0
     }
 
     /// Snapshot of unlinked linkable `O_TMPFILE` inodes awaiting either linking or close cleanup.
@@ -3244,7 +3247,7 @@ impl Store {
             (removed, pending.is_empty())
         };
         if empty {
-            self.sweep_bits.set(self.sweep_bits.get() & !1);
+            self.set_sweep_bit(SWEEP_PENDING_RELEASE, false);
         }
         let (st, data) = self.row(ino)?;
         if st.nlink != 0 || st.kind() != mode::S_IFREG || (!data.listed(ino) && !was_pending) {

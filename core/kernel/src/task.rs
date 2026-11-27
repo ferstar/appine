@@ -811,6 +811,8 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
                 continue;
             }
             Some(FastOutcome::Fallback) => {
+                // Fast sleep already published KernelEntry before clearing in_guest; avoid
+                // rewriting regs while inside == true (concurrent /proc/<pid>/syscall readers).
                 if !sync.entry.is_inside() {
                     sync.entry.enter(cpu.state(), svc);
                 }
@@ -1497,6 +1499,19 @@ mod tests {
     fn fast_syscall_loop_responds_to_quiesce_and_code_invalidation() {
         use std::time::{Duration, Instant};
 
+        fn wait_until(tier: Tier, msg: &str, mut cond: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !cond() {
+                assert!(Instant::now() < deadline, "{msg} ({tier:?})");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        let write_insns = |mm: &Mm, addr: u64, insns: &[u32]| {
+            let bytes: Vec<u8> = insns.iter().flat_map(|w| w.to_le_bytes()).collect();
+            mm.write(UserSlice::new(addr, bytes.len()), &bytes).unwrap();
+        };
+
         for tier in [Tier::Interpreter, Tier::Dbt] {
             let mut kernel = Kernel::new(tier);
             let (proc, _, mut cpu) = crate::pseudo::tests::add_task(&mut kernel, 20, 0, true, b"");
@@ -1518,17 +1533,18 @@ mod tests {
                     //  12: add  w1, w1, #1
                     //  16: str  w1, [x2]
                     //  20: b    -20
-                    let prog: [u32; 6] = [
-                        0xd280_1588, // movz x8, #172
-                        0xd400_0001, // svc #0
-                        0xb940_0041, // ldr w1, [x2]
-                        0x1100_0421, // add w1, w1, #1
-                        0xb900_0041, // str w1, [x2]
-                        0x17ff_fffb, // b -20
-                    ];
-                    let bytes: Vec<u8> = prog.iter().flat_map(|w| w.to_le_bytes()).collect();
-                    m.write(UserSlice::new(code_addr, bytes.len()), &bytes)
-                        .unwrap();
+                    write_insns(
+                        &m,
+                        code_addr,
+                        &[
+                            0xd280_1588, // movz x8, #172
+                            0xd400_0001, // svc #0
+                            0xb940_0041, // ldr w1, [x2]
+                            0x1100_0421, // add w1, w1, #1
+                            0xb900_0041, // str w1, [x2]
+                            0x17ff_fffb, // b -20
+                        ],
+                    );
                     // Reset users list so start() registers the running thread cleanly.
                     m.remove_user(&task.sync);
                 }
@@ -1558,41 +1574,31 @@ mod tests {
                     .unwrap();
                 u32::from_le_bytes(b)
             };
-
             // Wait until the guest thread is actively looping in fast getpid syscalls.
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while read_u32(data_addr) < 50 {
-                assert!(
-                    Instant::now() < deadline,
-                    "guest loop did not progress ({tier:?})"
-                );
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            wait_until(tier, "guest loop did not progress", || {
+                read_u32(data_addr) >= 50
+            });
 
-            // 1. Mm::quiesce must kick and stop the fast-syscall loop without starving.
+            // Keep dummy_cpu alive as long as caller_sync holds its Kicker.
             let dummy_cpu = unsafe { Cpu::new(mm_rc.borrow().mmu()) };
             let caller_sync = Arc::new(TaskSync {
                 in_guest: AtomicBool::new(false),
                 kicker: dummy_cpu.kicker(),
                 entry: KernelEntry::default(),
             });
+
+            // 1. Mm::quiesce must kick and stop the fast-syscall loop without starving.
             {
                 let _k = shared.lock();
                 mm_rc.borrow().quiesce(&caller_sync);
                 assert!(!task.sync.in_guest.load(Ordering::SeqCst));
             }
-            drop(dummy_cpu);
 
             // Confirm the loop resumes after BKL release.
             let after_quiesce = read_u32(data_addr);
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while read_u32(data_addr) < after_quiesce + 50 {
-                assert!(
-                    Instant::now() < deadline,
-                    "guest loop did not resume after quiesce ({tier:?})"
-                );
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            wait_until(tier, "guest loop did not resume after quiesce", || {
+                read_u32(data_addr) >= after_quiesce + 50
+            });
 
             // 2. Code-only invalidation (bumps generations.code without kicking) must be observed
             // by the fast-syscall loop (both Tier 0 and Tier 1): patch the branch at +20 to write
@@ -1601,40 +1607,29 @@ mod tests {
                 let _k = shared.lock();
                 let mut mm = mm_rc.borrow_mut();
                 // Write tail instructions first (+24..+36), then replace the branch at +20.
-                let tail: [u32; 3] = [
-                    0xb900_0060, // str w0, [x3]
-                    0xd280_0ba8, // movz x8, #93 (exit)
-                    0xd400_0001, // svc #0
-                ];
-                let tail_bytes: Vec<u8> = tail.iter().flat_map(|w| w.to_le_bytes()).collect();
-                mm.write(
-                    UserSlice::new(code_addr + 24, tail_bytes.len()),
-                    &tail_bytes,
-                )
-                .unwrap();
-                let head: u32 = 0x5280_0840; // movz w0, #0x42
-                mm.write(UserSlice::new(code_addr + 20, 4), &head.to_le_bytes())
-                    .unwrap();
+                write_insns(
+                    &mm,
+                    code_addr + 24,
+                    &[
+                        0xb900_0060, // str w0, [x3]
+                        0xd280_0ba8, // movz x8, #93 (exit)
+                        0xd400_0001, // svc #0
+                    ],
+                );
+                write_insns(&mm, code_addr + 20, &[0x5280_0840]); // movz w0, #0x42
                 mm.invalidate_code(code_addr, PAGE_SIZE);
                 mm.sync(&caller_sync);
             }
 
             // Wait for the guest thread to observe the code invalidation and exit cleanly.
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                {
-                    let k = shared.lock();
-                    if !k.tasks.contains_key(&proc.pid) {
-                        break;
-                    }
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "guest loop did not observe code-only invalidation ({tier:?})"
-                );
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            wait_until(
+                tier,
+                "guest loop did not observe code-only invalidation",
+                || !shared.lock().tasks.contains_key(&proc.pid),
+            );
             assert_eq!(read_u32(data_addr + 8), 0x42);
+            drop(caller_sync);
+            drop(dummy_cpu);
             drop(task);
             drop(mm_rc);
             drop(shared);

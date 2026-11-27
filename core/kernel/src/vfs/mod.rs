@@ -113,9 +113,13 @@ pub(crate) const INIT_MNT_NS: u64 = 4_026_531_841;
 /// Per-[`Vfs`] dirty bits mirroring pending end-of-syscall sweep work (`Vfs::sweep_bits`).
 const VFS_UNLINKED_TMPFS: u32 = 1 << 0;
 const VFS_MEMFD_SIZES: u32 = 1 << 1;
+/// Detached mounts need collection on the next syscall/exit pass (set when removing a mount point
+/// detaches mounts in other namespaces, or when an earlier collection found tables borrowed).
 const VFS_COLLECT_PENDING: u32 = 1 << 2;
 const VFS_DEAD_MNT_NS: u32 = 1 << 3;
-pub(super) const VFS_OVERLAY_SWEEP: u32 = 1 << 4;
+const VFS_OVERLAY_SWEEP: u32 = 1 << 4;
+const VFS_MOUNT_OR_TMPFS_SWEEP: u32 =
+    VFS_UNLINKED_TMPFS | VFS_MEMFD_SIZES | VFS_COLLECT_PENDING | VFS_DEAD_MNT_NS;
 
 /// A mount namespace (Linux's `struct mnt_namespace`): only an id; each mount records which
 /// namespace it belongs to ([`Mount::ns`]). A process's `FsContext` holds it; after the last
@@ -751,10 +755,6 @@ struct Mounts {
     /// instance was mounted, changed by a remount without `MS_BIND`; absent is none (the boot
     /// instances).
     sb_flags: std::collections::HashMap<u64, u64>,
-    /// Detached mounts need collection on the next syscall/exit pass (set when removing a mount
-    /// point detaches mounts in other namespaces, or when an earlier collection found tables
-    /// borrowed). Stored kernel-wide so a retiring pool thread never loses the retry.
-    collect_pending: bool,
 }
 
 impl Drop for Mounts {
@@ -1700,7 +1700,6 @@ impl Vfs {
             mq_dev: Default::default(),
             devpts: Default::default(),
             sb_flags: Default::default(),
-            collect_pending: false,
         };
         // The directory named `name` under directory `dir` in mount `mnt`
         let subdir = |dir: Option<&Node>, name: &[u8]| -> Option<Node> {
@@ -1811,12 +1810,7 @@ impl Vfs {
             mounts: RefCell::new(mounts),
             cached: RefCell::new(cached),
             executables: Default::default(),
-            init_ns: std::rc::Rc::new(MntNs {
-                id: INIT_MNT_NS,
-                owner: crate::cred::UserNs::init(),
-                anon: false,
-                sweeps: None,
-            }),
+            init_ns: MntNs::standalone(INIT_MNT_NS, crate::cred::UserNs::init()),
             namespaces: Default::default(),
             overlays: RefCell::new(overlay::Overlays::with_sweep_bits(sweep_bits.clone())),
             fuse: Default::default(),
@@ -1844,6 +1838,23 @@ impl Vfs {
         self.sweep_bits.set(self.sweep_bits.get() & !bit);
     }
 
+    #[inline]
+    fn take_sweep_bit(&self, bit: u32) -> bool {
+        let cur = self.sweep_bits.get();
+        if cur & bit != 0 {
+            self.sweep_bits.set(cur & !bit);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn sync_unlinked_tmpfs_bit(&self, mounts: &Mounts) {
+        if mounts.tmpfs.values().all(|t| t.unlinked.is_empty()) {
+            self.clear_sweep_bit(VFS_UNLINKED_TMPFS);
+        }
+    }
+
     /// Whether any VFS, store, mount-namespace or overlay sweep has pending work.
     #[inline]
     pub(crate) fn has_sweep_work(&self) -> bool {
@@ -1853,10 +1864,7 @@ impl Vfs {
     /// Whether `mount::collect_released` has pending VFS/store/tmpfs/mount work.
     #[inline]
     pub(crate) fn has_mount_or_tmpfs_sweep(&self) -> bool {
-        self.sweep_bits.get()
-            & (VFS_UNLINKED_TMPFS | VFS_MEMFD_SIZES | VFS_COLLECT_PENDING | VFS_DEAD_MNT_NS)
-            != 0
-            || self.store.has_sweep_work()
+        self.sweep_bits.get() & VFS_MOUNT_OR_TMPFS_SWEEP != 0 || self.store.has_sweep_work()
     }
 
     /// Whether `mount::sweep_overlays` has pending overlay node eviction work.
@@ -3209,7 +3217,6 @@ impl Vfs {
             .map(|m| m.ns)
             .collect();
         detach(&mut mounts, |m| gone.contains(&m.id));
-        mounts.collect_pending = true;
         self.set_sweep_bit(VFS_COLLECT_PENDING);
         drop(mounts);
         self.mounts_changed_ns(affected);
@@ -3250,7 +3257,6 @@ impl Vfs {
             .map(|m| m.ns)
             .collect();
         detach(&mut mounts, |m| gone.contains(&m.id));
-        mounts.collect_pending = true;
         self.set_sweep_bit(VFS_COLLECT_PENDING);
         drop(mounts);
         self.mounts_changed_ns(affected);
@@ -3625,9 +3631,7 @@ impl Vfs {
         let mut mounts = self.mounts.borrow_mut();
         if let Some(t) = mounts.tmpfs.get_mut(&dev) {
             t.unlinked.remove(&ino);
-            if !mounts.tmpfs.values().any(|t| !t.unlinked.is_empty()) {
-                self.clear_sweep_bit(VFS_UNLINKED_TMPFS);
-            }
+            self.sync_unlinked_tmpfs_bit(&mounts);
         }
     }
 
@@ -3676,9 +3680,7 @@ impl Vfs {
                 t.changed = true;
             }
         }
-        if !mounts.tmpfs.values().any(|t| !t.unlinked.is_empty()) {
-            self.clear_sweep_bit(VFS_UNLINKED_TMPFS);
-        }
+        self.sync_unlinked_tmpfs_bit(&mounts);
     }
 
     /// Changes the parameters of tmpfs instance `dev` on remount: `f` gets the parameters and
@@ -4374,7 +4376,6 @@ impl Vfs {
     /// Marks that detached mounts need collection on the next pass (used when a collection found
     /// task tables borrowed).
     pub(crate) fn defer_collect(&self) {
-        self.mounts.borrow_mut().collect_pending = true;
         self.set_sweep_bit(VFS_COLLECT_PENDING);
     }
 
@@ -4382,16 +4383,14 @@ impl Vfs {
     /// kernel-wide collection retry was scheduled, so that [`Vfs::collect`] may now drop it.
     pub(crate) fn released_detached(&self) -> bool {
         let released = RELEASED.with(|r| std::mem::take(&mut *r.borrow_mut()));
-        crate::syscall::clear_tl_sweep(crate::syscall::tl_sweep::VFS_RELEASED);
-        let mut mounts = self.mounts.borrow_mut();
-        let pending = std::mem::take(&mut mounts.collect_pending);
-        self.clear_sweep_bit(VFS_COLLECT_PENDING);
-        if pending {
+        crate::syscall::tl_sweep::clear(crate::syscall::tl_sweep::VFS_RELEASED);
+        if self.take_sweep_bit(VFS_COLLECT_PENDING) {
             return true;
         }
         if released.is_empty() {
             return false;
         }
+        let mounts = self.mounts.borrow();
         let any = released[0] == ANY_MOUNT;
         mounts
             .detached
@@ -4403,7 +4402,6 @@ impl Vfs {
     /// open file is in them) and not connected below one that is. tmpfs instances no mount can
     /// see any more are deleted with their files.
     pub(crate) fn collect(&self, in_use: &std::collections::HashSet<MountId>) {
-        self.mounts.borrow_mut().collect_pending = false;
         self.clear_sweep_bit(VFS_COLLECT_PENDING);
         // Clear before retaining dead namespaces so any MntNs dropped while tearing down mounts
         // below re-arms VFS_DEAD_MNT_NS for the recursive pass at the end.
@@ -4502,9 +4500,7 @@ impl Vfs {
                 .filter_map(|dev| mounts.tmpfs.remove(dev))
                 .map(|t| t.root)
                 .collect();
-            if !mounts.tmpfs.values().any(|t| !t.unlinked.is_empty()) {
-                self.clear_sweep_bit(VFS_UNLINKED_TMPFS);
-            }
+            self.sync_unlinked_tmpfs_bit(&mounts);
             gone
         };
         for root in gone {
@@ -5314,7 +5310,7 @@ pub(crate) fn released(mnt: MountId) {
         } else {
             *r = vec![ANY_MOUNT];
         }
-        crate::syscall::note_tl_sweep(crate::syscall::tl_sweep::VFS_RELEASED);
+        crate::syscall::tl_sweep::note(crate::syscall::tl_sweep::VFS_RELEASED);
     });
 }
 

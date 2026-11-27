@@ -1357,7 +1357,7 @@ pub struct Mm {
     private_files: Rc<RefCell<PrivateFiles>>,
     /// A mapping read on demand ([`Fill`]) has been made here (or in the parent before fork).
     fills: bool,
-    pub(crate) unmapped_fills: Vec<(Rc<Fill>, u64, u64)>,
+    unmapped_fills: Vec<(Rc<Fill>, u64, u64)>,
 }
 
 struct PrivateFile {
@@ -7388,6 +7388,12 @@ pub(crate) fn has_unmapped_fills() -> bool {
 }
 
 impl Mm {
+    /// Whether this address space has removed FUSE mappings awaiting writeback.
+    #[inline]
+    pub(crate) fn has_unmapped_fills(&self) -> bool {
+        !self.unmapped_fills.is_empty()
+    }
+
     /// Drains any removed FUSE mappings queued on this address space for end-of-syscall writeback.
     pub(crate) fn take_unmapped_fills(&mut self) -> Vec<(Rc<Fill>, u64, u64)> {
         if self.unmapped_fills.is_empty() {
