@@ -613,9 +613,10 @@ fn open_path_with(
     {
         // Single-walk O_CREAT fast path: resolve the parent directory once. If the leaf does not
         // exist in a store directory we create it directly without re-walking the parent prefix;
-        // if it exists (or lives in another filesystem) we resolve only the single final component
-        // from the resolved parent (falling back to a full walk only for non-O_EXCL symlinks to
-        // preserve cumulative 40-link counting across parent + leaf).
+        // if it exists in a store directory and is not a followed symlink (or O_EXCL is set) we
+        // resolve only the single final component from the resolved parent. Non-store parents and
+        // followed store symlinks fall back to walking from `start`/`path` so cumulative 40-link
+        // counting across parent + leaf is preserved.
         let (dir, name) = vfs.resolve_parent_with(&view, &cred, &root, &start, path, 0)?;
         let direct_missing = match &dir {
             Node::Store(_, d) => match vfs.store().lookup(*d, name)? {
@@ -642,11 +643,14 @@ fn open_path_with(
             fuse_created = c.fuse_created;
             (c.node, c.created, c.parent)
         } else {
-            let existing_symlink = matches!(direct_missing, Some(Some(ino)) if !excl && vfs.store().kind(ino)? == mode::S_IFLNK);
-            let resolved = if existing_symlink {
-                vfs.walk_resolve(&view, &cred, &root, &start, path, follow, 0)
-            } else {
+            let use_dir_shortcut = matches!(
+                direct_missing,
+                Some(Some(ino)) if excl || vfs.store().kind(ino)? != mode::S_IFLNK
+            );
+            let resolved = if use_dir_shortcut {
                 vfs.walk_resolve(&view, &cred, &root, &dir, name, follow, 0)
+            } else {
+                vfs.walk_resolve(&view, &cred, &root, &start, path, follow, 0)
             };
             match resolved {
                 Ok(_) if excl => return Err(Errno::EEXIST),
@@ -5340,10 +5344,25 @@ fn write_file_inner(
                 }
                 if !prepped || cow {
                     if cow {
-                        prepare_write(cx, file, None)?;
+                        if let Err(e) = prepare_write(cx, file, None) {
+                            drop(pinned);
+                            if done > 0 {
+                                break;
+                            }
+                            return Err(e);
+                        }
                         cow = false;
                         // `make_private` released the BKL; re-verify flags and seals.
-                        let flags = checked_write_flags(cx, &file.borrow())?;
+                        let flags = match checked_write_flags(cx, &file.borrow()) {
+                            Ok(flags) => flags,
+                            Err(e) => {
+                                drop(pinned);
+                                if done > 0 {
+                                    break;
+                                }
+                                return Err(e);
+                            }
+                        };
                         if flags & inode_flags::APPEND != 0 || cx.kr().seals.contains_key(&ino) {
                             drop(pinned);
                             fallback = true;
@@ -5393,32 +5412,20 @@ fn write_file_inner(
                 return Ok(done as u64);
             }
             prechecked_flags = None;
-        } else if let Some((ino, cow, flags, append, is_tmpfs, _)) = regular_info
+        } else if let Some((ino, cow, flags, mut append, is_tmpfs, _)) = regular_info
             && (append || is_tmpfs)
         {
             // BKL-held regular-file writes (`O_APPEND`, `FS_APPEND_FL`, or tmpfs): hoist
             // checked_write_flags, check_seals, tmpfs_write_room, prepare_write, remove_privs,
             // tmpfs_resized, object_modified and inotify across multi-chunk transfers.
-            let mut eff_offset = if offset.is_some() && flags & inode_flags::APPEND != 0 {
-                let f = file.borrow();
-                let (ino, host, _) = f.regular_backing().ok_or(Errno::EBADF)?;
-                Some(regular_size(&*cx.vfs()?, ino, host)?)
-            } else {
-                offset
-            };
-            let (mut allowed, mut tmpfs) =
-                tmpfs_write_room(cx, &file.borrow(), eff_offset, len, append)?;
-            check_seals(cx, &file.borrow(), true, |size| {
-                let f = file.borrow();
-                let pos = match eff_offset {
-                    Some(off) => off,
-                    None if append => size,
-                    None => f.pos,
-                };
-                size.max(pos + allowed as u64)
-            })?;
+            // Copy chunk 0 from user memory before checking tmpfs quota or seals so an unreadable
+            // buffer (EFAULT) or unread FUSE mapping (FUSE_RETRY) takes precedence over ENOSPC /
+            // EPERM.
+            let mut eff_offset = offset;
+            let mut allowed = len;
+            let mut tmpfs = None;
             let step = IO_CHUNK;
-            let mut chunk = IoScratch::take(allowed.min(step));
+            let mut chunk = IoScratch::take(len.min(step));
             let mut prepped = false;
             while done < allowed {
                 let n = (allowed - done).min(step);
@@ -5432,11 +5439,32 @@ fn write_file_inner(
                     return Err(e);
                 }
                 if !prepped {
+                    eff_offset = if offset.is_some() && flags & inode_flags::APPEND != 0 {
+                        let f = file.borrow();
+                        let (ino, host, _) = f.regular_backing().ok_or(Errno::EBADF)?;
+                        Some(regular_size(&*cx.vfs()?, ino, host)?)
+                    } else {
+                        offset
+                    };
+                    let (room, before) =
+                        tmpfs_write_room(cx, &file.borrow(), eff_offset, len, append)?;
+                    allowed = room;
+                    tmpfs = before;
+                    check_seals(cx, &file.borrow(), true, |size| {
+                        let f = file.borrow();
+                        let pos = match eff_offset {
+                            Some(off) => off,
+                            None if append => size,
+                            None => f.pos,
+                        };
+                        size.max(pos + allowed as u64)
+                    })?;
                     if cow {
                         prepare_write(cx, file, None)?;
-                        // `make_private` released the BKL; refresh flags, offset, tmpfs room and seals.
+                        // `make_private` released the BKL; refresh flags, append state, offset,
+                        // tmpfs room and seals.
                         let flags = checked_write_flags(cx, &file.borrow())?;
-                        let append_now = append || flags & inode_flags::APPEND != 0;
+                        append = append || flags & inode_flags::APPEND != 0;
                         eff_offset = if offset.is_some() && flags & inode_flags::APPEND != 0 {
                             let f = file.borrow();
                             let (ino, host, _) = f.regular_backing().ok_or(Errno::EBADF)?;
@@ -5449,18 +5477,18 @@ fn write_file_inner(
                             &file.borrow(),
                             eff_offset,
                             len,
-                            append_now,
+                            append,
                             flags,
                         )?;
                         let (room, before) =
-                            tmpfs_write_room(cx, &file.borrow(), eff_offset, allowed, append_now)?;
+                            tmpfs_write_room(cx, &file.borrow(), eff_offset, allowed, append)?;
                         tmpfs = before;
                         allowed = room;
                         check_seals(cx, &file.borrow(), true, |size| {
                             let f = file.borrow();
                             let pos = match eff_offset {
                                 Some(off) => off,
-                                None if append_now => size,
+                                None if append => size,
                                 None => f.pos,
                             };
                             size.max(pos + allowed as u64)
@@ -11238,6 +11266,10 @@ fn display_path(
 ) -> Option<Rc<[u8]>> {
     if let Some((dir, name)) = found
         && dir == root
+        && matches!(
+            root,
+            Node::Store(_, crate::vfs::store::ROOT) | Node::Pseudo(..)
+        )
     {
         let mut p = Vec::with_capacity(1 + name.len());
         p.push(b'/');
@@ -14454,6 +14486,182 @@ mod tests {
             let p_long = read_path(cx, addr).unwrap();
             assert!(matches!(p_long, PathBytes::Heap(_)));
             assert_eq!(&*p_long, &long[..]);
+        });
+    }
+
+    #[test]
+    fn write_bkl_held_faults_before_seals_and_enospc_and_display_path_unlinked_chroot() {
+        with_guest(0, |cx, addr, _| {
+            let write_str = |cx: &Cx<'_>, at: u64, s: &[u8]| {
+                let mut z = s.to_vec();
+                z.push(0);
+                cx.write_user(UserSlice::new(at, z.len()), &z).unwrap();
+            };
+
+            // 1. Sealed O_APPEND memfd: unreadable buffer must return EFAULT before F_SEAL_WRITE
+            //    returns EPERM.
+            write_str(cx, addr, b"seal-efault");
+            let mfd = memfd_create(cx, addr, libc::MFD_ALLOW_SEALING).unwrap() as i32;
+            let flags = fcntl(cx, mfd, F_GETFL, 0).unwrap();
+            fcntl(cx, mfd, F_SETFL, flags | oflags::O_APPEND as u64).unwrap();
+            assert_eq!(fcntl(cx, mfd, F_ADD_SEALS, F_SEAL_WRITE as u64), Ok(0));
+            assert_eq!(write(cx, mfd, 0, 16), Err(Errno::EFAULT));
+            assert_eq!(write(cx, mfd, addr, 16), Err(Errno::EPERM));
+            close(cx, mfd).unwrap();
+
+            // 2. Full tmpfs (1-page limit): unreadable buffer must return EFAULT before ENOSPC.
+            let vfs = cx.vfs().unwrap();
+            vfs.new_tmpfs(
+                mountpoint(&vfs, b"small-tmpfs"),
+                0,
+                b"tmpfs".to_vec(),
+                crate::vfs::TmpfsParams {
+                    blocks: 1,
+                    inodes: 8,
+                    perm: 0o1777,
+                    uid: 0,
+                    gid: 0,
+                    inode64: true,
+                },
+            )
+            .unwrap();
+            let tfd = open(
+                cx,
+                addr,
+                b"/small-tmpfs/f",
+                oflags::O_CREAT | oflags::O_RDWR,
+                0o644,
+            )
+            .unwrap();
+            // Fill the single allowed tmpfs page.
+            assert_eq!(write(cx, tfd, addr, 4096), Ok(4096));
+            // Next write at offset 4096 has no quota left: NULL buffer must still yield EFAULT,
+            // while a valid buffer yields ENOSPC.
+            assert_eq!(write(cx, tfd, 0, 4096), Err(Errno::EFAULT));
+            assert_eq!(write(cx, tfd, addr, 4096), Err(Errno::ENOSPC));
+            close(cx, tfd).unwrap();
+
+            // 3. Unlinked chroot root: display_path must retain the " (deleted)" suffix rather
+            //    than taking the root-level fast path.
+            write_str(cx, addr, b"/tmp/jail");
+            assert_eq!(mkdirat(cx, AT_FDCWD, addr, 0o755), Ok(0));
+            let jail_node = lookup_at(cx, AT_FDCWD, b"/tmp/jail", true).unwrap();
+            let jail_fd = open(
+                cx,
+                addr,
+                b"/tmp/jail/child",
+                oflags::O_CREAT | oflags::O_RDWR,
+                0o644,
+            )
+            .unwrap();
+            close(cx, jail_fd).unwrap();
+            // Remove `/tmp/jail/child` and `/tmp/jail` while keeping `jail_node` as chroot root,
+            // then check `display_path` for a dentry inside the unlinked root.
+            let old_root = cx.root();
+            cx.t.fs.borrow_mut().root = jail_node.clone();
+            let tmp_ino = vfs
+                .store()
+                .lookup(crate::vfs::store::ROOT, b"tmp")
+                .unwrap()
+                .unwrap();
+            let jail_ino = jail_node.ino().unwrap();
+            vfs.store().unlink(jail_ino, b"child").unwrap();
+            vfs.record_removed_dir(jail_ino, b"jail");
+            vfs.store().rmdir(tmp_ino, b"jail").unwrap();
+            let found = (jail_node.clone(), b"ghost".to_vec());
+            let shown = display_path(
+                cx,
+                &vfs,
+                &jail_node,
+                &jail_node,
+                b"/ghost",
+                None,
+                Some(&found),
+            )
+            .unwrap();
+            assert_eq!(&*shown, b"/ghost (deleted)");
+            cx.t.fs.borrow_mut().root = old_root;
+
+            // 4. Cumulative >40 symlinks across parent + leaf with O_CREAT returns ELOOP (both
+            //    store and overlay parents).
+            write_str(cx, addr, b"/tmp/eloop");
+            assert_eq!(mkdirat(cx, AT_FDCWD, addr, 0o755), Ok(0));
+            write_str(cx, addr, b"/tmp/eloop/real");
+            assert_eq!(mkdirat(cx, AT_FDCWD, addr, 0o755), Ok(0));
+            let tgt_addr = addr + 512;
+            // 25-link directory chain: d0 -> d1 -> ... -> d24 -> real
+            for i in 0..25 {
+                let link = format!("/tmp/eloop/d{i}");
+                let target = if i == 24 {
+                    "real".to_string()
+                } else {
+                    format!("d{}", i + 1)
+                };
+                write_str(cx, tgt_addr, target.as_bytes());
+                write_str(cx, addr, link.as_bytes());
+                assert_eq!(symlinkat(cx, tgt_addr, AT_FDCWD, addr), Ok(0));
+            }
+            // 20-link leaf chain inside `real`: l0 -> l1 -> ... -> l19 -> end
+            for i in 0..20 {
+                let link = format!("/tmp/eloop/real/l{i}");
+                let target = if i == 19 {
+                    "end".to_string()
+                } else {
+                    format!("l{}", i + 1)
+                };
+                write_str(cx, tgt_addr, target.as_bytes());
+                write_str(cx, addr, link.as_bytes());
+                assert_eq!(symlinkat(cx, tgt_addr, AT_FDCWD, addr), Ok(0));
+            }
+            // Total 45 symlinks (> MAX_SYMLINKS = 40) must fail with ELOOP (store parent).
+            assert_eq!(
+                open(
+                    cx,
+                    addr,
+                    b"/tmp/eloop/d0/l0",
+                    oflags::O_CREAT | oflags::O_RDWR,
+                    0o644,
+                ),
+                Err(Errno::ELOOP)
+            );
+            // Same >40 cumulative symlink test on a non-Store (Overlay) parent directory.
+            let lower = lookup_at(cx, AT_FDCWD, b"/tmp/eloop/real", true)
+                .unwrap()
+                .ino()
+                .unwrap();
+            let upper = vfs
+                .store()
+                .mkdir(crate::vfs::store::ROOT, b"ovl-eloop-up", 0o755, 0, 0)
+                .unwrap();
+            let point = mountpoint(&vfs, b"ovl-eloop");
+            vfs.new_overlay(
+                point,
+                0,
+                b"overlay".to_vec(),
+                ((Some(upper), vec![lower]), (0, 0), Vec::new()),
+                overlay::Options::default(),
+            );
+            for i in 0..25 {
+                let link = format!("/tmp/eloop/o{i}");
+                let target = if i == 24 {
+                    "/ovl-eloop".to_string()
+                } else {
+                    format!("o{}", i + 1)
+                };
+                write_str(cx, tgt_addr, target.as_bytes());
+                write_str(cx, addr, link.as_bytes());
+                assert_eq!(symlinkat(cx, tgt_addr, AT_FDCWD, addr), Ok(0));
+            }
+            assert_eq!(
+                open(
+                    cx,
+                    addr,
+                    b"/tmp/eloop/o0/l0",
+                    oflags::O_CREAT | oflags::O_RDWR,
+                    0o644,
+                ),
+                Err(Errno::ELOOP)
+            );
         });
     }
 }
