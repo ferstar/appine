@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (full refresh: 17 adversarial claims checked independently — 14 confirmed and 3 partial corrected, plus 5 confirmed bugs/debt items recorded below)
 >
-> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: `startKernel` consumes `Rootfs.StartPreparation` and skips `ensureOpenRc` when `openRcDone` is already true)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: `saveTabs` takes transcripts on the worker thread and `onTrimMemory` enqueues `saveTabs` before `trimMemory`)
 
 ## Responsibilities
 
@@ -154,7 +154,7 @@ Exit all is always available. Unless exiting, one action offers ALWAYS from SLEE
 
 ### Saving and restoring tabs
 
-`saveTabs` captures live tabs and transcripts on main. The selected index is relative to running tabs, default zero. A restored tab without a terminal uses `unshown` for its old transcript, cwd and snapshot. On the worker, a nonnegative console supplies `Native.consoleCwd` and `snapshotOf`. A null `takeSnapshot` reuses `savedSnapshot`, empty clears it, and new bytes go to `Tabs.writeSnapshot`. For `auto`, the first save caches `Rootfs.loginAccount`'s resolved name in `VtSession.resolvedLogin`.
+`saveTabs` captures live tabs and unshown restored entries on main (`s.tab == 0L` keeps `unshown`, otherwise removes it). The selected index is relative to running tabs, default zero. On the worker, each tab calls `takeTranscript` (falling back to the unshown transcript while unstarted), and a nonnegative console supplies `Native.consoleCwd` and `snapshotOf`. A null `takeSnapshot` reuses `savedSnapshot`, empty clears it, and new bytes go to `Tabs.writeSnapshot`. For `auto`, the first save caches `Rootfs.loginAccount`'s resolved name in `VtSession.resolvedLogin`.
 
 | File in `files/tabs/` | Contract |
 | --- | --- |
@@ -171,7 +171,7 @@ Saves run every minute, two seconds after the last tab open/close/shell end, on 
 
 When `current` changes, `BackgroundImageTrim` removes the selected ID from both sets and records the previous tab if still open and started. `MAX_RETAINED` (two) caps recently left, started tabs awaiting the 60-second (`DELAY_MS`) trim deadline; overflow evicts the oldest pending ID and queues it for immediate trim. `trimBackgroundImages` drains due IDs and schedules the next deadline. Revisiting a pending tab cancels its deadline. `periodicSave` re-trims already-trimmed, still-unseen IDs before each minute save since background output can add images.
 
-The last listener leaving saves at once and arms a separate 60-second `trimWhenHidden` timer. A returning listener cancels it. `onTrimMemory` at or above `TRIM_MEMORY_RUNNING_LOW`, except `TRIM_MEMORY_UI_HIDDEN`, calls `trimMemory()` and `saveTabs()` immediately. With a live kernel the full trim selects started VT handles other than `current`, marks their IDs trimmed and cancels the background deadline. The worker runs `Native.trimMemory`, `VtNative.dropImages` for the selected handles, then `VtNative.compressAll` for cold scrollback. Each image trim temporarily reduces Kitty storage to 4 MiB per screen. Selection and hide timers operate without a system pressure callback.
+The last listener leaving saves at once and arms a separate 60-second `trimWhenHidden` timer. A returning listener cancels it. `onTrimMemory` at or above `TRIM_MEMORY_RUNNING_LOW`, except `TRIM_MEMORY_UI_HIDDEN`, calls `saveTabs()` before `trimMemory()` so the serial worker re-compresses any cold scrollback pages touched by transcript formatting. With a live kernel the full trim selects started VT handles other than `current`, marks their IDs trimmed and cancels the background deadline. The worker runs `Native.trimMemory`, `VtNative.dropImages` for the selected handles, then `VtNative.compressAll` for cold scrollback. Each image trim temporarily reduces Kitty storage to 4 MiB per screen. Selection and hide timers operate without a system pressure callback.
 
 ### Exit, restart, replacement and destruction
 

@@ -431,13 +431,19 @@ impl Machine {
     /// Reads the console's output, waiting when there is none. Returns 0 when the session has
     /// ended: every slave is closed and the output has all been read.
     pub fn read_console(&self, id: u32, buf: &mut [u8]) -> Result<usize, Errno> {
-        let objects = terminal::wake_objects(&self.shared.lock(), id);
-        let out = self.wait_objects(wake::FILE, objects.as_deref(), |k| {
-            on_console(k, id, "Machine::read_console", |k| {
-                terminal::take_output(k, id, buf.len())
-            })
-            .transpose()
-        })?;
+        let out = self
+            .wait_deadline(
+                wake::FILE,
+                None,
+                |k| terminal::wake_object(k, id),
+                |k| {
+                    on_console(k, id, "Machine::read_console", |k| {
+                        terminal::take_output(k, id, buf.len())
+                    })
+                    .transpose()
+                },
+            )
+            .expect("waited without a deadline")?;
         buf[..out.len()].copy_from_slice(&out);
         Ok(out.len())
     }
@@ -459,19 +465,36 @@ impl Machine {
         buf: &mut [u8],
         timeout: Option<std::time::Duration>,
     ) -> Result<Option<(usize, bool)>, Errno> {
-        let objects = terminal::wake_objects(&self.shared.lock(), id);
+        Ok(self
+            .read_console_run_state(id, buf, timeout)?
+            .map(|r| (r.len, r.background)))
+    }
+
+    /// As [`Machine::read_console_run_timeout`], returning lightweight password-input and
+    /// foreground-process identity metadata sampled under the same BKL acquisition.
+    pub fn read_console_run_state(
+        &self,
+        id: u32,
+        buf: &mut [u8],
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Option<crate::ConsoleRead>, Errno> {
         let deadline = timeout.map(|d| std::time::Instant::now() + d);
-        let Some(result) = self.wait_deadline(wake::FILE, objects.as_deref(), deadline, |k| {
-            on_console(k, id, "Machine::read_console_run", |k| {
-                terminal::take_output_run(k, id, buf.len())
-            })
-            .transpose()
-        }) else {
+        let Some(result) = self.wait_deadline(
+            wake::FILE,
+            deadline,
+            |k| terminal::wake_object(k, id),
+            |k| {
+                on_console(k, id, "Machine::read_console_run", |k| {
+                    terminal::take_output_run_state(k, id, buf.len())
+                })
+                .transpose()
+            },
+        ) else {
             return Ok(None);
         };
-        let (out, background) = result?;
+        let (out, read) = result?;
         buf[..out.len()].copy_from_slice(&out);
-        Ok(Some((out.len(), background)))
+        Ok(Some(read))
     }
 
     /// Writes input to the console (through the line discipline), waiting while the input queue is
@@ -480,21 +503,26 @@ impl Machine {
         if data.is_empty() {
             return Ok(0);
         }
-        let objects = terminal::wake_objects(&self.shared.lock(), id);
-        self.wait_objects(wake::FILE, objects.as_deref(), |k| {
-            on_console(k, id, "Machine::write_console", |k| {
-                if terminal::ended(k, id)? {
-                    return Err(Errno::EIO);
-                }
-                let room = terminal::input_room(k, id)?;
-                if room > 0 {
-                    let n = room.min(data.len());
-                    return terminal::feed(k, id, &data[..n]).map(|()| Some(n));
-                }
-                Ok(None)
-            })
-            .transpose()
-        })
+        self.wait_deadline(
+            wake::FILE,
+            None,
+            |k| terminal::wake_object(k, id),
+            |k| {
+                on_console(k, id, "Machine::write_console", |k| {
+                    if terminal::ended(k, id)? {
+                        return Err(Errno::EIO);
+                    }
+                    let room = terminal::input_room(k, id)?;
+                    if room > 0 {
+                        let n = room.min(data.len());
+                        return terminal::feed(k, id, &data[..n]).map(|()| Some(n));
+                    }
+                    Ok(None)
+                })
+                .transpose()
+            },
+        )
+        .expect("waited without a deadline")
     }
 
     /// The console's window size changed: the foreground process group gets SIGWINCH.
@@ -904,18 +932,7 @@ impl Machine {
 
     /// The same as [`Machine::wait_for`], but woken only by the channels in `interest` ([`wake`]).
     fn wait_on<T>(&self, interest: u32, cond: impl FnMut(&mut Kernel) -> Option<T>) -> T {
-        self.wait_objects(interest, None, cond)
-    }
-
-    /// The same as [`Machine::wait_on`]; when `objects` is not None, changes that affect only other
-    /// objects do not wake it ([`crate::kernel::Cx::wait_objects`]).
-    fn wait_objects<T>(
-        &self,
-        interest: u32,
-        objects: Option<&[wake::Object]>,
-        cond: impl FnMut(&mut Kernel) -> Option<T>,
-    ) -> T {
-        self.wait_deadline(interest, objects, None, cond)
+        self.wait_deadline(interest, None, |_| None, cond)
             .expect("waited without a deadline")
     }
 
@@ -926,18 +943,21 @@ impl Machine {
         deadline: Option<std::time::Instant>,
         cond: impl FnMut(&mut Kernel) -> Option<T>,
     ) -> Option<T> {
-        self.wait_deadline(interest, None, deadline, cond)
+        self.wait_deadline(interest, deadline, |_| None, cond)
     }
 
+    /// Checks `cond` repeatedly with the BKL held until it gives a result or `deadline` passes,
+    /// lazily resolving an optional wake object under the same BKL acquisition only when blocking.
     fn wait_deadline<T>(
         &self,
         interest: u32,
-        objects: Option<&[wake::Object]>,
         deadline: Option<std::time::Instant>,
+        mut wake_object: impl FnMut(&Kernel) -> Option<wake::Object>,
         mut cond: impl FnMut(&mut Kernel) -> Option<T>,
     ) -> Option<T> {
         EVENT.with(|event| {
             let mut k = self.shared.lock();
+            let mut cached: Option<Option<wake::Object>> = None;
             loop {
                 if let Some(v) = cond(&mut k) {
                     return Some(v);
@@ -945,6 +965,8 @@ impl Machine {
                 if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                     return None;
                 }
+                let object = *cached.get_or_insert_with(|| wake_object(&k));
+                let objects = object.as_ref().map(std::slice::from_ref);
                 let (k2, _) =
                     block_for(&self.shared, k, event, deadline, &mut [], interest, objects);
                 k = k2;

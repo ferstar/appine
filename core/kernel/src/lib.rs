@@ -65,7 +65,7 @@ pub use loader::LoadError;
 pub use machine::{Machine, MachineOptions, SHUTDOWN_TIMEOUT, Stdio, run};
 pub use portmap::ListenEvent;
 pub use process::{ExitStatus, RunError, RunOptions, RunReport, Signal, Tier};
-pub use terminal::{ConsoleForeground, Terminal};
+pub use terminal::{ConsoleForeground, ConsoleForegroundKey, ConsoleRead, Terminal};
 pub use watchdog::Stall;
 
 use std::path::Path;

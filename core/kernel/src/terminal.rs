@@ -99,11 +99,41 @@ pub(crate) fn detach(k: &mut Kernel, id: u32, leader: Tid, attached: bool) {
     console.attached = attached;
 }
 
-/// The wake objects to register when waiting for console `id`'s output or for room in its input
+/// The wake object to register when waiting for console `id`'s output or for room in its input
 /// queue: its PTY. Closing a console requests a wake of the whole channel. None when the console
 /// does not exist.
-pub(crate) fn wake_objects(k: &Kernel, id: u32) -> Option<Vec<wake::Object>> {
-    tty_of(k, id).ok().map(|t| vec![wake::of(&t)])
+pub(crate) fn wake_object(k: &Kernel, id: u32) -> Option<wake::Object> {
+    tty_of(k, id).ok().map(|t| wake::of(&t))
+}
+
+/// Result of one host console read run ([`crate::Machine::read_console_run_state`]): byte count,
+/// whether a non-foreground process group wrote those bytes, and lightweight terminal metadata
+/// sampled under the same BKL acquisition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsoleRead {
+    /// Bytes copied into the caller's buffer (0 means EOF: attached session ended and output drained).
+    pub len: usize,
+    /// True when a process group other than the terminal's foreground group wrote these bytes.
+    pub background: bool,
+    /// Whether the line discipline reads lines without echo (`ICANON` on, `ECHO` off).
+    pub password_input: bool,
+    /// Foreground process group id (`tty.fg`), if any.
+    pub fg_pgrp: Option<i32>,
+    /// Lightweight identity of the foreground process state for caching [`ConsoleForeground`].
+    pub fg_key: Option<ConsoleForegroundKey>,
+}
+
+/// Lightweight identity of a console's foreground process state, sampled cheaply under the same
+/// BKL acquisition as [`take_output_run_state`] without reading guest memory or allocating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsoleForegroundKey {
+    pub pgid: i32,
+    pub session: Option<i32>,
+    pub pid: i32,
+    pub canonical_input: bool,
+    mm_id: usize,
+    args: (u64, u64),
+    comm: [u8; 16],
 }
 
 /// Takes up to `max` bytes of output. Returns None when there is no output; returns an empty Vec
@@ -115,16 +145,46 @@ pub(crate) fn take_output(k: &Kernel, id: u32, max: usize) -> Result<Option<Vec<
 }
 
 /// As [`take_output`], but only up to where the output's writer changes between the foreground
-/// process group and another, with whether another wrote it (a job left in the background, or a
-/// process of another session).
-pub(crate) fn take_output_run(
+/// process group and another, and also returns password-input and foreground-process identity
+/// metadata sampled under the same BKL hold.
+pub(crate) fn take_output_run_state(
     k: &Kernel,
     id: u32,
     max: usize,
-) -> Result<Option<(Vec<u8>, bool)>, Errno> {
+) -> Result<Option<(Vec<u8>, ConsoleRead)>, Errno> {
     let tty = tty_of(k, id)?;
-    let (out, background) = tty.borrow_mut().take_output_run(max);
-    Ok(taken(k, id, &tty, out, background))
+    let (out, background, password_input, fg_pgrp, session, canonical_input) = {
+        let mut t = tty.borrow_mut();
+        let (out, background) = t.take_output_run(max);
+        let lflag = t.termios.lflag;
+        (
+            out,
+            background,
+            lflag & (ICANON | ECHO) == ICANON,
+            t.fg,
+            t.session,
+            lflag & ICANON != 0,
+        )
+    };
+    let Some((out, background)) = taken(k, id, &tty, out, background) else {
+        return Ok(None);
+    };
+    let len = out.len();
+    let fg_key = if len > 0 {
+        fg_pgrp.and_then(|fg| fg_identity(k, fg, session, canonical_input))
+    } else {
+        None
+    };
+    Ok(Some((
+        out,
+        ConsoleRead {
+            len,
+            background,
+            password_input,
+            fg_pgrp,
+            fg_key,
+        },
+    )))
 }
 
 fn taken(
@@ -220,6 +280,32 @@ fn fg_member(k: &Kernel, fg: Tid) -> Result<(Tid, Tid), Errno> {
         .and_then(member)
         .or_else(|| k.groups.values().find_map(member))
         .ok_or(Errno::ESRCH)
+}
+
+fn fg_identity(
+    k: &Kernel,
+    fg: Tid,
+    session: Option<Tid>,
+    canonical_input: bool,
+) -> Option<ConsoleForegroundKey> {
+    let (tgid, tid) = fg_member(k, fg).ok()?;
+    let task = k.tasks.get(&tid)?;
+    let comm = task.comm.get();
+    let (mm_id, args) = {
+        let res = task.res.borrow();
+        let mm_id = Rc::as_ptr(&res.mm) as usize;
+        let args = res.mm.borrow().args;
+        (mm_id, args)
+    };
+    Some(ConsoleForegroundKey {
+        pgid: fg,
+        session,
+        pid: tgid,
+        canonical_input,
+        mm_id,
+        args,
+        comm,
+    })
 }
 
 /// Snapshot of the console's foreground process group (leader process, or first member if the
@@ -501,7 +587,7 @@ pub(crate) fn bridge(shared: Arc<Shared>, term: Terminal, id: u32, pid: Tid) {
         if let Some(r) = term.resize {
             fds.push((r, POLLIN, 0));
         }
-        let objects = wake_objects(&k, id);
+        let object = wake_object(&k, id);
         let (k2, _) = block_for(
             &shared,
             k,
@@ -509,7 +595,7 @@ pub(crate) fn bridge(shared: Arc<Shared>, term: Terminal, id: u32, pid: Tid) {
             None,
             &mut fds,
             wake::ALL,
-            objects.as_deref(),
+            object.as_ref().map(std::slice::from_ref),
         );
         k = k2;
         for (fd, _, revents) in fds {
@@ -647,5 +733,40 @@ mod tests {
         assert!(!check("doas", &[b"doas", b"-s"]));
         assert!(!check("su", &[b"su", b"alice", b"-c", b"exec sh -l"]));
         assert!(!check("ssh", &[b"ssh", b"example.com"]));
+    }
+
+    #[test]
+    fn take_output_run_state_reports_password_fg_and_eof() {
+        let mut k = Kernel::new(Tier::Interpreter);
+        let id = open(&mut k, Winsize::default());
+        let (slave, tty) = attach(&mut k, id, 42).unwrap();
+        assert_eq!(wake_object(&k, id), Some(wake::of(&tty)));
+
+        // Normal canonical + echo output from foreground group 42.
+        tty.borrow_mut().write_output(b"hi");
+        let (out, read) = take_output_run_state(&k, id, 64).unwrap().unwrap();
+        assert_eq!(out, b"hi");
+        assert_eq!(read.len, 2);
+        assert!(!read.background);
+        assert!(!read.password_input);
+        assert_eq!(read.fg_pgrp, Some(42));
+        assert!(read.fg_key.is_none()); // no live Task registered for tid 42 in unit test
+
+        // Disable ECHO while keeping ICANON (password prompt) and write from a background group.
+        tty.borrow_mut().termios.lflag &= !ECHO;
+        tty.borrow_mut().write_background(b"bg");
+        let (out, read) = take_output_run_state(&k, id, 64).unwrap().unwrap();
+        assert_eq!(out, b"bg");
+        assert!(read.background);
+        assert!(read.password_input);
+        assert_eq!(read.fg_pgrp, Some(42));
+
+        // Empty queue while slave is open returns None; closing slave returns EOF (len == 0).
+        assert!(take_output_run_state(&k, id, 64).unwrap().is_none());
+        drop(slave);
+        let (out, read) = take_output_run_state(&k, id, 64).unwrap().unwrap();
+        assert!(out.is_empty());
+        assert_eq!(read.len, 0);
+        assert!(read.fg_key.is_none());
     }
 }

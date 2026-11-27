@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of android/vtview, inherited from the android/terminal full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: per-row RenderNode hardware rendering in VtRenderer, immutable-per-generation VtImages bitmaps, and immediate row invalidation)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: mode 2026 holds freeze `AppineVtRender.state` in place instead of capturing `held_state` or rebuilding, with `skip_rows` on dimension mismatch)
 
 ## Responsibilities
 
@@ -62,16 +62,20 @@ it does not transfer those lifecycle methods here.
 
 - `onOutput` posts an invalidate on animation to the attached view; `onDraw` takes a frame
   (`VtNative.frame`, main thread only) in two phases and applies it: `frame` clears `dirty`, locks
-  `Tab.render`, then locks `Tab.term` only for `appine_vt_frame_begin` (shows animation frames due
-  unless held, runs `ghostty_render_state_begin_update` or hands off `vt->held_state`, reads image
-  placements when their generation changed, catches a running search up for at most 4 ms and marks
-  its viewport matches, and snapshots terminal-owned header metadata into `FrameSnap`). After
-  releasing `Tab.term`, `appine_vt_frame_end` runs under `Tab.render` alone: calls
-  `ghostty_render_state_end_update` to finish deferred style denormalization, writes the 64-byte
-  header, image placements (56 bytes each) and dirty/mark-changed rows (all rows when full or
-  placements changed while some were or are shown) in the format documented in `vt.c` (12-byte row
-  headers, 16-byte cells, a grapheme's extra codepoints after its row), and cleans the render
-  state; the direct `ByteBuffer` is valid until the next `frame`. `appine_vt_frame_end` uses
+  `Tab.render`, then locks `Tab.term` only for `appine_vt_frame_begin` (unless held, shows animation
+  frames due and runs `ghostty_render_state_begin_update`; while held, freezes `render->state` in
+  place and sets `skip_rows` if its dimensions do not yet match the terminal; reads image
+  placements when not skipping rows and their generation changed; catches a running search up for
+  at most 4 ms and marks its viewport matches unless skipping rows; and snapshots terminal-owned
+  header metadata into `FrameSnap`). After releasing `Tab.term`, `appine_vt_frame_end` runs under
+  `Tab.render` alone: when `skip_rows` is set it emits `DIRTY_FALSE` with zero placements, overscan
+  and rows (preserving `render->state`'s colours if initialized, else white on black) without
+  running `end_update` or `clean`; otherwise it calls `ghostty_render_state_end_update` to finish
+  deferred style denormalization, writes the 64-byte header, image placements (56 bytes each) and
+  dirty/mark-changed rows (all rows when full or placements changed while some were or are shown)
+  in the format documented in `vt.c` (12-byte row headers, 16-byte cells, a grapheme's extra
+  codepoints after its row), and cleans the render state; the direct `ByteBuffer` is valid until
+  the next `frame`. `appine_vt_frame_end` uses
   `ghostty_render_state_row_iterator_next_dirty` on incremental frames whose search marks did not
   change (safe because `overscan.above == 0`), falling back to `row_iterator_next` when `full` or
   search marks changed; `marks_nonempty` and `marks_sent_nonempty` skip full-grid mark `memset`,
@@ -108,14 +112,15 @@ it does not transfer those lifecycle methods here.
   `VtRenderer.discardDisplayLists()` so row nodes release bitmap references, after which the next
   visible frame copies them again from libghostty-vt and re-records rows from `VtScreen`. Newly
   arrived pixels call `VtRenderer.invalidateRows()` so painted rows re-record on the current frame.
-- A hold (mode 2026) captures the screen into `vt->held_state` (under `Tab.term` only, never
-  racing with `AppineVtRender`) when it begins; it ends with the program, a resize or a full
-  reset, or by force once a frame is taken more than 1 s after it began. On the first frame while
-  held, `vt->held_state` is moved into `AppineVtRender.state`; if a hold began and ended between
-  frames, `AppineVtRender.state` is rebuilt fresh before `begin_update` so rows whose dirty flags
-  `held_state` consumed are never missed. During a hold the rows, cursor and colours come from the
-  capture, and so does the overscan byte, while the header's modes, selection and scroll position
-  are read live.
+- A hold (mode 2026) records `vt->held` and `vt->held_since` in `on_render_hold` without touching
+  `GhosttyRenderState`; it ends with the program, a resize or a full reset, or by force once a
+  frame is taken more than 1 s after it began. While held, `appine_vt_frame_begin` skips
+  `ghostty_render_state_begin_update`, freezing `AppineVtRender.state` in place (or setting
+  `skip_rows` if its dimensions do not yet match the terminal, e.g. immediately after resize or
+  before the first frame), so terminal dirty flags stay intact and the first frame after
+  `CSI ? 2026 l` updates incrementally without rebuilding `render->state`. During a hold the rows,
+  cursor, colours, placements and overscan come from the frozen render state, while the header's
+  modes, selection and scroll position are read live.
 - The view asks for a full frame after a regrid, a change of the wide-cell setting, attaching
   another tab or the attached tab's shell starting; default colour changes (OSC 10 or 11, reverse
   video) and newly arrived image pixels invalidate cached row display lists in place via

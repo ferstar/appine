@@ -15,8 +15,9 @@
 //! Threads: Kotlin's pump thread runs [`pump`]'s loop (read the console, feed the terminal, write
 //! the terminal's replies back) until the session ends; the main thread takes frames and the
 //! pixels of the images they place, resizes, scrolls, encodes keys, mouse and focus events and
-//! pastes, selects, searches and copies, and reads the title and transcript; the service's worker
-//! takes snapshots for saving tabs and compresses every tab's scrollback when memory is trimmed;
+//! pastes, selects, searches and copies, and reads the title; the service's worker takes
+//! transcripts and snapshots for saving tabs and compresses every tab's scrollback when memory is
+//! trimmed;
 //! the `vt-compress` thread compresses idle tabs' scrollback ([`compressor`]). The terminal is not
 //! thread-safe, so every terminal call into vt.c holds the tab's terminal lock (`term`); frames
 //! hold a separate render lock (`render`, always acquired before `term`), taking `term` only for
@@ -34,7 +35,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use appine_kernel::{ConsoleForeground, Machine};
+use appine_kernel::{ConsoleForeground, ConsoleForegroundKey, Machine};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyteArray, jfloat, jint, jintArray, jlong, jobject, jstring};
@@ -937,6 +938,63 @@ impl FallbackTracker {
     }
 }
 
+/// Caches the console's [`ConsoleForeground`] by its lightweight [`ConsoleForegroundKey`] across
+/// pump reads so steady-state output skips repeated BKL acquisitions and guest `mm.args` reads.
+struct FgCache {
+    cached: Option<(ConsoleForegroundKey, ConsoleForeground)>,
+    transient: Option<ConsoleForeground>,
+}
+
+impl FgCache {
+    fn new() -> Self {
+        Self {
+            cached: None,
+            transient: None,
+        }
+    }
+
+    fn resolve(
+        &mut self,
+        m: &Machine,
+        console: u32,
+        need_fg: bool,
+        timeout: bool,
+        fg_key: Option<ConsoleForegroundKey>,
+    ) -> Option<&ConsoleForeground> {
+        self.transient = None;
+        if !need_fg {
+            return None;
+        }
+        if timeout {
+            self.cached = None;
+            self.transient = m.console_foreground_process(console).ok();
+            return self.transient.as_ref();
+        }
+        let Some(key) = fg_key else {
+            self.cached = None;
+            return None;
+        };
+        if self.cached.as_ref().is_some_and(|(k, _)| *k == key) {
+            return self.cached.as_ref().map(|(_, f)| f);
+        }
+        let Ok(fresh) = m.console_foreground_process(console) else {
+            self.cached = None;
+            return None;
+        };
+        if fresh.pgid == key.pgid
+            && fresh.pid == key.pid
+            && fresh.canonical_input == key.canonical_input
+        {
+            self.cached = Some((key, fresh));
+            self.cached.as_ref().map(|(_, f)| f)
+        } else {
+            self.cached = None;
+            self.transient = Some(fresh);
+            self.transient.as_ref()
+        }
+    }
+}
+
 /// Moves the console's output into the terminal until the session ends or the console is closed;
 /// calls `session.onOutput()` whenever the screen changed after the last frame was taken,
 /// `session.onTitle()` when a program or foreground-process fallback changed the title, `onBell`,
@@ -963,47 +1021,60 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_pump<'l>(
         // report lasts.
         let mut reporter = None;
         let mut fallback = FallbackTracker::new();
+        let mut fg_cache = FgCache::new();
         loop {
             // Looked up again for every read, so the kernel is not kept once the service stops it.
             let Some(m) = tab.machine() else { break };
             let timeout = FG_PROBE_DELAYS.get(fallback.probe_step).copied();
-            let read = match m.read_console_run_timeout(tab.console, &mut buf, timeout) {
-                Ok(Some((0, _))) | Err(_) => break,
-                Ok(Some((n, background))) => {
-                    // Sample the password cursor before locking the terminal. Feed the run and
-                    // take its effects and prompt state together, then unlock before writing replies.
-                    let password = m.console_password_input(tab.console).unwrap_or(false);
-                    let (replies, titled, effects, prompt) = {
-                        let mut term = tab.term();
-                        unsafe { appine_vt_set_password_input(term.0, password) };
-                        let replies = term.feed(&buf[..n], background);
-                        let titled = unsafe { appine_vt_take_title_changed(term.0) };
-                        let effects = term.take_effects();
-                        (replies, titled, effects, term.prompt_state())
-                    };
-                    if !replies.is_empty() && !tab.write(&m, &replies) {
-                        break;
+            let (read, fg_pgrp, fg_key) =
+                match m.read_console_run_state(tab.console, &mut buf, timeout) {
+                    Ok(Some(r)) if r.len == 0 => break,
+                    Err(_) => break,
+                    Ok(Some(r)) => {
+                        // Password input, foreground group and foreground identity were sampled
+                        // under the same BKL acquisition as the read. Feed the run and take its
+                        // effects and prompt state together, then unlock before writing replies.
+                        let (replies, titled, effects, prompt) = {
+                            let mut term = tab.term();
+                            unsafe { appine_vt_set_password_input(term.0, r.password_input) };
+                            let replies = term.feed(&buf[..r.len], r.background);
+                            let titled = unsafe { appine_vt_take_title_changed(term.0) };
+                            let effects = term.take_effects();
+                            (replies, titled, effects, term.prompt_state())
+                        };
+                        if !replies.is_empty() && !tab.write(&m, &replies) {
+                            break;
+                        }
+                        (
+                            PumpRead {
+                                prompt,
+                                effects: Some(effects),
+                                titled,
+                                foreground_newline: !r.background && buf[..r.len].contains(&b'\n'),
+                            },
+                            r.fg_pgrp,
+                            r.fg_key,
+                        )
                     }
-                    PumpRead {
-                        prompt,
-                        effects: Some(effects),
-                        titled,
-                        foreground_newline: !background && buf[..n].contains(&b'\n'),
-                    }
-                }
-                Ok(None) => PumpRead {
-                    prompt: tab.term().prompt_state(),
-                    effects: None,
-                    titled: false,
-                    foreground_newline: false,
-                },
-            };
-            let fg = m.console_foreground_process(tab.console).ok();
+                    Ok(None) => (
+                        PumpRead {
+                            prompt: tab.term().prompt_state(),
+                            effects: None,
+                            titled: false,
+                            foreground_newline: false,
+                        },
+                        None,
+                        None,
+                    ),
+                };
+
+            let need_fg = !(read.prompt.at_prompt || read.prompt.mode == PROMPT_FULL);
+            let fg = fg_cache.resolve(&m, tab.console, need_fg, read.effects.is_none(), fg_key);
             drop(m);
 
             let mut gave_back = false;
             if let Some(effects) = &read.effects {
-                let pgid = fg.as_ref().map(|f| f.pgid);
+                let pgid = fg.map(|f| f.pgid).or(fg_pgrp);
                 if effects.reported() {
                     reporter = pgid;
                 } else if reporter.is_some() && reporter != pgid {
@@ -1011,7 +1082,7 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_pump<'l>(
                     gave_back = true;
                 }
             }
-            let update = fallback.update(&read, fg.as_ref());
+            let update = fallback.update(&read, fg);
             let mut title_notify = read.titled;
             if let Some(next_title) = update.title {
                 let mut term = tab.term();

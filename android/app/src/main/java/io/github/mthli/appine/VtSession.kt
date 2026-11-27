@@ -21,7 +21,8 @@ import kotlin.math.abs
  * shell starts when a view first knows the grid ([start]), and until then a restored tab's saved
  * terminal and messages wait. Input goes out on the tab's own writer thread, so a program that
  * stops reading blocks only its tab. Calls are on the main thread, except [console],
- * [resolvedLogin], [takeSnapshot] and [savedSnapshot], which saving uses on the service's worker.
+ * [resolvedLogin], [takeTranscript], [takeSnapshot] and [savedSnapshot], which saving uses on the
+ * service's worker.
  */
 internal class VtSession(
     /** Names the tab in a notification's intent (from the service, never reused in a run). */
@@ -163,9 +164,11 @@ internal class VtSession(
     private var cellHeight = 0
 
     /**
-     * The last transcript of the primary screen (as much as [transcriptText] returns), kept for
-     * saves while a full-screen program runs or nothing changed the screen.
+     * The last transcript of the primary screen (as much as [takeTranscript] returns), kept for
+     * saves while a full-screen program runs or nothing changed the screen (only the service's
+     * worker thread uses it).
      */
+    @Volatile
     private var lastTranscript: String? = null
 
     /**
@@ -231,22 +234,23 @@ internal class VtSession(
 
     /**
      * Plain text of the primary screen and its scrollback for saving the tab, as much of its end as
-     * saving keeps ([Tabs.MAX_TRANSCRIPT]); null while the shell has not started (a restored tab
-     * not shown yet).
+     * saving keeps ([Tabs.MAX_TRANSCRIPT]), on the service's worker; null while the shell has not
+     * started (a restored tab not shown yet).
      */
-    val transcriptText: String?
-        get() {
-            if (tab == 0L) return null
-            VtNative.transcript(tab)?.let {
-                // Kept for later saves: the rest of a full scrollback would sit in the heap unused
-                lastTranscript = it.takeLast(Tabs.MAX_TRANSCRIPT)
-                return lastTranscript
-            }
-            // Unchanged since the last one, which formatting again would only make the scrollback
-            // decompress for; or the alternate screen (vim, less): what the tab showed before it,
-            // not the program's screen without scrollback
-            return lastTranscript.orEmpty()
+    fun takeTranscript(): String? {
+        val t = tab
+        if (t == 0L) return null
+        VtNative.transcript(t)?.let {
+            // Kept for later saves: the rest of a full scrollback would sit in the heap unused
+            val trimmed = it.takeLast(Tabs.MAX_TRANSCRIPT)
+            lastTranscript = trimmed
+            return trimmed
         }
+        // Unchanged since the last one, which formatting again would only make the scrollback
+        // decompress for; or the alternate screen (vim, less): what the tab showed before it,
+        // not the program's screen without scrollback
+        return lastTranscript.orEmpty()
+    }
 
     /**
      * A snapshot of the whole terminal for saving the tab ([VtNative.snapshot]), on the service's

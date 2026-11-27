@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 3 research concerns; 9 claims checked by 2 independent verifiers — 9 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: OSC 52 read capture, preview dismissal and writer invalidation across user resets and program RIS)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: `VtSession.takeTranscript()` and `@Volatile lastTranscript` moved to the service worker)
 
 ## Responsibilities
 
@@ -38,8 +38,8 @@ login script and prompt-mark producers (`android/setup`).
   on `vt-pump`), `console` (`pty.console`), `consoleOpen` (`pty.console >= 0 && !hungUp`),
   `isRunning` (`exit == null`, true before start as well), `busy` (`isRunning && tab != 0L &&
   VtNative.busy(tab)`), restore staging (`restoredSnapshot`, `restoredText`, `pending`),
-  `lastTranscript` (capped to `Tabs.MAX_TRANSCRIPT` = 256 K chars), worker-only `@Volatile` save
-  metadata (`resolvedLogin`, `savedSnapshot`), cursor defaults (`cursorStyle`, `cursorBlink`),
+  worker-only `@Volatile` save metadata (`lastTranscript` capped to `Tabs.MAX_TRANSCRIPT` = 256 K
+  chars, `resolvedLogin`, `savedSnapshot`), cursor defaults (`cursorStyle`, `cursorBlink`),
   grid cache, main-thread `progress` (`Progress?`, 15 s `dropProgress` timer) and `status`
   (`Status?` selected from `LinkedHashMap<String, Status> records`, LRU-ordered, max 64),
   synchronized `reports` handoff buffer from `vt-pump`, `clipboardReads` (`ClipboardReads`), `AtomicBoolean
@@ -64,7 +64,7 @@ login script and prompt-mark producers (`android/setup`).
   `ConsolePty.start`, `waitFor`, `close`, `script`, `argv`, `ENVIRONMENT`, `LOGIN_AUTO`,
   `LOGIN_ROOT`.
 - State and saving: `id`, `login`, `resolvedLogin`, `savedSnapshot`, `tab`, `view`, `console`,
-  `consoleOpen`, `title`, `isRunning`, `busy`, `cwd`, `setRestored`, `transcriptText`,
+  `consoleOpen`, `title`, `isRunning`, `busy`, `cwd`, `setRestored`, `takeTranscript`,
   `takeSnapshot`, `showMessage`, `setCursor`, `clear`, `reset`.
 - Program reports and native pump callbacks: `progress`, `status`, `statusSeen`, `describe`,
   `answerClipboardRead`, `Events`; JNI callbacks invoked on `vt-pump`: `onOutput`, `onTitle`,
@@ -77,7 +77,7 @@ login script and prompt-mark producers (`android/setup`).
 
 - `TerminalService.createSession` builds `ConsolePty` and `VtSession` and calls `setCursor`;
   restored tabs also call `setRestored(text, snapshotLoader, notice)`. While unstarted (`tab == 0L`),
-  `isRunning` is true, `busy` is false, `console` is `-1`, `transcriptText` returns `null` (so
+  `isRunning` is true, `busy` is false, `console` is `-1`, `takeTranscript()` returns `null` (so
   `saveTabs` preserves the original unshown tab record), and `showMessage` appends yellow ANSI
   lines to `pending`.
 - `VtSession.start(cols, rows, cellWidth, cellHeight)` runs once on the main thread when a view
@@ -152,10 +152,11 @@ login script and prompt-mark producers (`android/setup`).
 
 ### Saving, messages, actions and shell integration
 
-- `transcriptText` (main thread): returns `null` when `tab == 0L`. Otherwise calls
-  `VtNative.transcript(tab)`: a non-null result (primary screen changed) is truncated to its last
-  `Tabs.MAX_TRANSCRIPT` (256 K) characters, cached in `lastTranscript` and returned; a `null`
-  result (unchanged, alternate screen, or error) returns `lastTranscript.orEmpty()`.
+- `takeTranscript()` (service worker): returns `null` when `tab == 0L`. Otherwise calls
+  `VtNative.transcript(tab)` (already truncated to the trailing `Tabs.MAX_TRANSCRIPT` UTF-16 code
+  units in native code): a non-null result (primary screen changed) is cached in `lastTranscript`
+  and returned; a `null` result (unchanged, alternate screen, or error) returns
+  `lastTranscript.orEmpty()`.
 - `takeSnapshot()` (service worker): returns `null` if `tab == 0L`, else forwards
   `VtNative.snapshot(t)`'s three-way result (`null` = unchanged -> keep `savedSnapshot`; empty
   `ByteArray` = failed / >16 MiB -> clear `savedSnapshot`; non-empty bytes -> write new snapshot).
@@ -188,9 +189,10 @@ login script and prompt-mark producers (`android/setup`).
 
 - `android/service` (`TerminalService`, `Notifications`): constructs/restores/saves/releases
   sessions (passing `ConsoleTracker` to `ConsolePty`), implements `Events`, reads
-  `isRunning`/`transcriptText`/`console`/`consoleOpen`/`tab`/`id`/`title`/`progress`/`status`,
+  `isRunning`/`console`/`consoleOpen`/`tab`/`id`/`title`/`progress`/`status`,
   calls `ownedConsoleAt`, mutates `resolvedLogin`/`savedSnapshot`, calls `setCursor`,
-  `setRestored`, `showMessage`, `takeSnapshot`, `answerClipboardRead`, `statusSeen` and `describe`.
+  `setRestored`, `showMessage`, `takeTranscript`, `takeSnapshot`, `answerClipboardRead`,
+  `statusSeen` and `describe`.
 - `android/terminal` (`MainActivity`): calls `start`, `cwd`, `clear`, `reset`, `write`,
   `answerClipboardRead`; reads `id`, `tab`, `busy`, `isRunning`, `progress`, `status`.
 - `android/tabbar` (`TabBarView`, `TabListView`, `TabMarks`, `ProgressLine`): reads `id`, `title`,

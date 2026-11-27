@@ -4,6 +4,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -199,7 +200,7 @@ class VtShellIntegrationTest {
         assertTrue("Expected non-default fg on 'h'", s1.fg[0] != 0)
         VtNative.searchEnd(tab)
 
-        // Synchronized output hold: capture pre-hold state while held, then show new state after end.
+        // Synchronized output hold: freeze pre-hold state while held, then update incrementally after end.
         VtNative.print(tab, "\u001b[?2026h\r\nHIDDEN_WHILE_HELD".toByteArray())
         val (heldFrame, heldScreen) = captureScreen(tab, full = true)
         assertTrue("Expected outputPending during mode 2026 hold", heldFrame.outputPending)
@@ -207,11 +208,15 @@ class VtShellIntegrationTest {
         VtNative.print(tab, "\u001b[?2026l".toByteArray())
         val (afterHold, afterScreen) = captureScreen(tab, full = false)
         assertFalse(afterHold.outputPending)
+        assertNotEquals("Mode 2026 release must not force a full redraw", VtFrame.DIRTY_FULL, afterHold.dirty)
+        assertTrue("Expected incremental row count after mode 2026 release, got ${afterHold.rowCount}", afterHold.rowCount < afterHold.rows)
         assertEquals("HIDDEN_WHILE_HELD", rowText(afterScreen, 2))
 
-        // A hold that starts AND ends between two frames must not lose changes made before/during it.
+        // A hold that starts AND ends between two frames must keep changes incremental.
         VtNative.print(tab, "\r\nBEFORE_BURST\u001b[?2026h\r\nINSIDE_BURST\u001b[?2026l".toByteArray())
-        val (_, burstScreen) = captureScreen(tab, full = false)
+        val (burstFrame, burstScreen) = captureScreen(tab, full = false)
+        assertNotEquals("Completed mode 2026 burst must not force a full redraw", VtFrame.DIRTY_FULL, burstFrame.dirty)
+        assertTrue("Expected incremental row count after mode 2026 burst, got ${burstFrame.rowCount}", burstFrame.rowCount < burstFrame.rows)
         assertEquals("BEFORE_BURST", rowText(burstScreen, 3))
         assertEquals("INSIDE_BURST", rowText(burstScreen, 4))
 

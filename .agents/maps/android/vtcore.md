@@ -4,6 +4,8 @@
 > See `.agents/decisions/android/vtcore.md` for the paired decision history (pre-split decisions D1, D3, D4 and the parsing side of D5–D7 stay in `.agents/decisions/android/vt.md`; earlier terminal implementation decisions D2, D5, D6, D8, D16, D17, D32, D33, D35–D39 and D42–D49 stay in `.agents/decisions/android/terminal.md`).
 >
 > Verified: 2026-11-26 (full refresh: 18 adversarial claims checked by independent verifier — 13 confirmed, 5 partial corrected below, 0 refuted; confirmed bugs and debts recorded)
+>
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: freeze render state on mode 2026 hold, collapse vt-pump console reads via `read_console_run_state` with cached foreground lookup, and bound worker-side `appine_vt_transcript`)
 
 ## Responsibilities
 
@@ -46,10 +48,10 @@ exports.
 | Touch and pointer selection | `gesturePress`, `gestureDrag`, `gestureEnd`, `mousePress`, `mouseDrag`, `mouseRelease`, `selectContext`, `selectGrab`, `selectTo`, `selectAdjust`, `selectRectangle`, `selectAll` |
 | Output, links and search | `outputAt`, `selectOutput`, `selectClear`, `copy`, `link`, `promptClick`, `search`, `searchSelect`, `searchRows`, `searchEnd` |
 
-`pump` runs on `VtSession`'s `vt-pump`. Production session controls, transcripts, input,
-frames and bitmap reads run on main. The service worker calls `snapshot` (any-thread),
-`dropImages` and `compressAll`. `Tabs` reads `version` lazily for its index. Instrumentation
-uses `atPrompt`; production close checks use `busy`.
+`pump` runs on `VtSession`'s `vt-pump`. Production session controls, input,
+frames and bitmap reads run on main. The service worker calls `transcript` (any-thread), `snapshot`
+(any-thread), `dropImages` and `compressAll`. `Tabs` reads `version` lazily for its index.
+Instrumentation uses `atPrompt`; production close checks use `busy`.
 
 ### Constants and JNI values
 
@@ -113,9 +115,10 @@ tabs/threads, with a possible race at the second boundary.
 ### Console output and JNI delivery
 
 1. `vt-pump` reads one run of foreground or background output into a reusable 64 KiB buffer with
-   `Machine::read_console_run_timeout`. For data it samples `console_password_input` (ICANON
-   on, ECHO off; false on error) before locking. The view polls `passwordInput` while showing
-   the lock cursor in case echo returns without output.
+   `Machine::read_console_run_state`, which samples `password_input` (ICANON on, ECHO off),
+   `fg_pgrp`, and a lightweight `ConsoleForegroundKey` under the same single BKL acquisition. The
+   view still polls `passwordInput` while showing the lock cursor in case echo returns without
+   output.
 2. Under one terminal guard it sets the password flag, feeds bytes, takes replies, title-change
    flag, effects and prompt state. `ghostty_terminal_vt_write_until` stops at OSC/DCS starts
    and ends. Scanners retain 64/5 prefix bytes across reads and count the entire content,
@@ -123,8 +126,11 @@ tabs/threads, with a possible race at the second boundary.
    bulk-write the remainder and clear OSC/DCS/tmux tracking. Armed ash LFs are handled below.
 3. After unlock `Tab::write` loops over partial writes until all replies (e.g. DA, DSR, size,
    tmux CR) reach the console or a write fails. Paste and prompt-click adapters drain the same C
-   buffer for Kotlin. A timeout samples prompt state without feeding. After data or timeout
-   the pump samples `console_foreground_process`, drops the machine, then updates fallback.
+   buffer for Kotlin. A timeout samples prompt state without feeding. After data or timeout,
+   `console_foreground_process` is skipped when `at_prompt` or `PROMPT_FULL` (using `fg_pgrp` for
+   report expiry), reused from a pump-local cache while `ConsoleForegroundKey` matches, and
+   queried fresh only on key changes or probe timeouts; the pump then drops the machine and updates
+   fallback.
 4. Only a data run swaps `dirty` to true. Only the false→true transition calls `onOutput`,
    posting a frame invalidation if a view is attached. Hidden tabs keep pumping. Then come
    `onTitle` for explicit/fallback changes, batch effects, fallback completion and finally
@@ -259,8 +265,7 @@ Shells that fail to redraw can lose visible input until the next prompt.
 
 Only a changed grid sets `resize_pending` and zeros `resize_output_at`. Each nonempty feed
 while pending refreshes the timestamp. Frame begin clears pending only after such a feed,
-≥32 ms quiet, successful `VT_GROUND` (including UTF-8 state) and a clear host hold flag (a
-failed hold capture can leave that flag clear while synchronized output is active). Frame bit 7 is pending **or** held. The height-shrink preview has its own 200 ms bound
+≥32 ms quiet, successful `VT_GROUND` (including UTF-8 state) and a clear host hold flag. Frame bit 7 is pending **or** held. The height-shrink preview has its own 200 ms bound
 even if output never comes. Later redraws can follow a quiet gap; resize and SIGWINCH proceed
 without waiting.
 
@@ -268,9 +273,11 @@ without waiting.
 samples state, images, animation, search and header fields. `appine_vt_frame_end` finishes
 deferred style work and encodes rows under render alone. JNI releases render before wrapping
 the direct buffer; main must consume it before the next frame on the live tab. Mode 2026's
-`on_render_hold` captures separate `held_state` under terminal alone. Frame begin transfers it under
-both locks or rebuilds a fresh state if the hold ended between frames and consumed dirty rows.
-Begin forces a hold older than one second off.
+`on_render_hold` only records `held` and `held_since` without touching `GhosttyRenderState`, so
+terminal dirty flags stay intact; while held, `appine_vt_frame_begin` freezes `render->state` in
+place (suppressing row encoding via `skip_rows` only if `render->state` dimensions do not yet match
+the terminal) so the first frame after `CSI ? 2026 l` updates incrementally. Begin forces a hold
+older than one second off.
 
 ### App messages, clear and reset
 
@@ -327,10 +334,13 @@ foreground running-low callbacks are absent.
 ### Transcripts, snapshots and restore
 
 `changed` invalidates both `transcribed` and `snapshot` on feed, resize, own writes and
-explicit reset, independently of frame `dirty`. `transcript` formats primary/history as plain
-text with soft wraps joined and trailing blanks trimmed. Success on an empty screen returns
-an empty string. Alternate, unchanged or failed returns null. Kotlin retains the last 256 Ki
-characters for reuse. Skipping formatting avoids making the same cold pages resident again.
+explicit reset, independently of frame `dirty`. `transcript` formats the primary screen's trailing
+plain text (capped to `TRANSCRIPT_MAX_UTF16` = 256 Ki UTF-16 code units in C before JNI, trying a
+tail selection first on deep scrollback so older cold pages remain compressed when the tail fills
+the cap, and falling back to full history for sparse lines) with soft wraps joined and trailing
+blanks trimmed. Success on an empty screen returns an empty string. Alternate, unchanged or failed
+returns null. Kotlin caches the result on the service worker. Skipping formatting avoids making
+compressed pages resident again.
 
 Binary snapshots capture both screens, history, images, colours, modes, title and parser
 continuation. From `SNAPSHOT_STALE`, mark touched and set `NONE` before encoding. Success
@@ -429,8 +439,6 @@ Writes produce no app effects or console replies. In order:
   `command_start`, and explicit reset also leaves `was_at_prompt` intact; a later `D` can
   report duration spanning a reset, and the first feed after explicit reset can infer
   departure from a pre-reset prompt.
-- `on_render_hold` returns without setting `held` if render-state allocation or update fails
-  after Ghostty enables mode 2026, allowing resize to settle while synchronized output is active.
 - `tmux_started` arms `tmux_control` before reserving the CR reply, so a reply-buffer
   reservation failure can leave detach tracking armed without queuing CR.
 - `appine_vt_message` returns true on primary even on a one-row grid or when the cursor lies

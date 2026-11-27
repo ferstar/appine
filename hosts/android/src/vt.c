@@ -408,6 +408,7 @@ typedef struct {
   uint16_t cols;
   uint16_t height;
   bool full;
+  bool skip_rows;
   bool marked;
   bool password_input;
   bool bottom;
@@ -548,10 +549,9 @@ typedef struct AppineVt {
   // A cell in a command's output that a long press found (appine_vt_output_at), for the menu's
   // Select output; tracked, so output does not move it. NULL when none
   GhosttyTrackedGridRef output_at;
-  // Synchronized output (mode 2026): captured into held_state under the terminal lock when the
-  // hold begins (so on_render_hold never races with AppineVtRender), then handed off to
-  // AppineVtRender on the next frame (or discarded if the hold already ended)
-  GhosttyRenderState held_state;
+  // Synchronized output (mode 2026): while held, appine_vt_frame_begin freezes AppineVtRender's
+  // existing state instead of updating it so terminal dirty flags stay intact for incremental
+  // updates once the hold ends.
   bool held;
   int64_t held_since;
   // A resize has not yet been followed by settled output. Resize itself dirties rows before
@@ -766,7 +766,6 @@ static void expire_reports(AppineVt *vt) {
 // a command that started is reported: a prompt drawn again (after a resize, or Ctrl-C at the
 // prompt) reports a command end too, with none running
 static void drop_resumed(AppineVt *vt);
-static GhosttyRenderState new_render_state(void);
 
 static void on_semantic_prompt(GhosttyTerminal t, void *userdata,
                                const GhosttyTerminalSemanticPrompt *e) {
@@ -807,18 +806,12 @@ static void on_semantic_prompt(GhosttyTerminal t, void *userdata,
   }
 }
 
-// A hold began: capture the screen now into vt->held_state (under the terminal lock only, never
-// touching AppineVtRender which may be encoding a previous frame concurrently).
+// Synchronized output (mode 2026): record the hold without touching GhosttyRenderState so
+// terminal dirty flags stay intact; appine_vt_frame_begin freezes render->state while held.
 static void on_render_hold(GhosttyTerminal t, void *userdata, bool held) {
+  (void)t;
   AppineVt *vt = userdata;
   if (held) {
-    if (vt->held_state == NULL) {
-      vt->held_state = new_render_state();
-      if (vt->held_state == NULL) return;
-    } else {
-      ghostty_render_state_end_update(vt->held_state);
-    }
-    if (ghostty_render_state_begin_update(vt->held_state, t) != GHOSTTY_SUCCESS) return;
     vt->held = true;
     vt->held_since = now_ns();
   } else {
@@ -1227,11 +1220,6 @@ static void drop_resumed(AppineVt *vt) {
   vt->lf_resumed = NULL;
 }
 
-static void drop_held_state(AppineVt *vt) {
-  if (vt->held_state) ghostty_render_state_free(vt->held_state);
-  vt->held_state = NULL;
-}
-
 void appine_vt_free(AppineVt *vt) {
   if (vt == NULL) return;
   drop_resumed(vt);
@@ -1251,7 +1239,6 @@ void appine_vt_free(AppineVt *vt) {
   if (vt->mouse) ghostty_mouse_encoder_free(vt->mouse);
   if (vt->event) ghostty_key_event_free(vt->event);
   if (vt->encoder) ghostty_key_encoder_free(vt->encoder);
-  drop_held_state(vt);
   if (vt->term) ghostty_terminal_free(vt->term);
   free(vt->replies.ptr);
   free(vt->text.ptr);
@@ -1819,12 +1806,6 @@ static bool mark_matches(AppineVt *vt, AppineVtRender *render);
 static uint32_t tick_animations(AppineVt *vt);
 static bool images_changed(AppineVt *vt, AppineVtRender *render);
 
-static void replace_render_state(AppineVtRender *render, GhosttyRenderState next) {
-  ghostty_render_state_free(render->state);
-  render->state = next;
-  render->images_valid = false;
-}
-
 // Phase 1 of frame capture (called holding both the render lock and the terminal lock): updates
 // render->state with ghostty_render_state_begin_update (deferring style work to phase 2), advances
 // animations/search/marks, and snapshots terminal-owned header metadata into render->snap.
@@ -1846,31 +1827,29 @@ bool appine_vt_frame_begin(AppineVt *vt, AppineVtRender *render, bool full) {
     }
   }
   uint32_t animation_ms = 0;
+  bool skip_rows = false;
   if (vt->held) {
-    if (vt->held_state != NULL) {
-      replace_render_state(render, vt->held_state);
-      vt->held_state = NULL;
-    }
+    // Freeze the last rendered state while synchronized output is active, leaving terminal dirty
+    // flags untouched so the frame after CSI ? 2026 l updates incrementally. If render->state has
+    // not yet been updated at the current dimensions (e.g. a resize or brand-new tab immediately
+    // entering mode 2026), suppress row encoding until the hold ends.
+    uint16_t state_cols = 0;
+    uint16_t state_rows = 0;
+    ghostty_render_state_get(render->state, GHOSTTY_RENDER_STATE_DATA_COLS, &state_cols);
+    ghostty_render_state_get(render->state, GHOSTTY_RENDER_STATE_DATA_ROWS, &state_rows);
+    skip_rows = state_cols != vt->cols || state_rows != vt->height;
   } else {
     // The animation frames due now go into the update that follows
     animation_ms = tick_animations(vt);
-    if (vt->held_state != NULL) {
-      // A synchronized-output hold began and ended between frames, consuming terminal dirty flags
-      // into held_state. Rebuild render->state fresh so no row changed before the hold is missed.
-      GhosttyRenderState fresh = new_render_state();
-      if (fresh == NULL) return false;
-      drop_held_state(vt);
-      replace_render_state(render, fresh);
-    }
     if (ghostty_render_state_begin_update(render->state, vt->term) != GHOSTTY_SUCCESS) {
       return false;
     }
   }
   // The view paints images into its rows, so every row is repainted when they change
-  if (images_changed(vt, render)) full = true;
+  if (!skip_rows && images_changed(vt, render)) full = true;
   bool search_pending = vt->search != NULL && !search_catch_up(vt);
   // Without memory for the marks, rows go without them
-  bool marked = mark_matches(vt, render);
+  bool marked = !skip_rows && mark_matches(vt, render);
   uint32_t search_total = 0;
   uint32_t search_selected = 0;
   if (vt->search != NULL) {
@@ -1918,6 +1897,7 @@ bool appine_vt_frame_begin(AppineVt *vt, AppineVtRender *render, bool full) {
       .cols = vt->cols,
       .height = vt->height,
       .full = full,
+      .skip_rows = skip_rows,
       .marked = marked,
       .password_input = vt->password_input,
       .bottom = bottom,
@@ -1943,16 +1923,29 @@ bool appine_vt_frame_begin(AppineVt *vt, AppineVtRender *render, bool full) {
 // NULL when out of memory.
 const uint8_t *appine_vt_frame_end(AppineVtRender *render, size_t *len) {
   *len = 0;
-  ghostty_render_state_end_update(render->state);
-
   const FrameSnap *snap = &render->snap;
+  if (!snap->skip_rows) {
+    ghostty_render_state_end_update(render->state);
+  }
+
   GhosttyRenderStateDirty dirty = GHOSTTY_RENDER_STATE_DIRTY_FALSE;
-  ghostty_render_state_get(render->state, GHOSTTY_RENDER_STATE_DATA_DIRTY, &dirty);
-  if (snap->full) dirty = GHOSTTY_RENDER_STATE_DIRTY_FULL;
   GhosttyRenderStateColors colors = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
-  ghostty_render_state_get(render->state, GHOSTTY_RENDER_STATE_DATA_COLORS, &colors);
   GhosttyRenderStateCursor cursor = GHOSTTY_INIT_SIZED(GhosttyRenderStateCursor);
-  ghostty_render_state_get(render->state, GHOSTTY_RENDER_STATE_DATA_CURSOR, &cursor);
+  if (snap->skip_rows) {
+    uint16_t state_rows = 0;
+    ghostty_render_state_get(render->state, GHOSTTY_RENDER_STATE_DATA_ROWS, &state_rows);
+    if (state_rows > 0) {
+      ghostty_render_state_get(render->state, GHOSTTY_RENDER_STATE_DATA_COLORS, &colors);
+    } else {
+      colors.foreground = DEFAULT_FOREGROUND;
+      colors.background = DEFAULT_BACKGROUND;
+    }
+  } else {
+    ghostty_render_state_get(render->state, GHOSTTY_RENDER_STATE_DATA_DIRTY, &dirty);
+    if (snap->full) dirty = GHOSTTY_RENDER_STATE_DIRTY_FULL;
+    ghostty_render_state_get(render->state, GHOSTTY_RENDER_STATE_DATA_COLORS, &colors);
+    ghostty_render_state_get(render->state, GHOSTTY_RENDER_STATE_DATA_CURSOR, &cursor);
+  }
 
   render->frame.len = 0;
   if (!buf_reserve(&render->frame, HEADER_BYTES)) return NULL;
@@ -1989,10 +1982,15 @@ const uint8_t *appine_vt_frame_end(AppineVtRender *render, size_t *len) {
   put_u32(h + 44, snap->scroll_len);
   put_u32(h + 48, snap->search_total);
   put_u32(h + 52, snap->search_selected);
-  size_t images = render->placed_len < UINT16_MAX ? render->placed_len : UINT16_MAX;
+  size_t images = 0;
+  if (!snap->skip_rows) {
+    images = render->placed_len < UINT16_MAX ? render->placed_len : UINT16_MAX;
+  }
   put_u16(h + 56, (uint16_t)images);
   GhosttyRenderStateOverscan captured = {0};
-  ghostty_render_state_get(render->state, GHOSTTY_RENDER_STATE_DATA_OVERSCAN, &captured);
+  if (!snap->skip_rows) {
+    ghostty_render_state_get(render->state, GHOSTTY_RENDER_STATE_DATA_OVERSCAN, &captured);
+  }
   h[58] = captured.below > 0;
   h[59] = snap->pointer;
   put_u32(h + 60, snap->animation_ms);
@@ -2025,7 +2023,7 @@ const uint8_t *appine_vt_frame_end(AppineVtRender *render, size_t *len) {
       memcmp(render->marks, render->marks_sent, render->marks_cells) != 0;
 
   uint16_t count = 0;
-  if ((dirty != GHOSTTY_RENDER_STATE_DIRTY_FALSE || marks_changed) &&
+  if (!snap->skip_rows && (dirty != GHOSTTY_RENDER_STATE_DIRTY_FALSE || marks_changed) &&
       ghostty_render_state_get(render->state, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR,
                                &render->rows) == GHOSTTY_SUCCESS) {
     if (dirty == GHOSTTY_RENDER_STATE_DIRTY_FULL || marks_changed) {
@@ -2067,7 +2065,9 @@ const uint8_t *appine_vt_frame_end(AppineVtRender *render, size_t *len) {
   }
   // put_row may have moved the buffer
   put_u16(render->frame.ptr + 24, count);
-  ghostty_render_state_clean(render->state);
+  if (!snap->skip_rows) {
+    ghostty_render_state_clean(render->state);
+  }
   *len = render->frame.len;
   return render->frame.ptr;
 }
@@ -2527,16 +2527,22 @@ ptrdiff_t appine_vt_focus(AppineVt *vt, bool gained, uint8_t *out, size_t cap) {
 
 // Copies text allocated by libghostty-vt into vt->text and frees it; NULL with len 0 when empty
 // or out of memory
-static const uint8_t *keep_text(AppineVt *vt, uint8_t *data, size_t data_len, size_t *len) {
+static const uint8_t *keep_text_slice(AppineVt *vt, uint8_t *data, size_t data_len, size_t offset,
+                                      size_t *len) {
   vt->text.len = 0;
-  bool ok = data_len > 0 && buf_reserve(&vt->text, data_len);
+  size_t slice_len = offset < data_len ? data_len - offset : 0;
+  bool ok = slice_len > 0 && buf_reserve(&vt->text, slice_len);
   if (ok) {
-    memcpy(vt->text.ptr, data, data_len);
-    vt->text.len = data_len;
+    memcpy(vt->text.ptr, data + offset, slice_len);
+    vt->text.len = slice_len;
   }
   ghostty_free(NULL, data, data_len);
   *len = vt->text.len;
   return ok ? vt->text.ptr : NULL;
+}
+
+static const uint8_t *keep_text(AppineVt *vt, uint8_t *data, size_t data_len, size_t *len) {
+  return keep_text_slice(vt, data, data_len, 0, len);
 }
 
 // ---- Selection ----
@@ -3569,7 +3575,6 @@ bool appine_vt_reset(AppineVt *vt, uint64_t *clipboard_generation) {
   ghostty_terminal_reset(vt->term);
   // A synchronized output hold ends with the modes, and the prompt's way of moving the cursor
   // with the screen's prompt state (on_reset hears only a program's reset)
-  drop_held_state(vt);
   vt->held = false;
   reset_prompt_state(vt);
   vt->clipboard_generation++;
@@ -3699,17 +3704,82 @@ bool appine_vt_message(AppineVt *vt, const uint8_t *text, size_t len) {
   return ok;
 }
 
-// The primary screen's text with its scrollback, soft-wrapped lines joined and trailing blanks
-// trimmed (saving tabs); valid until the next text call. NULL on the alternate screen, whose text
-// is not what the tab should come back with, when the last transcript is still the screen's text
-// (the caller keeps it: formatting restores every compressed page), and on failure.
+// Tabs.MAX_TRANSCRIPT: trailing UTF-16 code units kept for transcript fallback.
+#define TRANSCRIPT_MAX_UTF16 (256u * 1024u)
+
+// Returns the byte offset in [data, data + len) where the trailing max_utf16 UTF-16 code units
+// start (always on a UTF-8 codepoint boundary). Sets *reached when the text holds at least
+// max_utf16 UTF-16 code units.
+static size_t utf8_tail_offset(const uint8_t *data, size_t len, size_t max_utf16, bool *reached) {
+  size_t utf16 = 0;
+  size_t pos = len;
+  while (pos > 0) {
+    size_t start = pos - 1;
+    while (start > 0 && (data[start] & 0xc0) == 0x80) start--;
+    size_t seq_len = pos - start;
+    size_t units = (seq_len == 4 && (data[start] & 0xf8) == 0xf0) ? 2 : 1;
+    if (utf16 + units > max_utf16) {
+      if (reached != NULL) *reached = true;
+      return pos;
+    }
+    utf16 += units;
+    pos = start;
+  }
+  if (reached != NULL) *reached = (utf16 >= max_utf16);
+  return 0;
+}
+
+// Formats only a tail selection of deep scrollback when that tail already fills
+// TRANSCRIPT_MAX_UTF16 UTF-16 code units, leaving older cold pages compressed. Returns true with
+// *data, *data_len and *offset populated on a hit; false to fall back to full history.
+static bool format_transcript_tail(AppineVt *vt, uint8_t **data, size_t *data_len, size_t *offset) {
+  GhosttyTerminalScrollbar scrollbar = {0};
+  if (vt->cols == 0 ||
+      ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &scrollbar) !=
+          GHOSTTY_SUCCESS ||
+      scrollbar.total > UINT32_MAX) {
+    return false;
+  }
+  uint64_t window = (uint64_t)TRANSCRIPT_MAX_UTF16 / vt->cols + 256;
+  if (window < vt->height) window = vt->height;
+  if (scrollbar.total <= window) return false;
+
+  uint32_t start_y = (uint32_t)(scrollbar.total - window);
+  uint32_t end_y = (uint32_t)(scrollbar.total - 1);
+  GhosttySelection tail = {0};
+  if (!screen_ref(vt, 0, start_y, &tail.start) ||
+      !screen_ref(vt, vt->cols - 1, end_y, &tail.end) ||
+      !format_plain(vt, &tail, data, data_len)) {
+    return false;
+  }
+  bool reached = false;
+  *offset = utf8_tail_offset(*data, *data_len, TRANSCRIPT_MAX_UTF16, &reached);
+  if (reached) return true;
+  // Sparse lines: fewer than TRANSCRIPT_MAX_UTF16 chars in the tail window, so fall back to full
+  // history to avoid truncating short-line scrollback early.
+  ghostty_free(NULL, *data, *data_len);
+  *data = NULL;
+  *data_len = 0;
+  *offset = 0;
+  return false;
+}
+
+// The primary screen's trailing text (up to Tabs.MAX_TRANSCRIPT UTF-16 code units), soft-wrapped
+// lines joined and trailing blanks trimmed (saving tabs); valid until the next text call. NULL on
+// the alternate screen, whose text is not what the tab should come back with, when the last
+// transcript is still the screen's text (the caller keeps it: formatting restores the compressed
+// pages it touches), and on failure.
 const uint8_t *appine_vt_transcript(AppineVt *vt, size_t *len) {
   *len = 0;
   if (is_alternate(vt) || vt->transcribed) return NULL;
   vt->compress_touched = true;
   uint8_t *data = NULL;
   size_t data_len = 0;
-  if (!format_plain(vt, NULL, &data, &data_len)) return NULL;
+  size_t offset = 0;
+  if (!format_transcript_tail(vt, &data, &data_len, &offset)) {
+    if (!format_plain(vt, NULL, &data, &data_len)) return NULL;
+    offset = utf8_tail_offset(data, data_len, TRANSCRIPT_MAX_UTF16, NULL);
+  }
   if (data_len == 0) {
     // An empty screen: an empty transcript, not a failure
     ghostty_free(NULL, data, 0);
@@ -3717,7 +3787,7 @@ const uint8_t *appine_vt_transcript(AppineVt *vt, size_t *len) {
     static const uint8_t empty = 0;
     return &empty;
   }
-  const uint8_t *text = keep_text(vt, data, data_len, len);
+  const uint8_t *text = keep_text_slice(vt, data, data_len, offset, len);
   vt->transcribed = text != NULL;
   return text;
 }

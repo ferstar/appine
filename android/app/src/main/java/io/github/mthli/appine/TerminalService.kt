@@ -1130,10 +1130,10 @@ class TerminalService : Service() {
     }
 
     /**
-     * Saves the tabs ([Tabs]): transcripts are taken on the main thread (the emulator changes them
-     * on the main thread); the foreground process's current directory needs the BKL, so it is taken
-     * on [worker] together with the terminals' snapshots and writing the files. Tabs that have
-     * ended are not saved.
+     * Saves the tabs ([Tabs]): the running session list and unshown restored records are captured
+     * on the main thread; transcripts (which can decompress cold scrollback pages), foreground
+     * working directories (which need the BKL), terminal snapshots and writing the files all run
+     * on [worker]. Tabs that have ended are not saved.
      */
     private fun saveTabs() {
         val m = machine
@@ -1141,28 +1141,27 @@ class TerminalService : Service() {
         main.removeCallbacks(saveSoon)
         val live = sessions.filter { it.isRunning }
         val taken = live.map { s ->
-            val text = s.transcriptText
             // A restored tab not shown yet: its shell has not started, so save the original copy
-            val old = if (text == null) unshown[s] else null.also { unshown.remove(s) }
-            // The directory and the snapshot are filled in on the worker
-            s to Tabs.Tab(s.login, old?.cwd, text ?: old?.transcript.orEmpty(), old?.snapshot)
+            val old = if (s.tab == 0L) unshown[s] else null.also { unshown.remove(s) }
+            s to old
         }
         val index = live.indexOf(current).coerceAtLeast(0)
         runCatching {
             worker.execute {
-                val tabs = taken.map { (session, tab) ->
+                val tabs = taken.map { (session, old) ->
+                    val transcript = session.takeTranscript() ?: old?.transcript.orEmpty()
                     val console = session.console
-                    val withCwd = if (console >= 0) {
-                        tab.copy(cwd = Native.consoleCwd(m, console), snapshot = snapshotOf(session))
-                    } else {
-                        tab
-                    }
+                    val cwd = if (console >= 0) Native.consoleCwd(m, console) else old?.cwd
+                    val snapshot = if (console >= 0) snapshotOf(session) else old?.snapshot
                     // An "auto" tab is saved as the account it logged in as: the setting would be
                     // resolved again at restore and might name another user by then
-                    if (tab.login != ConsolePty.LOGIN_AUTO) return@map withCwd
-                    val account = session.resolvedLogin
-                        ?: Rootfs.loginAccount(this, ConsolePty.LOGIN_AUTO).name.also { session.resolvedLogin = it }
-                    withCwd.copy(login = account)
+                    val login = if (session.login != ConsolePty.LOGIN_AUTO) {
+                        session.login
+                    } else {
+                        session.resolvedLogin
+                            ?: Rootfs.loginAccount(this, ConsolePty.LOGIN_AUTO).name.also { session.resolvedLogin = it }
+                    }
+                    Tabs.Tab(login, cwd, transcript, snapshot)
                 }
                 Tabs.save(this, tabs, index)
             }
@@ -1236,8 +1235,10 @@ class TerminalService : Service() {
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
         if (level >= TRIM_MEMORY_RUNNING_LOW && level != TRIM_MEMORY_UI_HIDDEN) {
-            trimMemory()
+            // Save before trimming on the serial worker so compressAll re-compresses any cold
+            // scrollback pages touched by transcript formatting.
             saveTabs()
+            trimMemory()
         }
     }
 

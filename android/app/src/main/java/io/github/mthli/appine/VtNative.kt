@@ -290,7 +290,7 @@ internal object VtNative {
      * The primary screen's text with its scrollback (soft wraps joined, trailing blanks trimmed),
      * for saving tabs; null on the alternate screen, when nothing changed the screen since the
      * last transcript (the caller keeps that one: formatting restores the compressed scrollback),
-     * or on failure.
+     * or on failure. Any thread.
      */
     @JvmStatic external fun transcript(tab: Long): String?
 

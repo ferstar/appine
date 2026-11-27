@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 7 confirmed, 4 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: bulk-extend raw writes and fast-scan printable ASCII runs with inline `ONLCR` in `Tty::write_output`)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: `terminal::wake_object`, `take_output_run_state`, `ConsoleRead`/`ConsoleForegroundKey`, and lazy wake-object resolution in `Machine` console reads/writes)
 
 ## Responsibilities
 
@@ -71,12 +71,13 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 - I/O: `syscall::tty::read`, `write`, `readiness`, `ioctl`.
 - Hangup: `hang_up`, `vhangup_ctty` (`vhangup(2)`), `hang_up_closed` (run when the BKL is
   released).
-- Host console: `terminal::{open, attach, detach, wake_objects, take_output, take_output_run,
+- Host console: `terminal::{open, attach, detach, wake_object, take_output, take_output_run_state,
   input_room, feed, fg_pgrp, fg_process, fg_cwd, password_input, resize, close, initial_size,
-  bridge}`, `ConsoleForeground`, wrapped by `Machine::{open_console, read_console,
-  read_console_run, read_console_run_timeout, write_console, resize_console, close_console,
-  console_foreground, console_foreground_process, console_cwd, console_password_input}`,
-  `Stdio::Console` at spawn and the kernel's `run`.
+  bridge}`, `ConsoleForeground`, `ConsoleForegroundKey`, `ConsoleRead`, wrapped by
+  `Machine::{open_console, read_console, read_console_run, read_console_run_timeout,
+  read_console_run_state, write_console, resize_console, close_console, console_foreground,
+  console_foreground_process, console_cwd, console_password_input}`, `Stdio::Console` at spawn and
+  the kernel's `run`.
 
 ## Data flow / lifecycle
 
@@ -305,10 +306,12 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   again); when the spawn then fails, `detach` clears that session and puts back whether one was
   ever attached.
 - The host takes output (`take_output`: bytes, nothing yet, or empty once a session was attached
-  and the terminal's slaves are all closed, by any process; `take_output_run`, which the app
-  uses: the same, but only up to where the writer changes between the foreground group and
-  another, with whether another wrote it, so the app's terminal does not take a background job's
-  line feed at the shell's prompt for the shell's, android/vtcore), feeds input under `input_room`
+  and the terminal's slaves are all closed, by any process; `take_output_run_state`, wrapped by
+  `Machine::read_console_run_state` / `read_console_run_timeout` / `read_console_run`: the same,
+  but only up to where the writer changes between the foreground group and another, returning
+  `ConsoleRead` with `background`, `password_input`, `fg_pgrp` and an allocation-free
+  `ConsoleForegroundKey` sampled under the same BKL hold, while `Machine` resolves `wake_object`
+  lazily only when blocking), feeds input under `input_room`
   backpressure (`feed` delivers resulting signals), resizes (`SIGWINCH` on change), asks for the
   foreground group (`fg_pgrp`: its id as the kernel sees it, untranslated, `ESRCH` with none; the
   app drops what a program reported about its progress once another group has the terminal) and
