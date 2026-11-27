@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 7 confirmed, 4 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: document intentional /dev/console controlling-terminal routing and close open question)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: bulk-extend raw writes and fast-scan printable ASCII runs with inline `ONLCR` in `Tty::write_output`)
 
 ## Responsibilities
 
@@ -183,10 +183,12 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 
 - Slave writes are bounded per character against `OUTPUT_MAX` (64 KiB; 0 while output is stopped)
   after `ONLCR` and tab expansion (`processed_len`), then output processing (Linux's
-  `do_output_char`) with the cursor column: with
-  `OPOST`, `ONLCR`, `OCRNL`, `ONOCR` (CR at column 0 dropped), `ONLRET`, `OLCUC` (Latin-1
-  `toupper`), tab expansion with `XTABS`; control characters take no column, UTF-8 continuation
-  bytes none with `IUTF8`. Without `OPOST` bytes pass unchanged and the column is not followed.
+  `do_output_char`) with the cursor column: without `OPOST`, `write_output` bulk-extends directly
+  without tracking columns; with `OPOST` and `!OLCUC`, it scans maximal printable ASCII runs
+  (`0x20..=0x7e`, clamped to remaining `OUTPUT_MAX` room) with inline `ONLCR` newline handling,
+  delegating remaining bytes to `processed_len` + `output_char` for `OCRNL`, `ONOCR` (CR at column
+  0 dropped), `ONLRET`, `OLCUC` (Latin-1 `toupper`), tab expansion with `XTABS`, control characters
+  (0 columns) and UTF-8 continuation bytes (0 columns with `IUTF8`).
   `EIO` without a master; `TOSTOP` background check. A write by a process whose group is not the
   terminal's foreground group (whether or not the terminal is its controlling one; never when
   there is no foreground group) is remembered as a range of the output stream (`background`,

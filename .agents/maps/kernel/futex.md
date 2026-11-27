@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: skip `shared_maps` read lock on fast-path `FUTEX_PRIVATE_FLAG` operations)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: 256-bucket sharded futex queues with canonical lock ordering, per-waiter `WaiterSlot` woken fast-leave, and lock-free `pi_count` skip)
 
 ## Responsibilities
 
@@ -31,10 +31,12 @@ breaking copy-on-write (`kernel/cow`); counting unimplemented commands (`kernel/
 ## Key types
 
 - `futex::Key` — `Private{mm, addr, shared}`, `Host(address)` or `File{dev, ino, offset}`;
-  `Futexes` — one queue (in registration order) of (id, key, bitset, event, and for a
-  `FUTEX_LOCK_PI` waiter a `PiWaiter`: its global tid and the lock's address in its address space)
-  behind `Shared`'s futex lock; `Enqueued` — leaves the queue on the normal path (a wake racing it
-  counts as a wake), and on drop only when unwinding.
+  `Futexes` — 256 cache-line-aligned `Mutex<Vec<Entry>>` hash buckets keyed by `Key`, plus a
+  lock-free `AtomicUsize` `pi_count` (letting `pi_owners_exited` return immediately when zero);
+  each `Entry` holds `(id, key, bitset, event, slot: Arc<WaiterSlot>, Option<PiWaiter>)`;
+  `WaiterSlot` tracks `woken` and current bucket index across requeues; `Enqueued` skips locking on
+  `leave()` when `slot.is_woken()` (a wake racing it counts as a wake), and removes from its
+  current bucket on timeout/signal/unwind.
 
 ## Public entry points
 
@@ -53,8 +55,9 @@ breaking copy-on-write (`kernel/cow`); counting unimplemented commands (`kernel/
   without the flag, shared anonymous memory (shared mappings, SysV shm) uses its host address and
   a shared file mapping (even a read-only one) (device, inode, offset), so processes sharing them
   meet. Kernel wakes (robust list, `clear_child_tid`) are shared operations. An unaligned address
-  is `EINVAL`, a shared operation on an unreadable page `EFAULT`. The single waiter list is
-  scanned linearly.
+  is `EINVAL`, a shared operation on an unreadable page `EFAULT`. Waiters live in 256 hash-sharded
+  buckets (`Shared::futexes`); multi-bucket operations (`requeue`, `wake_op`, `futex_waitv`) acquire
+  distinct bucket locks in strictly ascending bucket-index order.
 - Supported: WAIT, WAKE, REQUEUE, CMP_REQUEUE, WAKE_OP, WAIT_BITSET, WAKE_BITSET, `futex_waitv`,
   LOCK_PI, LOCK_PI2, TRYLOCK_PI, UNLOCK_PI; WAIT_REQUEUE_PI, CMP_REQUEUE_PI and `FUTEX_FD` return
   `ENOSYS` (counted as unimplemented). As in 6.1's `sys_futex`/`do_futex`: the command is
@@ -123,7 +126,8 @@ breaking copy-on-write (`kernel/cow`); counting unimplemented commands (`kernel/
 
 ## Invariants and gotchas
 
-- Lock order is BKL, then the futex lock; never the reverse.
+- Lock order is BKL, then futex bucket locks in strictly ascending bucket-index order; never the
+  reverse, and any move across buckets must update `WaiterSlot::bucket` while holding both locks.
 - Every kernel write to a futex word (WAKE_OP, the PI commands, robust lists, PI hand-overs at
   exit) goes through `writable_word`, which breaks copy-on-write or faults the page in first,
   since a plain `translate` does neither.

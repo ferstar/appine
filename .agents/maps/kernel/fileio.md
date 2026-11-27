@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (split out of the kernel/files map, which was split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: per-thread `IoScratch` buffer reuse across file, pipe, splice, copy and vectored I/O)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: zero-copy `PinnedIo` regular-file pread/pwrite/preadv/pwritev, hoisted per-chunk write checks, and `remove_privs` fast skip)
 
 ## Responsibilities
 
@@ -70,11 +70,20 @@ flushes (`kernel/fuse`); store objects, sharing and WAL sync (`kernel/store`); s
 
 ### Data I/O
 
-- read and pread send sockets to `kernel/net` first (even for 0 bytes); otherwise they read in
-  pieces of 64 KiB (8 MiB for FUSE files and `/dev/fuse`), looping until the buffer is full only
-  for regular files, synthetic files other than `/proc/kmsg`, `/dev/zero`, `/dev/full`, random
-  and loop devices; pipes, terminals, host fds and FUSE files return after one piece. write and
-  pwrite check mode first, then copy and write a piece at a time, stopping at a short write.
+- read and pread send sockets to `kernel/net` first (even for 0 bytes); regular store files use
+  `Mm::pin_io` / `PinnedIo` for zero-copy unlocked host `pread`/`preadv` (inline single-span
+  storage or up to 16 multi-VMA spans, guarded by `HostRegion::io_write_pins` so concurrent
+  `Mm::fork` copies instead of CoW-lending), falling back to 64 KiB `IoScratch` pieces for
+  non-pinnable/CoW/FUSE/tmpfs buffers. Regular store writes likewise use `PinnedIo` `pwrite`/
+  `pwritev` (hoisting `checked_write_flags`, `check_seals`, `prepare_write`, `remove_privs`,
+  `tmpfs_write_room`/`tmpfs_resized`, `object_modified` and `inotify::file_io_event` out of
+  per-64 KiB loops, preserving partial progress if a concurrent clone sets `cow`, and reading
+  chunk 0 before tmpfs room/seals checks on BKL-held append/tmpfs writes so `EFAULT`/`FUSE_RETRY`
+  precede `ENOSPC`/`EPERM`). Other files read in pieces of 64 KiB (8 MiB for FUSE files and
+  `/dev/fuse`), looping until the buffer is full only for regular files, synthetic files other than
+  `/proc/kmsg`, `/dev/zero`, `/dev/full`, random and loop devices; pipes, terminals, host fds and
+  FUSE files return after one piece. `remove_privs` short-circuits via `store.attrs` +
+  `has_file_caps` when no set-id bits or file caps are present.
 - A regular-file read checks the signed offset plus the full scalar count (before `MAX_RW_COUNT`)
   or imported iovec total before copying any bytes. Overflow gives `EINVAL`, including at EOF.
   A memfd with a logical length reads its host prefix followed by zeros through logical EOF.

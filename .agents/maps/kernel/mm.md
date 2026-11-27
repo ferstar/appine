@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (full mapping, 15 claims independently checked across VMA layout, page faults, permission changes, file invalidation and dump selection)
 >
-> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: eager anonymous write probing, batched tmpfs faults, in-place tracked-file mprotect, and pagemap-aware MADV_DONTNEED)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: coalesced `Mm::for_each_page` with 2 MiB leaf fills, `Mm::pin_io`/`HostRegion::io_write_pins` for zero-copy I/O, and `Mm::read_cstr_into`)
 
 ## Responsibilities
 
@@ -83,8 +83,12 @@ Outside the module: `kernel/cow`, `kernel/hostmem`, `kernel/mmu`, `kernel/oom`, 
 - **FUSE fills & kernel access**: `FillPages::new`/`size`/`has`/`window`/`window_from`/`store`/
   `notify_store`/`has_tracked`/`fd`, `take_wanted`, `has_fills`, `first_unread`,
   `next_unread_fill`, `invalidate_fill`, `invalidate_fill_code`; `read`, `write` (breaks CoW via
-  `kernel/cow`), `translate` (no CoW break), `read_cstr`, `read_force`, `write_kernel`,
-  `write_force`, `populate_mlock_step`, `mapped_above`, `check_mapped`.
+  `kernel/cow`; `for_each_page` coalesces contiguous non-CoW/non-Fill/non-tmpfs host spans and
+  expands lazy anonymous PTE fills to enclosing 2 MiB `LEAF_SPAN` windows), `pin_io` (`PinnedIo`
+  holding `HostRegion::io_write_pins` so concurrent `Mm::fork` copies instead of lending/sharing
+  and teardown defers `discard_unlent`), `translate` (no CoW break), `read_cstr`, `read_cstr_into`,
+  `read_force`, `write_kernel`, `write_force`, `populate_mlock_step`, `mapped_above`,
+  `check_mapped`.
 - **Files, shm, futex & introspection**: `futex_key`, `shared_maps`, `id`; `file_truncated`,
   `writably_maps`, `maps_file`, `maps_ino`, `mapped_inos`, `set_mnt`, `mapped_mounts`,
   `next_msync`, `residency_chunk`; `attach_shm`/`detach_shm`/`shm_attachments`;

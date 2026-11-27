@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (full mapping, 15 claims independently checked across fd allocation and close, path and handle opens, inode flags, render submission and fences)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest changes: `EventFdIds` allocator, Linux 6.1 zombie leader mem/pagemap open, `FileKind::FuseSnapshot` for deleted FUSE `/proc/<pid>/exe` reopens, and FUSE FIFO/device node opens)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: single-walk `openat(O_CREAT)` parent resolution for plain names and deferred `display_path` with root-level shortcut)
 
 ## Responsibilities
 
@@ -147,8 +147,15 @@ and timerfd (`kernel/poll`); inotify (`kernel/inotify`); native AIO (`kernel/aio
 
 ### Opening
 
-- `open_path_with` (openat, openat2, `create_exclusive`): resolve through `kernel/vfs` (openat2's
-  rules and `O_CREAT`'s creation loop are in its map); on create, `may_create` (search, `EEXIST`,
+- `open_path_with` (openat, openat2, `create_exclusive`): when `O_CREAT` is set with `res == 0`
+  and a plain final component (no trailing slash, `.` or `..`), resolves the parent once via
+  `resolve_parent_with`: missing store entries create directly without re-walking, existing
+  non-symlink (or `O_CREAT|O_EXCL`) store entries resolve only the final component, and other cases
+  (symlinks without `O_EXCL`, non-store parents) fall back to the full walk to preserve cumulative
+  40-symlink `ELOOP` counting. `display_path` is deferred until after `open_store`/`open_pseudo`/
+  `open_overlay`/`fuse::open` succeed (skipped on errors, `OpenFd`/`OpenExe` reopens, `NsFile` and
+  non-devpts PTY slaves), with a root-level shortcut gated on store `ROOT` or `Pseudo` root so
+  unlinked chroot roots retain ` (deleted)`. On create, `may_create` (search, `EEXIST`,
   `EROFS`, write+search) and create with the requested mode limited by the parent default ACL or the
   umask (`kernel/cred`: setgid stripped before the umask, setgid directories); a just-created file
   skips permission checks and truncation. `O_PATH` gives a `FileKind::Path` (`O_DIRECTORY` on a

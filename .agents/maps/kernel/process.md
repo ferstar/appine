@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: cache-line align `TaskSync`, keep non-sleeping fast syscalls in guest mode with `SeqCst` fence + `Relaxed` generation loads, and gate `post_syscall_sweeps` with dirty flags)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: add `getppid`/`readlinkat`/`faccessat`/`faccessat2` fast paths, cache-line isolate `Hold::held`, skip empty `Bkl::drop` catch wrappers, and gate `Mm::sync`)
 
 ## Responsibilities
 
@@ -71,9 +71,10 @@ and `kernel/oom`.
   internal `OBJECTS`); `wake::Object` is the address of a value (inside a `RefCell`, or a plain
   counter).
 - Waiter — (event, interest channels, optional sorted object list), stored in `Kernel::waiters`.
-- `fast::Fast` — a thread's fast-path record (epoch, tracing, resolved root and cwd, tid,
-  namespace-translated tgid/tid and real/effective uid/gid, CPU-clock base, address-space id and
-  its shared writable mappings, vDSO address, time-namespace offsets).
+- `fast::Fast` — a thread's fast-path record (epoch, tracing, resolved root, cwd, and effective +
+  real-ID `CachedCred`s, tid, namespace-translated tgid/ppid/tid and real/effective uid/gid,
+  CPU-clock base, address-space id and its shared writable mappings, vDSO address, time-namespace
+  offsets).
 
 ## Public entry points
 
@@ -193,10 +194,10 @@ and `kernel/oom`.
   (`Kernel::collect_ipc`), removed overlay nodes are swept (`kernel/overlay`), and pending cgroup2
   file changes checked (`cgroup::notify_changes`, also run at thread exit, freezer stops and by the
   timer thread); then results are translated out (invisible pids become 0), edge-triggered
-  readiness is re-armed after reads, x0 is set, `Mm::sync` runs, then the exit stop and signal
-  delivery. A successful `execve` or `execveat` runs the sweeps, drops `InSyscall`, and runs
-  `Mm::sync` on the new address space before `exec_done`. `exit`, `exit_group` and `rt_sigreturn`
-  return before the sweeps and `Mm::sync`.
+  readiness is re-armed after reads, x0 is set, `Mm::sync` runs when `Mm::needs_sync()` is true,
+  then the exit stop and signal delivery. A successful `execve` or `execveat` runs the sweeps, drops
+  `InSyscall`, and runs `Mm::sync` on the new address space before `exec_done`. `exit`, `exit_group`
+  and `rt_sigreturn` return before the sweeps and `Mm::sync`.
 - A guest page fault on a FUSE mapping's page not yet read reads it with the BKL released before
   re-executing (`kernel/mm`'s fault order).
 
@@ -271,14 +272,16 @@ and `kernel/oom`.
   hook. A guard re-takes the BKL
   on return and on unwinding.
 - Acquisition: try once; otherwise up to half the host CPUs (1 to 4) spin for at most about 30 µs,
-  reading only the `held` flag; the rest sleep on the mutex (a poisoned one is accepted). The new
-  holder sets `held`, updates `Hold` (`kernel/bug`, relaxed same-cache-line stores, no clock read),
-  marks BKL ownership and defers host unmaps (`kernel/hostmem`).
-- Release (`Drop for Bkl`), in order: hang up closed terminals (contained), reap any dead IPC
-  namespaces (`collect_ipc`, contained), match pending wake
-  requests against waiters (inside `bug::catch`; on panic, wakes all waiters directly so the BKL is
-  always unlocked), clear `held`, unlock, clear the thread's held marker, notify pooled
-  host threads, signal the matched events, release deferred host memory and refill fork spares
+  reading only `Hold::held` (placed on its own 64-byte cache line ahead of `HoldInfo` to avoid
+  false sharing with `Hold::record`); the rest sleep on the mutex (a poisoned one is accepted). The
+  new holder sets `held`, updates `HoldInfo` (`kernel/bug`, relaxed stores, no clock read), marks
+  BKL ownership and defers host unmaps (`kernel/hostmem`).
+- Release (`Drop for Bkl`), in order: hang up closed terminals (skipping `bug::catch` when
+  `!tty::has_closed()`), reap any dead IPC namespaces (`collect_ipc`, contained), match pending
+  wake requests against waiters (skipping `bug::catch` when `!has_pending_wakeups()`, retaining
+  cleared `PENDING` `Vec` capacity up to 1024; on panic, wakes all waiters directly so the BKL is
+  always unlocked), clear `held`, unlock, clear the thread's held marker, notify pooled host
+  threads, signal the matched events, release deferred host memory and refill fork spares
   (`kernel/hostmem`).
 - Waits outside a syscall context (the timer thread, `Machine::wait_*`, the terminal bridge) call
   `block`/`block_for` directly; they hold no kernel objects while the BKL is released.
@@ -296,12 +299,14 @@ and `kernel/oom`.
   `nanosleep`, `clock_nanosleep` (REALTIME, MONOTONIC, BOOTTIME), `clock_gettime` (host clocks
   with time-ns offsets, or own CPU clock by namespace tid), `clock_getres`, `gettimeofday`,
   `sched_yield` (yields the host thread, not counted as running guest code meanwhile), read-only
-  ID queries (`getpid`, `gettid`, `getuid`, `geteuid`, `getgid`, `getegid`, served from the
-  namespace-translated values cached in `Fast` while `Shared::fast_epoch` matches; `getppid`
-  stays on the BKL path), and `newfstatat`/`statx`
-  (absolute or `AT_FDCWD`-relative paths, when the root is the root mount's store directory, the
-  root mount is usable, the walk stays in the store's metadata cache and crosses no other mount,
-  and the credentials can skip search-permission checks).
+  ID queries (`getpid`, `getppid`, `gettid`, `getuid`, `geteuid`, `getgid`, `getegid`, served from
+  the namespace-translated values cached in `Fast` while `Shared::fast_epoch` matches; reparenting
+  live children in `finish_group` bumps the epoch), and `newfstatat`/`statx`/`readlinkat`/
+  `faccessat`/`faccessat2` (absolute or `AT_FDCWD`-relative paths, when the root is the root
+  mount's store directory, the root mount is usable, the walk stays in the store's metadata cache
+  and crosses no other mount, and the credentials can skip search-permission checks; `faccessat`/
+  `faccessat2` snapshot both effective credentials for `AT_EACCESS` and real-ID `for_access()`
+  credentials otherwise, falling back when `for_access()` lacks override/read-search caps).
 - It is off while strace-tracing, under `PTRACE_SYSCALL`, single-stepping, or with a pending
   `ivau_page`; with seccomp only for numbers the filter always allows, and for the vDSO stubs'
   reads of clocks Linux's vDSO reads in user space (`kernel/vdso`).
@@ -317,8 +322,10 @@ and `kernel/oom`.
 
 ### Waiting and waking
 
-- A guest thread never blocks in a host syscall: every wait is one host `poll()` on the thread's own
-  event (an eventfd) plus the host fds it waits on, with the deadline as timeout. Wall-clock
+- A guest thread never blocks in a host syscall: waits with host fds use `Event::poll_with`
+  (stack-allocated `ppoll()` on the thread's `Event` plus the host fds), while waits with no host
+  fds (sleeps, futexes, lock/signal/child waits) park directly in `Event::wait` (host
+  `FUTEX_WAIT_PRIVATE`) with the deadline as timeout. Wall-clock
   deadlines (sleeps, futex and mqueue timeouts, timers) are `Expiry` values turned into an instant
   at each wait and checked with their own clock, so a wait woken after the realtime or boottime
   clock jumped (the host's clock set, or the device resuming) waits again for the right time;

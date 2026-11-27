@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: cache-line align `TaskSync`, `SeqCst` fence + `Relaxed` generation loads in the run loop, and `InGuest` fast-syscall `generations.code` polling)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: shoot down only in-guest threads in `Mm::sync_except` via shared `shootdown_users` and gate post-syscall `Mm::sync` on `Mm::needs_sync`)
 
 ## Responsibilities
 
@@ -161,26 +161,28 @@ fast path and refill (`engine/dbt`).
   grown, re-protected, discarded, rolled back or truncated, and invalidations), and `exec_changed`
   (executable VMAs inserted, unmapped, re-protected, grown or rolled back, and kernel writes into
   them).
-- `Mm::sync` runs after every syscall that takes the BKL (except exit, `exit_group`,
-  `rt_sigreturn`, a successful execve or execveat, a syscall a tracer or seccomp skipped, and a
-  kill at the entry stop; the no-BKL fast path never changes the mm), on `ic ivau` exits (and any
-  exit with an `ivau` page pending), after `write_force`, and on every address space a truncation
-  changed. It re-checks the code group, prunes `Mm::memops` against invalidated or
-  non-exec/writable/written ranges and syncs group-admitted or sole-space memops to
-  `DbtSpace::set_memops`; returns when nothing is dirty and no code changed; publishes `code_ranges`
-  to the `CodeLog` and bumps the code generation; returns if nothing is dirty and the graveyard is
-  empty; otherwise bumps the TLB generation (when dirty), runs `quiesce`, and clears the graveyard.
-- `quiesce` kicks every other user of the mm and spins until none is in guest code. When a
-  Files app open truncates a mapped object, `sync_except(None)` includes
-  every guest thread in the shootdown before the host file shrinks. The kick is
-  sticky, so a thread returning from a no-BKL fast syscall stops at its next guest entry. fork and
-  membarrier quiesce too.
-- `shootdown` is the immediate form used when a PTE is re-pointed (CoW copy, return of a borrowed
-  page): with users, it bumps the TLB generation, kicks only users in guest code, and waits until
-  none is in guest code, kicking again any it still finds there (one that entered after the first
-  kicks, which nothing else would stop). It does not hold users back: one that enters guest code
-  after the wait has passed it (such as a thread waking from a no-BKL fast-path sleep) runs with a
-  flushed TLB while the caller still holds the BKL.
+- `Mm::sync` runs after BKL syscalls when `Mm::needs_sync()` is true (skipping `Arc<TaskSync>::clone()`
+  and `cx.mm_mut()` on clean syscalls; also skipped on exit, `exit_group`, `rt_sigreturn`, a
+  successful execve or execveat, a syscall a tracer or seccomp skipped, and a kill at the entry
+  stop; the no-BKL fast path never changes the mm), on `ic ivau` exits (and any exit with an `ivau`
+  page pending), after `write_force`, and on every address space a truncation changed. It re-checks
+  the code group, prunes `Mm::memops` against invalidated or non-exec/writable/written ranges and
+  syncs group-admitted or sole-space memops to `DbtSpace::set_memops`; returns when nothing is
+  dirty and no code changed; publishes `code_ranges` to the `CodeLog` and bumps the code generation;
+  returns if nothing is dirty and the graveyard is empty; otherwise bumps the TLB generation (via
+  `SeqCst`), runs `shootdown_users` (kicking and waiting only for threads currently `in_guest`,
+  with brief `spin_loop` before yielding, so parked futex/epoll threads flush lazily on next guest
+  entry without spurious sticky kicks), and clears the graveyard.
+- `quiesce` (`quiesce_except`) still sticky-kicks every other user of the mm and spins until none
+  is in guest code, used by `fork` and `membarrier` where the TLB generation is not bumped. When a
+  Files app open truncates a mapped object, `sync_except(None)` includes every in-guest thread in
+  the shootdown before the host file shrinks.
+- `shootdown` shares `shootdown_users` for immediate PTE re-pointing (CoW copy, return of a
+  borrowed page): with users, it bumps the TLB generation (`SeqCst`), kicks only users in guest
+  code, and waits until none is in guest code, kicking again any it still finds there (one that
+  entered after the first kicks, which nothing else would stop). It does not hold users back: one
+  that enters guest code after the wait has passed it (such as a thread waking from a no-BKL
+  fast-path sleep) runs with a flushed TLB while the caller still holds the BKL.
 - The run loop sets `in_guest` (`Relaxed`), issues a `SeqCst` fence, then reads the counters
   (`Relaxed`, pairing with the mutator's `SeqCst` bump-then-read under fence-atomic coherence). If
   `space` changed it re-attaches to a new `CodeSpace` (when it had a translator) and looks again on

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (namespace and cache, object sharing and lifetimes, transaction and recovery ordering, import and provider authorization checked against the store and its callers)
 >
-> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: sole-user mapping pin fast path and reconcile tracking, transactional remove_checked, and fast object unlinks)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: cache regular-file host stats and held sizes, release `Meta::lock.read()` on `Reader::stat` misses guarded by `Meta::mutations`, and two-generation cache rotation)
 
 ## Responsibilities
 
@@ -45,16 +45,21 @@ provider and rootfs installation UI (`android`).
   and linkable tmpfile state with its transaction undo log.
 - `MappingObject` — pinned host `File` and `reconcile` flag returned by `mapping_object`.
 - `Meta` — state shared with readers and the reaper thread: the cache behind an `RwLock`, the
-  commit counter, the reaper queue, the WAL path and durability watermark.
+  commit counter, the monotonic `mutations` counter (guarding unlocked `Reader::stat` misses
+  against uncommitted deferred-transaction writes), the reaper queue, the WAL path and durability
+  watermark.
 - `Stat` includes the store inode’s access and default ACLs; `DirEntry`, `FileTime` (`Now` or `At(ns)`), the `mode` constants; `Ino = u64`, `ROOT = 1`.
 - `Commits` — 32 bytes of the `lock` file mapped shared: commit counter, packed connection state
   (active open connections in the low 32 bits, monotonic open epoch in the high 32 bits), and the
   range of inode numbers allocated by uncommitted transactions.
-- `Cache` — dentries (including negative entries), database rows with where each regular file's
-  data and times are (`Data`: object number, held timestamp and guest atime),
-  symlink targets, `..` parents, names (for getcwd), directory listings, the set of inodes with
-  file capabilities, and `relatime_fresh` (plus a 1-entry `last_relatime` fast slot) caching
-  inodes whose guest atime is strictly newer than mtime and ctime for the current connection state.
+- `Cache` — two-generation (`hot`/`cold`, 65,536 entries each) positive tables and independently
+  capped (`neg_hot`/`neg_cold`, 8,192 entries each) negative dentries, database rows with where each
+  regular file's data and times are (`Data`: object number, held timestamp and guest atime),
+  unheld regular-file host metadata (`ObjectStat`: size, blocks, atime/mtime/ctime), immutable
+  held regular-file `(size, blocks)` (`held_sizes`), symlink targets, `..` parents, names (for
+  getcwd), directory listings, the set of inodes with file capabilities, and `relatime_fresh`
+  (plus a 1-entry `last_relatime` fast slot) caching inodes whose guest atime is strictly newer
+  than mtime and ctime for the current connection state.
 - `Unshare` — a held file's private copy in the making: the shared object open for reading, the
   new one open for writing, the length to copy, and both numbers.
 - `Fill` — an entry created by an operation, inserted into the cache only if the operation
@@ -274,30 +279,38 @@ provider and rootfs installation UI (`android`).
 
 ### Metadata cache
 
-- Caches dentries (including names that do not exist), database rows (with the `shared` row
-  joined in), symlink targets, `..` parents, names, directory listings, the file-capability set, and
-  `relatime_fresh` (with a 1-entry `last_relatime` fast slot). The row caches decoded POSIX ACLs. Other xattr values, emptiness checks
-  and regular-file sizes and mtime/ctime are not cached.
-- `relatime_fresh` records an inode's `atime_ns` only when `atime > mtime && atime > ctime`, no
+- Caches dentries (two positive `hot`/`cold` generations of 65,536 entries and two negative
+  `neg_hot`/`neg_cold` generations of 8,192 entries), database rows (with the `shared` row joined
+  in and decoded POSIX ACLs), unheld regular-file host metadata (`ObjectStat`) and immutable held
+  regular-file `(size, blocks)` (`held_sizes`), symlink targets, `..` parents, names, directory
+  listings, the file-capability set, and `relatime_fresh` (with a 1-entry `last_relatime` fast
+  slot). Other xattr values and emptiness checks are not cached.
+- `ObjectStat` and `relatime_fresh` share the same invalidation discipline: active only when no
   other connection is open (`active_users <= 1`), no Files app writer is open on this store
-  (`HOST_WRITERS`), and the inode has no `writable_maps` mark. Writable mapping opens, memfds,
-  and exclusive tmpfiles set that mark. Inode mutations (`touch_ino`), direct host-object modifications
-  (`object_modified` from writes, truncates, fallocate, copies, and mtime-only `set_times`),
+  (`HOST_WRITERS`), and the inode has no `writable_maps` mark (`relatime_fresh` additionally
+  requires `atime > mtime && atime > ctime`). Writable mapping opens, memfds, and exclusive tmpfiles
+  set that mark. Inode mutations (`touch_ino`), direct host-object modifications (`object_modified`
+  from writes, truncates, fallocate, copies, `write_file_owned`, and mtime-only `set_times`),
   foreign commits, or any other connection joining the store (via the open epoch packed into word 1
-  of `lock`) invalidate cached `relatime` entries.
-- Reads hit the cache first; on a miss the database is queried and the result inserted only if the
-  commit counter did not move. Inside a `snapshot` all misses share one lazily started read
-  transaction (path walks and the following stat).
+  of `lock`) invalidate cached entries.
+- Reads hit the cache first (`hot` then `cold`); on a miss the database is queried and the result
+  inserted only if the commit counter did not move. Inside a `snapshot` all misses share one lazily
+  started read transaction (path walks and the following stat).
 - Writes invalidate the affected entries as they happen (names and listings of the directory; the
-  row, target and parent of the inode); entries created by a successful operation are inserted
-  afterwards (fills are discarded on rollback). There is no eviction: after 131,072 fills the whole
-  cache is cleared.
+  row, `ObjectStat`/`held_sizes`, target and parent of the inode); entries created by a successful
+  operation are inserted afterwards (fills are discarded on rollback). Generation rotation swaps
+  `hot` into `cold` at 65,536 positive entries (and `neg_hot` into `neg_cold` at 8,192 negative
+  entries), returning evicted/cleared tables from `Store::update` to drop after releasing
+  `Meta::lock.write()`.
 - The cache is labelled with the commit count it matches. A commit by this connection advances the
   label; any other change of the shared counter (another connection's commit) clears everything,
   checked lazily on each query, reader and commit. A failed commit clears it too.
 - Only the BKL-holding thread mutates the cache, under the write lock. Threads without the BKL use
-  `Meta::reader` (read lock), which refuses when the counter moved; the no-BKL resolver falls back
-  to the BKL path on any miss. Regular-file stats in a reader query the host while holding the lock.
+  `Meta::reader` (read lock), which exposes `attrs` and refuses when the counter moved; the no-BKL
+  resolver falls back to the BKL path on any miss. On a regular-file `Reader::stat` miss, the
+  reader drops `Meta::lock.read()` before calling host `fstatat` and bails (`None`) if either
+  `Meta::commits` or `Meta::mutations` moved (preventing torn stats against concurrent deferred
+  transactions).
 
 ### Sharing the store
 

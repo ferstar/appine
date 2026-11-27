@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (full refresh: 5 research concerns; 18 claims checked by an independent verifier — 18 confirmed, 0 partial, 0 refuted, plus 6 map-audit refinements and 4 additional confirmed bugs folded in)
 >
-> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: connected UDP peer updates via `update_udp_peer` with fast-path checks, reconnect error propagation and `peer_map` clearing)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: per-thread `NetScratch` buffer reuse, direct `RecvSink::Scatter` delivery, optional-addr/control HAL recv, and zero-copy hot-page `SOCK_STREAM` iovec fast path)
 
 ## Responsibilities
 
@@ -29,7 +29,10 @@ helpers, netlink section and `Socket::Netlink` arms, and `kernel/rawicmp`’s `r
   listener. `fwd` holds the registration.
 - `SockOpts` holds common Unix/netlink options. `MsgHdr` represents imported iovecs and pointers.
   `Message` separates copied bytes from reported length and carries source, controls, flags and pending
-  Unix rights.
+  Unix rights. `NetScratch` is a per-thread RAII guard (`Cell<Vec<u8>>`, 4 KiB minimum, 256 KiB
+  retention cap, transient fallback for >256 KiB or re-entrancy) reused across `recv`/`recv_with`,
+  `sendto`, `sendmsg` and `rw`. `RecvSink::Scatter` scatters inet payloads directly from `NetScratch`
+  into guest iovecs without an intermediate `Message::data` copy.
 - `PortMap` tracks live and released ports (`Lease`) and queues `ListenEvent`. `Traffic` stores `IfStats`,
   address cache and `Protocols`. `origdst::Table` indexes namespace-specific destinations by host tuple.
 
@@ -186,7 +189,14 @@ missing namespace listeners drop silently. Reverse DNAT history holds 16 pairs. 
 sources can append IP_PKTINFO/IPV6_PKTINFO unless supplied. Raw and tapped UDP call `before_io`, drain tap
 errors and may retry a host ICMP failure once. Raw uses `RawIcmp::send` per attempt.
 
-Host send strips guest DONTWAIT/NOSIGNAL and HAL adds MSG_NOSIGNAL. Blocking stream sends loop. On host
+Host send strips guest DONTWAIT/NOSIGNAL and HAL adds MSG_NOSIGNAL. For hot-page `SOCK_STREAM`
+calls without `MSG_PEEK`/`MSG_ERRQUEUE`/`MSG_TRUNC`/`MSG_WAITALL`/`MSG_FASTOPEN`,
+`try_direct_send_inet` / `try_direct_recv_inet` translate up to 64 coalesced already-mapped
+soft-MMU spans (`translate_iovecs`) under the BKL and issue direct `hal::net::{sendmsg,recvmsg}_iov`,
+falling back cleanly to `NetScratch` on cold, CoW, FUSE or unmapped pages. Ordinary inet receives
+use `hal::net::recvmsg_opt` (skipping address/control allocations when unused) and scatter directly
+from `NetScratch` via `RecvSink::Scatter` (distinguishing socket errors from scatter faults so
+`recv_rest` never records `EFAULT` in `pending_err`). Blocking stream sends loop. On host
 `EAGAIN`, `wait_host` tests nonblocking, deadline, then interruption (`EAGAIN`, `EAGAIN`, `ERESTARTSYS`)
 before waiting on POLLOUT and the socket. Errors after progress return a partial count. Initial host
 `EPIPE` raises guest SIGPIPE unless suppressed. A successful datagram send can claim an autobound port.

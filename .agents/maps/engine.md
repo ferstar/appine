@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (full mapping, 15 claims independently checked across CPU layout, Tier 0 dispatch, atomics, features, native code and fault recovery)
 >
-> Maintained: 2026-11-27 (targeted update for `_Thread_local` guard pointer cache in `guard.c`)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: move `nwatch` and `dbt_fp_loaded` into the pre-TLB hot header of `appine_cpu` and clear `dbt_fp_loaded` on host-fault recovery in `guard.c`)
 
 ## Responsibilities
 
@@ -40,11 +40,12 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
 
 - `struct appine_cpu` / `CpuState` — one per guest thread: X0–X30, SP, PC, NZCV, FPCR, FPSR,
   TPIDR_EL0, exit and fault information, the `pending` kick flag, the bound page table, the
-  exclusive monitor (`excl_addr`, `excl_value`, `excl_size`; size 0 means none), Tier 1 scratch and
-  group slots (`dbt_groups[8]`), `ivau_page`, 4096 data TLB entries for 4 KiB pages, 512 instruction TLB entries,
-  and 1024 superpage TLB entries for 2 MiB mappings. Each data TLB has a used-entry bitmap.
-  The state also holds V0–V31, DIT and 16 slots each for breakpoints and watchpoints. Fields before the TLB are
-  addressed by `engine/dbt` with immediate offsets.
+  exclusive monitor (`excl_addr`, `excl_value`, `excl_size`; size 0 means none), Tier 1 scratch,
+  `dbt_fp_loaded`, `nwatch` and group slots (`dbt_groups[8]`), `ivau_page`, 4096 data TLB entries
+  for 4 KiB pages, 512 instruction TLB entries, and 1024 superpage TLB entries for 2 MiB mappings.
+  Each data TLB has a used-entry bitmap. The state also holds V0–V31, DIT and 16 slots each for
+  breakpoints and watchpoints. Fields before the TLB (`TLB_OFF = 480`) are addressed by
+  `engine/dbt` with immediate offsets.
 - `Cpu` — owns one state (pooled: up to 8 spares); `Send`, not `Sync`.
 - `Kicker` — raw handle whose only operation, `kick`, sets `pending`; the one thread-safe call.
 - `Exit` — `Svc{imm}`, `Undefined{insn}`, `Breakpoint{imm}`, `Fault{addr, access, kind}`, `Kick`,
@@ -181,7 +182,8 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
 - `install_fault_guard` installs SIGSEGV, SIGBUS and SIGILL handlers (chained after ART's); the
   machine installs it only when kernel bugs are contained (release builds by default, or
   `APPINE_ON_BUG`). During a guarded run, a host fault with `si_code > 0` long-jumps back: the host
-  FPCR is restored, registered locks are released newest first (the outer four of those held;
+  FPCR is restored, `dbt_fp_loaded` is cleared on the thread's active CPU, registered locks are
+  released newest first (the outer four of those held;
   deeper ones are counted so drops still pair), the signal is unblocked, and the run returns
   `HostFault`. The locks taken during a run are registered: the native-stub lock, plus `engine/dbt`'s
   instance, template and perf-map locks. Other faults are reported to stderr and passed to the

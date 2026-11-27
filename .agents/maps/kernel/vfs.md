@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (full refresh; 18 claims verified — 13 confirmed, 5 partial, 0 refuted; all fixes applied)
 >
-> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: range-aware tmpfs mapping faults, single-walk unlink dispatch with transactional store removal, and removal of parent_at)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: zero-alloc stack `WalkPending` in `Vfs::walk_in`, `PathBytes` stack path reads, and `Cached::{readlink,access}` with `CachedCred` and `ROOT_MOUNT` flags)
 
 ## Responsibilities
 
@@ -35,7 +35,8 @@ locks, pipes, loops, mounts, overlay and FUSE are separate modules.
 
 - Resolution: `Vfs::resolve`, `walk`, `walk_resolve`, `resolve_mountpoint`, `resolve_parent`,
   `resolve_parent_with`, `found_path`, `reach`, `path_of`, `mounts_from`, `Cached::stat`,
-  `start_dir`, `lookup_at`, `create_parent_at`, `may_create`, `display_path`.
+  `Cached::readlink`, `Cached::access` (`CachedCred`), `start_dir`, `lookup_at`,
+  `create_parent_at`, `may_create`, `display_path`.
 - Syscalls: `newfstatat`, `fstat`, `statx`, `statfs`/`fstatfs`, `faccessat`/`faccessat2`,
   chmod/chown variants, `utimensat`, `getdents64`, `readlinkat`, `getcwd`, `chdir`/`fchdir`,
   `chroot`, `umask`, `mkdirat`, `mknodat`, `symlinkat`, `linkat`, `unlinkat`, `renameat2`.
@@ -52,7 +53,10 @@ paths use cwd for `AT_FDCWD` or the fd's directory (`EBADF` for bad fd, `ENOTDIR
 type/no node). `lookup_at_or_fd` with empty path and `AT_EMPTY_PATH` takes cwd or fd node
 (`EBADF` if absent). Stat and anonymous attrs also have fd-specific routes.
 
-`walk_resolve` runs `walk_in` in one store snapshot. A trailing slash forces final-link follow
+`walk_resolve` runs `walk_in` in one store snapshot using a stack-backed `WalkPending` (32 inline
+borrowed `&[u8]` slots with lazy overflow and symlink target buffers, skipping final `Dentry`
+allocation when `want_found == false`). Path syscalls read guest strings into a 256-byte
+stack-inline `PathBytes` buffer (`read_path_buf`) with heap fallback. A trailing slash forces final-link follow
 and requires a searchable directory. Each name checks length (255 bytes), type and search,
 including `.` and `..`. Dot preserves the dentry. Dotdot clears it, stops at process root, or
 climbs stacked attachments, takes a parent and enters its top mount. A store parent outside
@@ -124,25 +128,33 @@ names marked. `display_path` falls back from `found_path` to lexical normalizati
 `readlinkat` checks positive size first and returns raw bytes truncated to fit. Empty input
 reads the fd without flags (`ENOENT` for node-less fd/nonlink, `EINVAL` for a nonempty path to a nonlink).
 
-### No-BKL stat
+### No-BKL stat, readlink and access
 
 `Fast::new` snapshots a root in attached `ROOT_MOUNT` (including chroot within it) without
-`NOSYMFOLLOW` and with `searches_all` credentials. Absolute input permits any cwd. Relative input
-needs `AT_FDCWD` and a cwd in that mount. Stat needs a current epoch, valid flags and readable
+`NOSYMFOLLOW` and with `searches_all` credentials, recording both effective `eaccess_cred` and
+real-ID `access_cred = cred.for_access()`. Absolute input permits any cwd. Relative input needs
+`AT_FDCWD` and a cwd in that mount. Calls need a current epoch, valid flags/amode/size (`readlinkat`
+falls back on `size <= 0` or targets filling `PATH_MAX` when `size > PATH_MAX`), and a readable
 nonempty path fitting `PATH_MAX` including NUL. Global tracing, syscall tracing, stepping or
-pending instruction-cache invalidation disables fast dispatch. Seccomp can admit a syscall
-number cached as always allowed.
+pending instruction-cache invalidation disables fast dispatch. Seccomp can admit a syscall number
+cached as always allowed.
 
-`Cached::stat` uses a store metadata reader. A cached negative returns `ENOENT` directly.
-An unavailable/stale reader, uncached entry, host stat failure, over 64 pending steps or an
-encountered store mount point falls back to the BKL. The mount-point list includes the store
-root when the boot mount is no longer topmost. Length/type/loop errors can be final. A followed
-trailing link owned by someone other than its sticky world-writable directory's owner falls back.
-Final immutable, append or nodump forces fallback for both stat calls. Noatime alone does not.
-Fast statx uses `ROOT_MOUNT` and advertises the supported attribute mask. `mounts_changed_ns`
-always rebuilds cached mount state and increments/wakes once per affected namespace that still
-exists and is nonanonymous. Mount, fs-context and credential changes invalidate snapshots with
-`fast_changed`; `Fast::refresh` rebuilds on epoch change under the BKL.
+`Cached::{stat,readlink,access}` use a store metadata reader (with `ROOT_MOUNT` `root_readonly` and
+`root_noexec` snapshotted into `Cached` and rebuilt on `ROOT_DEV` `set_sb_flags`). A cached
+negative returns `ENOENT` directly. An unavailable/stale reader, uncached entry, host stat failure,
+over 64 pending steps or an encountered store mount point falls back to the BKL. The mount-point
+list includes the store root when the boot mount is no longer topmost. Length/type/loop errors can
+be final. A followed trailing link owned by someone other than its sticky world-writable directory's
+owner falls back. Final immutable, append or nodump forces fallback for both stat calls; noatime
+alone does not. `Cached::readlink` returns `EINVAL` on non-symlinks and truncates into the caller's
+buffer. `Cached::access` requires `CAP_DAC_OVERRIDE` or `CAP_DAC_READ_SEARCH` in `CachedCred`,
+enforces regular-file `root_noexec` (`EACCES`), `IMMUTABLE` (`EPERM`), `Cred::permission`-equivalent
+DAC (falling back for extended ACLs on non-exec `X_OK` or non-owned group/other checks), and
+`root_readonly` (`EROFS` for non-special nodes). Fast statx uses `ROOT_MOUNT` and advertises the
+supported attribute mask. `mounts_changed_ns` always rebuilds cached mount state and
+increments/wakes once per affected namespace that still exists and is nonanonymous. Mount,
+fs-context and credential changes invalidate snapshots with `fast_changed`; `Fast::refresh`
+rebuilds on epoch change under the BKL.
 
 ### Mount flags and atime
 
