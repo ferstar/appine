@@ -48,6 +48,7 @@ bool dbt_dp_operands(uint32_t insn, struct operands *o)
 {
     o->n = 0;
     o->writes_rd = true;
+    o->reads_rd = false;
     if (FIELD(insn, 28, 26) == 4) { /* immediate */
         switch (FIELD(insn, 25, 23)) {
         case 2: /* ADD/SUB (immediate) */
@@ -59,9 +60,11 @@ bool dbt_dp_operands(uint32_t insn, struct operands *o)
             add_operand(o, 5, false);
             return true;
         case 5: /* MOVN/MOVZ/MOVK */
+            o->reads_rd = FIELD(insn, 30, 29) == 3;
             add_operand(o, 0, false);
             return true;
-        case 6: /* bitfield */
+        case 6: /* bitfield: BFM (BFI/BFXIL) reads old Rd; SBFM/UBFM overwrite it */
+            o->reads_rd = FIELD(insn, 30, 29) == 1;
             add_operand(o, 0, false);
             add_operand(o, 5, false);
             return true;
@@ -118,12 +121,13 @@ bool dbt_dp_operands(uint32_t insn, struct operands *o)
     }
 }
 
-/* Replace stolen guest registers with temporaries: load them from the cpu struct first, and write
- * Rd back after execution */
+/* Replace stolen guest registers with temporaries: load read operands from the cpu struct first
+ * (skipping a write-only Rd), and write Rd back after execution */
 static bool emit_operands(struct xlate *x, uint32_t insn, const struct operands *o)
 {
     const unsigned pool[3] = {T0, T1, T2};
     unsigned guest[3], nmap = 0, rd_host = 0, rd_guest = 0;
+    bool need_load[3] = {false, false, false};
     bool rd_stolen = false;
     uint32_t out = insn;
     bool renamed = false;
@@ -150,6 +154,10 @@ static bool emit_operands(struct xlate *x, uint32_t insn, const struct operands 
             rd_stolen = true;
             rd_host = pool[k];
             rd_guest = g;
+            if (o->reads_rd)
+                need_load[k] = true;
+        } else {
+            need_load[k] = true;
         }
     }
     if (nmap == 0 && !renamed) {
@@ -159,8 +167,10 @@ static bool emit_operands(struct xlate *x, uint32_t insn, const struct operands 
     }
     if (nmap == 3)
         x->t2_group = -1; /* later members get the host base back from the slot (plan_group) */
-    for (unsigned k = 0; k < nmap; k++)
-        emit_load_guest(x, pool[k], guest[k]);
+    for (unsigned k = 0; k < nmap; k++) {
+        if (need_load[k])
+            emit_load_guest(x, pool[k], guest[k]);
+    }
     emit(x, out);
     if (rd_stolen)
         emit_store_guest(x, rd_host, rd_guest);
@@ -920,7 +930,7 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
         case SYSREG_CNTFRQ_EL0:
         case SYSREG_CNTVCT_EL0:
         case SYSREG_CNTVCTSS_EL0: {
-            struct operands o = {.n = 1, .pos = {0}, .sp = {false}, .writes_rd = read};
+            struct operands o = {.n = 1, .pos = {0}, .sp = {false}, .writes_rd = read, .reads_rd = !read};
             return emit_operands(x, insn, &o) || fallback(x, pc);
         }
         case SYSREG_FPCR:
@@ -1039,11 +1049,14 @@ static bool translate_simd_dp(struct xlate *x, uint32_t insn)
     if (!appine_has(APPINE_HWCAP_FP | APPINE_HWCAP_ASIMD) || !appine_native_available() ||
         !appine_simd_dp_decode(insn, &nd))
         return false;
-    struct operands o = {.n = 0, .writes_rd = false};
+    struct operands o = {.n = 0, .writes_rd = false, .reads_rd = false};
     for (unsigned i = 0; i < nd.n; i++) {
         add_operand(&o, nd.gpr[i].pos, false);
-        if (nd.gpr[i].pos == 0 && nd.gpr[i].store)
+        if (nd.gpr[i].pos == 0 && nd.gpr[i].store) {
             o.writes_rd = true;
+            if (nd.gpr[i].load)
+                o.reads_rd = true;
+        }
     }
     return emit_operands(x, insn, &o);
 }

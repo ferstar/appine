@@ -790,6 +790,7 @@ struct operands {
     unsigned pos[4]; /* start bit of the field */
     bool sp[4];      /* whether 31 means SP */
     bool writes_rd;  /* the Rd field at pos[0] == 0 is written */
+    bool reads_rd;   /* the written Rd field at pos == 0 is also read (MOVK, BFM) */
 };
 
 static inline void add_operand(struct operands *o, unsigned pos, bool sp)

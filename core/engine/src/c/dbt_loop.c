@@ -166,14 +166,6 @@ static bool dp_writes_nzcv(uint32_t insn)
     return false;
 }
 
-static bool dp_reads_rd(uint32_t insn)
-{
-    if (FIELD(insn, 28, 26) != 4)
-        return false;
-    unsigned g = FIELD(insn, 25, 23), opc = FIELD(insn, 30, 29);
-    return (g == 5 && opc == 3) || (g == 6 && opc == 1); /* MOVK, BFM */
-}
-
 static unsigned count_distinct_stolen(const struct xlate *x, uint32_t insn, const struct operands *o)
 {
     unsigned seen[3], n = 0;
@@ -662,9 +654,8 @@ static bool analyze_fast_loop(struct xlate *x, struct fast_loop *fl)
             }
 
             /* General DP instruction: reading any register taints its root as non-pointer */
-            bool reads_rd = dp_reads_rd(insn);
             for (unsigned k = 0; k < o.n; k++) {
-                if (o.pos[k] == 0 && o.writes_rd && !reads_rd)
+                if (o.pos[k] == 0 && o.writes_rd && !o.reads_rd)
                     continue;
                 fl_mark_read((insn >> o.pos[k]) & 31, sym_root, written, &read_before_write,
                              &used_as_nonptr);
@@ -1099,7 +1090,7 @@ static int fast_ptr_or_alias_index(const struct fast_loop *fl, unsigned r)
 
 /* Emit a data-processing / SIMD-DP instruction inside fast_loop_body using only T0 and T1 (T2 holds
  * the strip-mine trip counter) */
-static void emit_fast_operands(struct xlate *x, uint32_t insn, const struct operands *o, bool reads_rd)
+static void emit_fast_operands(struct xlate *x, uint32_t insn, const struct operands *o)
 {
     const unsigned pool[2] = {T0, T1};
     unsigned guest[2], nmap = 0, rd_host = 0, rd_guest = 0;
@@ -1123,7 +1114,7 @@ static void emit_fast_operands(struct xlate *x, uint32_t insn, const struct oper
             rd_stolen = true;
             rd_host = pool[k];
             rd_guest = r;
-            if (reads_rd)
+            if (o->reads_rd)
                 need_load[k] = true;
         } else {
             need_load[k] = true;
@@ -1602,14 +1593,13 @@ static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
         if ((top & 7) == 7) {
             struct native_desc nd;
             appine_simd_dp_decode(insn, &nd);
-            struct operands o = {.n = 0, .writes_rd = false};
-            bool reads_rd = false;
+            struct operands o = {.n = 0, .writes_rd = false, .reads_rd = false};
             for (unsigned k = 0; k < nd.n; k++) {
                 add_operand(&o, nd.gpr[k].pos, false);
                 if (nd.gpr[k].pos == 0 && nd.gpr[k].store) {
                     o.writes_rd = true;
                     if (nd.gpr[k].load)
-                        reads_rd = true;
+                        o.reads_rd = true;
                 }
             }
             if (fl->npin) {
@@ -1620,7 +1610,7 @@ static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
                 }
                 emit(x, out);
             } else {
-                emit_fast_operands(x, insn, &o, reads_rd);
+                emit_fast_operands(x, insn, &o);
             }
         } else if (top == 0x4 || top == 0x6 || top == 0xc || top == 0xe) {
             struct memop m;
@@ -1657,7 +1647,7 @@ static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
                 }
                 emit(x, out);
             } else {
-                emit_fast_operands(x, insn, &o, dp_reads_rd(insn));
+                emit_fast_operands(x, insn, &o);
             }
         }
     }
@@ -1704,7 +1694,7 @@ static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
         uint32_t cmp_insn = x->words[fl->ctrl_idx];
         struct operands o;
         dbt_dp_operands(cmp_insn, &o);
-        emit_fast_operands(x, cmp_insn, &o, false);
+        emit_fast_operands(x, cmp_insn, &o);
     }
 
     uint32_t *slow = here(x);

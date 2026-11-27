@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: 2 MiB STLB fast-path probe in emit_fill before the radix page-table walk)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: skip redundant `msr fpcr` in `enter`/`exit` and skip loading write-only stolen `Rd` in `emit_operands`)
 
 ## Responsibilities
 
@@ -84,16 +84,20 @@ triggers (`kernel/oom`).
 ### Register convention and FP state
 
 - Non-stolen guest GPRs live in same-numbered host registers; stolen registers live in `cpu->x[]`
-  and are loaded into `{T0, T1, T2}` and written back around rewritten instructions (instructions
-  with >3 distinct stolen GPRs fall back to Tier 0). Host `x18` (Android shadow call stack) is
-  never touched. Guest SP lives in `SP_HOST` (`x26`/`x24`), so SP-based operands rename directly.
+  and are loaded into `{T0, T1, T2}` and written back around rewritten instructions (skipping the
+  load for write-only stolen `Rd`, loading `Rd` only for `MOVK`/`BFM`, read-modify-write SIMD GPRs,
+  or when aliased as a source operand; instructions with >3 distinct stolen GPRs fall back to Tier 0).
+  Host `x18` (Android shadow call stack) is never touched. Guest SP lives in `SP_HOST` (`x26`/`x24`),
+  so SP-based operands rename directly.
 - Guest NZCV lives in host NZCV; all DBT-emitted helper code is strictly NZCV-free (`emit.h` omits
   flag-setting integer ALU encodings).
 - `d->enter(cpu, code)` saves host `x19–x30`, `d8–d15` and host FPCR (176-byte frame), loads guest
-  FPCR, FPSR, NZCV, `V0–V31`, non-stolen GPRs and `SP_HOST`, and jumps to `code`. `d->exit` saves
-  `T0/T1/T2` (`pc`, `dbt_site`, `dbt_reason`), NZCV, non-stolen GPRs, `SP_HOST`, `V0–V31` and
-  host FPSR (not FPCR, since translated code never alters host FPCR), restores host state and
-  returns. `appine_dbt_run` syncs host `PSTATE.DIT` via `appine_sync_dit` on entry.
+  FPCR (skipping the serializing `msr fpcr` when `cpu->fpcr` already matches host FPCR), FPSR, NZCV,
+  `V0–V31`, non-stolen GPRs and `SP_HOST`, and jumps to `code`. `d->exit` saves `T0/T1/T2` (`pc`,
+  `dbt_site`, `dbt_reason`), NZCV, non-stolen GPRs, `SP_HOST`, `V0–V31` and host FPSR (not FPCR,
+  since translated code never alters host FPCR), restores host FPCR only when it differed from
+  `cpu->fpcr`, restores host state and returns. `appine_dbt_run` syncs host `PSTATE.DIT` via
+  `appine_sync_dit` on entry.
 
 ### Blocks and instruction handling
 

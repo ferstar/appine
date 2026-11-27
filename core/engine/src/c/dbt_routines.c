@@ -903,13 +903,18 @@ void dbt_emit_routines(struct appine_dbt *d)
     emit(x, enc_stp_x(19, 20, 31, 80));
     for (unsigned r = 8; r < 16; r += 2)
         emit(x, enc_stp_d(r, r + 1, 31, (int)(112 + 8 * (r - 8))));
-    emit(x, enc_mrs_fpcr(T1));
-    emit(x, enc_str_x(T1, 31, 104));
     emit(x, enc_mov(CTX, 0));
     emit(x, enc_mov(T0, 1));
-    /* The guest's FP state stays in host registers throughout translated code (the engine/dbt map) */
-    emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, fpcr)));
-    emit(x, enc_msr_fpcr(T1));
+    emit(x, enc_mrs_fpcr(T1));
+    emit(x, enc_str_x(T1, 31, 104));
+    /* The guest's FP state stays in host registers throughout translated code (the engine/dbt map).
+     * Skip the serializing msr fpcr when guest and host FPCR already match. */
+    emit(x, enc_ldr_x(T2, CTX, offsetof(struct appine_cpu, fpcr)));
+    emit(x, enc_eor_lsr(T1, T1, T2, 0));
+    uint32_t *same_fpcr_enter = here(x);
+    emit(x, enc_cbz_x(T1));
+    emit(x, enc_msr_fpcr(T2));
+    patch_branch(x->wdelta, same_fpcr_enter, here(x));
     emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, fpsr)));
     emit(x, enc_msr_fpsr(T1));
     emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, nzcv)));
@@ -949,8 +954,14 @@ void dbt_emit_routines(struct appine_dbt *d)
         emit(x, enc_stp_q(q, q + 1, T1, (int)(16 * q)));
     emit(x, enc_mrs_fpsr(T0));
     emit(x, enc_str_x(T0, CTX, offsetof(struct appine_cpu, fpsr)));
+    /* Restore host FPCR only when enter changed it (translated code never alters host FPCR). */
     emit(x, enc_ldr_x(T0, 31, 104));
+    emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, fpcr)));
+    emit(x, enc_eor_lsr(T1, T0, T1, 0));
+    uint32_t *same_fpcr_exit = here(x);
+    emit(x, enc_cbz_x(T1));
     emit(x, enc_msr_fpcr(T0));
+    patch_branch(x->wdelta, same_fpcr_exit, here(x));
     emit(x, enc_mov(0, T2));
     for (unsigned r = 8; r < 16; r += 2)
         emit(x, enc_ldp_d(r, r + 1, 31, (int)(112 + 8 * (r - 8))));

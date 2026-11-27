@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-26 (full mapping, 15 claims independently checked across CPU layout, Tier 0 dispatch, atomics, features, native code and fault recovery)
 >
-> Maintained: 2026-11-26 (targeted update for arm64 TBI0 instruction-pointer untagging)
+> Maintained: 2026-11-27 (targeted update for `_Thread_local` guard pointer cache in `guard.c`)
 
 ## Responsibilities
 
@@ -185,7 +185,11 @@ non-aarch64 hosts get stubs (no native stubs, no Tier 1, only CPUID advertised).
   deeper ones are counted so drops still pair), the signal is unblocked, and the run returns
   `HostFault`. The locks taken during a run are registered: the native-stub lock, plus `engine/dbt`'s
   instance, template and perf-map locks. Other faults are reported to stderr and passed to the
-  previous handler. If the per-thread guard cannot be allocated, the run proceeds unguarded.
+  previous handler. Normal-context guard lookups cache the per-thread `struct guard *` in
+  `_Thread_local` (cleared and freed by the `pthread_key_t` destructor on thread exit), while
+  `handler()` reads `pthread_getspecific` directly so signals on unrelated threads in `dlopen`'d
+  shared libraries never trigger lazy dynamic-TLS allocation. If the per-thread guard cannot be
+  allocated, the run proceeds unguarded.
 - Guarded code must not allocate or call back into the kernel layer (`engine/dbt`'s opt-in
   `APPINE_PERF_MAP` is the one documented exception).
 - Guest state is not reconstructed from the host context; after a host fault the kernel kills the

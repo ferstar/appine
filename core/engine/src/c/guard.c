@@ -53,6 +53,17 @@ static pthread_once_t once = PTHREAD_ONCE_INIT;
 static pthread_key_t key;
 static bool installed;
 static struct sigaction previous[NSIGNALS];
+/* Cached per-thread guard pointer for normal-context callers (avoids atomic load +
+ * pthread_getspecific on every guarded run and lock hold/drop). handler() intentionally reads
+ * pthread_getspecific(key) directly instead of tls_guard so a signal on an unrelated thread in a
+ * dlopen'd shared library never triggers lazy dynamic-TLS allocation inside a signal handler. */
+static _Thread_local struct guard *tls_guard;
+
+static void destroy_guard(void *p)
+{
+    tls_guard = NULL;
+    free(p);
+}
 
 static uint64_t read_fpcr(void)
 {
@@ -182,7 +193,7 @@ static void handler(int sig, siginfo_t *info, void *uc)
 
 static void install(void)
 {
-    if (pthread_key_create(&key, free) != 0)
+    if (pthread_key_create(&key, destroy_guard) != 0)
         return;
     struct sigaction sa = {.sa_flags = SA_SIGINFO | SA_ONSTACK};
     sa.sa_sigaction = handler;
@@ -197,12 +208,11 @@ void appine_fault_guard_install(void)
     pthread_once(&once, install);
 }
 
-/* The current thread's guard; NULL when the guard is not installed */
-static struct guard *current(void)
+/* The current thread's guard; NULL when the guard is not installed or not yet allocated on this
+ * thread (normal thread context only; handler() uses pthread_getspecific directly). */
+static inline struct guard *current(void)
 {
-    if (!__atomic_load_n(&installed, __ATOMIC_ACQUIRE))
-        return NULL;
-    return pthread_getspecific(key);
+    return tls_guard;
 }
 
 static void unlock_mutex(void *lock)
@@ -317,7 +327,8 @@ int appine_guard_selftest(void)
  * the signal mask) */
 static enum appine_exit recover(struct guard *g)
 {
-    write_fpcr(g->fpcr);
+    if (read_fpcr() != g->fpcr)
+        write_fpcr(g->fpcr);
     while (g->nlocks) {
         g->nlocks--;
         g->locks[g->nlocks].release(g->locks[g->nlocks].lock);
@@ -333,14 +344,19 @@ static enum appine_exit recover(struct guard *g)
 /* The current thread's guard, allocated on first use; NULL when the guard is not installed */
 static struct guard *current_or_new(void)
 {
-    struct guard *g = current();
-    if (!g && __atomic_load_n(&installed, __ATOMIC_ACQUIRE)) {
-        g = calloc(1, sizeof(*g));
-        if (g && pthread_setspecific(key, g) != 0) {
-            free(g);
-            g = NULL;
-        }
+    struct guard *g = tls_guard;
+    if (LIKELY(g != NULL))
+        return g;
+    if (!__atomic_load_n(&installed, __ATOMIC_ACQUIRE))
+        return NULL;
+    g = calloc(1, sizeof(*g));
+    if (!g)
+        return NULL;
+    if (pthread_setspecific(key, g) != 0) {
+        free(g);
+        return NULL;
     }
+    tls_guard = g;
     return g;
 }
 
@@ -357,6 +373,7 @@ enum appine_exit appine_guard_run(enum appine_exit (*fn)(void *, struct appine_c
     g->fpcr = read_fpcr();
     g->depth = 0;
     g->nlocks = 0;
+    __atomic_signal_fence(__ATOMIC_RELEASE);
     g->armed = 1;
     enum appine_exit r = fn(ctx, cpu);
     g->armed = 0;

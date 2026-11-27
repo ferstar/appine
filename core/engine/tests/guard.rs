@@ -11,7 +11,7 @@
 
 use std::ptr::NonNull;
 
-use appine_engine::{Cpu, Dbt, Exit, Mmu, PAGE_SIZE, hwcap, prot};
+use appine_engine::{Cpu, Dbt, DbtRegs, Exit, Mmu, PAGE_SIZE, hwcap, prot};
 
 #[repr(C, align(4096))]
 struct Page([u8; 4096]);
@@ -152,4 +152,35 @@ fn locks_held_at_the_fault_are_released() {
     g.cpu.state_mut().x[6] = DATA;
     assert_eq!(g.cpu.run(), Exit::Svc { imm: 0 });
     assert_eq!(&g.pages[1].0[..8], &5u64.to_le_bytes());
+}
+
+fn host_fpcr() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mrs {}, fpcr", out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+#[test]
+fn translator_restores_host_fpcr_on_host_fault() {
+    const FZ: u64 = 1 << 24;
+    let orig = host_fpcr();
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let Some(mut dbt) = Dbt::with_regs(regs) else {
+            return;
+        };
+        let mut g = Guest::new();
+        g.code(&[LDR_X0_X1, SVC]);
+        {
+            let s = g.cpu.state_mut();
+            s.x[1] = BROKEN;
+            s.fpcr = orig ^ FZ;
+        }
+        let exit = dbt.run(&mut g.cpu);
+        g.assert_host_fault(exit);
+        assert_eq!(
+            host_fpcr(),
+            orig,
+            "host FPCR must be restored after a host fault ({regs:?})"
+        );
+    }
 }
