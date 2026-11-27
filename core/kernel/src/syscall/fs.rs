@@ -40,7 +40,7 @@ use crate::vfs::{AnonTarget, Dentry, Fs, MountId, Node, Pseudo, TMPFS_PAGE, Vfs,
 pub(super) const AT_FDCWD: i32 = -100;
 pub(super) const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
 const AT_REMOVEDIR: u32 = 0x200;
-const AT_EACCESS: u32 = 0x200;
+pub(super) const AT_EACCESS: u32 = 0x200;
 const AT_SYMLINK_FOLLOW: u32 = 0x400;
 const AT_NO_AUTOMOUNT: u32 = 0x800;
 const AT_EMPTY_PATH: u32 = 0x1000;
@@ -7676,6 +7676,14 @@ fn durable(cx: &mut Cx<'_>, all: bool) -> SysResult {
 
 // ---- Metadata ----
 
+/// Linux 6.1's `do_faccessat` mode and flag validation (shared with the no-BKL fast path).
+pub(super) fn faccessat_flags(amode: u32, flags: u32) -> Result<(), Errno> {
+    if amode & !7 != 0 || flags & !(AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
 pub(super) fn faccessat(
     cx: &mut Cx<'_>,
     dirfd: i32,
@@ -7683,9 +7691,7 @@ pub(super) fn faccessat(
     amode: u32,
     flags: u32,
 ) -> SysResult {
-    if amode & !7 != 0 || flags & !(AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH) != 0 {
-        return Err(Errno::EINVAL);
-    }
+    faccessat_flags(amode, flags)?;
     let path = read_path(cx, path)?;
     // By default checks use the real user ID (including search permission along the path), and
     // with AT_EACCESS the effective user ID

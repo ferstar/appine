@@ -1461,7 +1461,6 @@ struct UnlinkedTmpfs {
 
 /// Credential fields needed by [`Cached::access`] in the initial user namespace (thread-safe
 /// snapshot without `Rc<UserNs>`).
-#[allow(dead_code)] // Wired into syscall::fast during integration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CachedCred {
     pub(crate) fsuid: u32,
@@ -1514,7 +1513,6 @@ impl Cached {
     /// its target into `buf` (truncated as `readlinkat(2)` does), returning the bytes copied.
     /// Returns `None` on a cache miss, mount crossing, or empty path so the caller falls back to
     /// the BKL path.
-    #[allow(dead_code)] // Wired into syscall::fast during integration.
     pub(crate) fn readlink(
         &self,
         root: Ino,
@@ -1546,7 +1544,6 @@ impl Cached {
     /// cache, for initial-user-namespace credentials `cred`. Returns `None` on a cache miss, mount
     /// crossing, empty path, credentials lacking `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH`, or an
     /// ACL/group check that needs the full BKL path.
-    #[allow(dead_code)] // Wired into syscall::fast during integration.
     pub(crate) fn access(
         &self,
         root: Ino,
