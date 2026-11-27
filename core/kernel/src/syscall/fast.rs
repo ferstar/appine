@@ -133,10 +133,12 @@ struct Paths {
     /// None when the current directory is not in the boot root filesystem (it is in `/proc` or in a
     /// bind mount).
     cwd: Option<Ino>,
-    /// Effective credentials (`cx.cred()`) used by `faccessat2(..., AT_EACCESS)`.
+    /// Effective credentials (`cx.cred()`, always `searches_all`) used by
+    /// `faccessat2(..., AT_EACCESS)`.
     eaccess_cred: CachedCred,
     /// Real-ID credentials (`cx.cred().for_access()`) used by `faccessat` / `faccessat2` without
-    /// `AT_EACCESS`.
+    /// `AT_EACCESS`. May lack `searches_all` (e.g. setuid-root without `SECBIT_NO_SETUID_FIXUP`),
+    /// in which case [`Paths::faccessat`] falls back to the BKL path before reading guest memory.
     access_cred: CachedCred,
 }
 
@@ -151,24 +153,15 @@ impl Fast {
         let paths = match (&t.vfs, &fs.root) {
             (Some(vfs), &Node::Store(ROOT_MOUNT, root)) if cred.searches_all() => {
                 let vfs = vfs.cached();
-                vfs.usable.then(|| {
-                    let ac = cred.for_access();
-                    Paths {
-                        vfs,
-                        root,
-                        cwd: match fs.cwd {
-                            Node::Store(ROOT_MOUNT, ino) => Some(ino),
-                            _ => None,
-                        },
-                        eaccess_cred: CachedCred {
-                            fsuid: cred.fsuid,
-                            cap_effective: cred.cap_effective,
-                        },
-                        access_cred: CachedCred {
-                            fsuid: ac.fsuid,
-                            cap_effective: ac.cap_effective,
-                        },
-                    }
+                vfs.usable.then(|| Paths {
+                    vfs,
+                    root,
+                    cwd: match fs.cwd {
+                        Node::Store(ROOT_MOUNT, ino) => Some(ino),
+                        _ => None,
+                    },
+                    eaccess_cred: CachedCred::from_cred(&cred),
+                    access_cred: CachedCred::from_cred(&cred.for_access()),
                 })
             }
             _ => None,
@@ -593,8 +586,7 @@ impl Paths {
             return None;
         }
         let mut path_buf = [0u8; PATH_MAX];
-        let path = read_path(cpu, path, &mut path_buf)?;
-        let cwd = self.resolve_cwd(dirfd, path)?;
+        let (cwd, path) = self.read_at(cpu, dirfd, path, &mut path_buf)?;
         let mut out = [0u8; PATH_MAX];
         let cap = size.min(out.len());
         let n = match self.vfs.readlink(self.root, cwd, path, &mut out[..cap])? {
@@ -619,14 +611,16 @@ impl Paths {
         flags: u32,
     ) -> Option<SysResult> {
         faccessat_flags(amode, flags).ok()?;
-        let mut path_buf = [0u8; PATH_MAX];
-        let path = read_path(cpu, path, &mut path_buf)?;
-        let cwd = self.resolve_cwd(dirfd, path)?;
         let cred = if flags & AT_EACCESS != 0 {
             self.eaccess_cred
         } else {
             self.access_cred
         };
+        if !cred.searches_all() {
+            return None;
+        }
+        let mut path_buf = [0u8; PATH_MAX];
+        let (cwd, path) = self.read_at(cpu, dirfd, path, &mut path_buf)?;
         self.vfs
             .access(
                 self.root,
@@ -682,18 +676,27 @@ impl Paths {
     /// directory.
     fn stat(&self, cpu: &Cpu, dirfd: i32, path: u64, flags: u32) -> Option<Result<Stat, Errno>> {
         let mut buf = [0u8; PATH_MAX];
-        let path = read_path(cpu, path, &mut buf)?;
-        let cwd = self.resolve_cwd(dirfd, path)?;
+        let (cwd, path) = self.read_at(cpu, dirfd, path, &mut buf)?;
         self.vfs
             .stat(self.root, cwd, path, flags & AT_SYMLINK_NOFOLLOW == 0)
     }
 
-    fn resolve_cwd(&self, dirfd: i32, path: &[u8]) -> Option<Ino> {
-        match path.first()? {
-            b'/' => Some(self.root),
-            _ if dirfd == AT_FDCWD => self.cwd,
-            _ => None,
-        }
+    /// Reads a non-empty guest path into `buf` and resolves its starting directory when it stays
+    /// inside [`ROOT_MOUNT`] (absolute path or relative to `AT_FDCWD`).
+    fn read_at<'b>(
+        &self,
+        cpu: &Cpu,
+        dirfd: i32,
+        addr: u64,
+        buf: &'b mut [u8; PATH_MAX],
+    ) -> Option<(Ino, &'b [u8])> {
+        let path = read_path(cpu, addr, buf)?;
+        let cwd = match path.first()? {
+            b'/' => self.root,
+            _ if dirfd == AT_FDCWD => self.cwd?,
+            _ => return None,
+        };
+        Some((cwd, path))
     }
 }
 
@@ -1610,6 +1613,23 @@ mod tests {
             .unwrap();
     }
 
+    fn assert_fast_in_guest_matches_slow(
+        fast: &Fast,
+        shared: &Shared,
+        cx: &mut Cx<'_>,
+        cpu: &mut Cpu,
+        nr: u64,
+        args: [u64; 6],
+        expected: u64,
+    ) {
+        assert_eq!(
+            run_fast_outcome(fast, shared, cx.task, cpu, nr, args),
+            FastOutcome::InGuest
+        );
+        assert_eq!(cpu.state().x[0], expected);
+        assert_eq!(run_slow(cx, cpu, nr, args), expected);
+    }
+
     #[test]
     fn readlinkat_fast_path_matches_slow_path_and_fallbacks() {
         let mut fx = VfsFastFixture::new("readlinkat");
@@ -1623,6 +1643,24 @@ mod tests {
             let mut state = task.state.borrow_mut();
             let mut cx = Cx::new(&shared, k, &task, &mut state);
             let mut fast = Fast::new(&shared, cx.task, cx.t);
+            let reset_canary = |cx: &Cx<'_>| {
+                cx.mm()
+                    .write(crate::uaccess::UserSlice::new(out_addr, 64), &[0xAAu8; 64])
+                    .unwrap();
+            };
+            let read_out = |cx: &Cx<'_>| {
+                let mut buf = [0u8; 64];
+                cx.mm()
+                    .read(
+                        crate::uaccess::UserSlice::new(out_addr, buf.len()),
+                        &mut buf,
+                    )
+                    .unwrap();
+                buf
+            };
+            let rl_args = |dirfd: i32, buf: u64, size: usize| {
+                [dirfd as i64 as u64, path_addr, buf, size as u64, 0, 0]
+            };
 
             // Absolute path (even with invalid dirfd), relative AT_FDCWD path, dangling symlink,
             // non-symlinks (EINVAL), trailing slash on symlink-to-dir (EINVAL), missing (ENOENT).
@@ -1639,16 +1677,9 @@ mod tests {
                 (AT_FDCWD, b"/missing", 64),
             ] {
                 write_cstr(&cx, path_addr, path);
-                let args = [dirfd as i64 as u64, path_addr, out_addr, size as u64, 0, 0];
+                let args = rl_args(dirfd, out_addr, size);
 
-                // Fill output with canary before fast call.
-                let canary = [0xAAu8; 64];
-                cx.mm()
-                    .write(
-                        crate::uaccess::UserSlice::new(out_addr, canary.len()),
-                        &canary,
-                    )
-                    .unwrap();
+                reset_canary(&cx);
                 let entry_before = cx.task.sync.entry.get();
                 cx.task.sync.in_guest.store(true, Ordering::SeqCst);
                 let outcome = run_fast_outcome(&fast, &shared, cx.task, &mut fx.cpu, 78, args);
@@ -1661,29 +1692,11 @@ mod tests {
                 assert!(cx.task.sync.in_guest.load(Ordering::Relaxed));
                 assert_eq!(cx.task.sync.entry.get(), entry_before);
                 let fast_ret = fx.cpu.state().x[0];
-                let mut fast_buf = [0u8; 64];
-                cx.mm()
-                    .read(
-                        crate::uaccess::UserSlice::new(out_addr, fast_buf.len()),
-                        &mut fast_buf,
-                    )
-                    .unwrap();
+                let fast_buf = read_out(&cx);
 
-                // Reset canary and run slow path for exact comparison.
-                cx.mm()
-                    .write(
-                        crate::uaccess::UserSlice::new(out_addr, canary.len()),
-                        &canary,
-                    )
-                    .unwrap();
+                reset_canary(&cx);
                 let slow_ret = run_slow(&mut cx, &mut fx.cpu, 78, args);
-                let mut slow_buf = [0u8; 64];
-                cx.mm()
-                    .read(
-                        crate::uaccess::UserSlice::new(out_addr, slow_buf.len()),
-                        &mut slow_buf,
-                    )
-                    .unwrap();
+                let slow_buf = read_out(&cx);
                 assert_eq!(
                     fast_ret,
                     slow_ret,
@@ -1710,7 +1723,7 @@ mod tests {
                 ("ro output", AT_FDCWD, b"/usr/bin/env", ro_addr, 64),
             ] {
                 write_cstr(&cx, path_addr, path);
-                let args = [dirfd as i64 as u64, path_addr, buf, size as u64, 0, 0];
+                let args = rl_args(dirfd, buf, size);
                 assert_eq!(
                     run_fast_outcome(&fast, &shared, cx.task, &mut fx.cpu, 78, args),
                     FastOutcome::Fallback,
@@ -1719,55 +1732,28 @@ mod tests {
             }
             // Confirm slow path returns EINVAL for size <= 0.
             write_cstr(&cx, path_addr, b"/usr/bin/env");
-            assert_eq!(
-                run_slow(
-                    &mut cx,
-                    &mut fx.cpu,
-                    78,
-                    [AT_FDCWD as i64 as u64, path_addr, out_addr, 0, 0, 0]
-                ),
-                Errno::EINVAL.to_syscall_return()
-            );
-            assert_eq!(
-                run_slow(
-                    &mut cx,
-                    &mut fx.cpu,
-                    78,
-                    [
-                        AT_FDCWD as i64 as u64,
-                        path_addr,
-                        out_addr,
-                        usize::MAX as u64,
-                        0,
-                        0
-                    ]
-                ),
-                Errno::EINVAL.to_syscall_return()
-            );
+            for bad_size in [0usize, usize::MAX] {
+                assert_eq!(
+                    run_slow(
+                        &mut cx,
+                        &mut fx.cpu,
+                        78,
+                        rl_args(AT_FDCWD, out_addr, bad_size)
+                    ),
+                    Errno::EINVAL.to_syscall_return()
+                );
+            }
 
             // Stale fast_epoch forces fallback; refresh re-enables fast path.
+            let std_args = rl_args(AT_FDCWD, out_addr, 64);
             shared.fast_changed();
             assert_eq!(
-                run_fast_outcome(
-                    &fast,
-                    &shared,
-                    cx.task,
-                    &mut fx.cpu,
-                    78,
-                    [AT_FDCWD as i64 as u64, path_addr, out_addr, 64, 0, 0]
-                ),
+                run_fast_outcome(&fast, &shared, cx.task, &mut fx.cpu, 78, std_args),
                 FastOutcome::Fallback
             );
             fast.refresh(&shared, cx.task, cx.t);
             assert_eq!(
-                run_fast_outcome(
-                    &fast,
-                    &shared,
-                    cx.task,
-                    &mut fx.cpu,
-                    78,
-                    [AT_FDCWD as i64 as u64, path_addr, out_addr, 64, 0, 0]
-                ),
+                run_fast_outcome(&fast, &shared, cx.task, &mut fx.cpu, 78, std_args),
                 FastOutcome::InGuest
             );
 
@@ -1784,26 +1770,12 @@ mod tests {
             fast.refresh(&shared, cx.task, cx.t);
             write_cstr(&cx, path_addr, b"usr/bin/env");
             assert_eq!(
-                run_fast_outcome(
-                    &fast,
-                    &shared,
-                    cx.task,
-                    &mut fx.cpu,
-                    78,
-                    [AT_FDCWD as i64 as u64, path_addr, out_addr, 64, 0, 0]
-                ),
+                run_fast_outcome(&fast, &shared, cx.task, &mut fx.cpu, 78, std_args),
                 FastOutcome::Fallback
             );
             write_cstr(&cx, path_addr, b"/usr/bin/env");
             assert_eq!(
-                run_fast_outcome(
-                    &fast,
-                    &shared,
-                    cx.task,
-                    &mut fx.cpu,
-                    78,
-                    [AT_FDCWD as i64 as u64, path_addr, out_addr, 64, 0, 0]
-                ),
+                run_fast_outcome(&fast, &shared, cx.task, &mut fx.cpu, 78, std_args),
                 FastOutcome::InGuest
             );
         }
@@ -1823,6 +1795,16 @@ mod tests {
         let mut fx = VfsFastFixture::new("faccessat");
         let shared = fx.shared.clone();
         let path_addr = fx.page;
+        let acc_args = |dirfd: i32, amode: u32, flags: u32| {
+            [
+                dirfd as i64 as u64,
+                path_addr,
+                u64::from(amode),
+                u64::from(flags),
+                0,
+                0,
+            ]
+        };
         {
             let k = shared.lock();
             let task = k.tasks[&fx.pid].clone();
@@ -1856,14 +1838,7 @@ mod tests {
                 (439, AT_FDCWD, b"/bin/busybox", R_OK, AT_EMPTY_PATH),
             ] {
                 write_cstr(&cx, path_addr, path);
-                let args = [
-                    dirfd as i64 as u64,
-                    path_addr,
-                    u64::from(amode),
-                    u64::from(flags),
-                    0,
-                    0,
-                ];
+                let args = acc_args(dirfd, amode, flags);
                 let entry_before = cx.task.sync.entry.get();
                 cx.task.sync.in_guest.store(true, Ordering::SeqCst);
                 let outcome = run_fast_outcome(&fast, &shared, cx.task, &mut fx.cpu, nr, args);
@@ -1913,14 +1888,7 @@ mod tests {
                 ("uncached", 48, AT_FDCWD, b"/never-looked-up", F_OK, 0),
             ] {
                 write_cstr(&cx, path_addr, path);
-                let args = [
-                    dirfd as i64 as u64,
-                    path_addr,
-                    u64::from(amode),
-                    u64::from(flags),
-                    0,
-                    0,
-                ];
+                let args = acc_args(dirfd, amode, flags);
                 assert_eq!(
                     run_fast_outcome(&fast, &shared, cx.task, &mut fx.cpu, nr, args),
                     FastOutcome::Fallback,
@@ -1930,21 +1898,11 @@ mod tests {
             // Confirm slow path returns EINVAL for bad amode and bad flags.
             write_cstr(&cx, path_addr, b"/bin/busybox");
             assert_eq!(
-                run_slow(
-                    &mut cx,
-                    &mut fx.cpu,
-                    48,
-                    [AT_FDCWD as i64 as u64, path_addr, 8, 0, 0, 0]
-                ),
+                run_slow(&mut cx, &mut fx.cpu, 48, acc_args(AT_FDCWD, 8, 0)),
                 Errno::EINVAL.to_syscall_return()
             );
             assert_eq!(
-                run_slow(
-                    &mut cx,
-                    &mut fx.cpu,
-                    439,
-                    [AT_FDCWD as i64 as u64, path_addr, 0, 0x4000, 0, 0]
-                ),
+                run_slow(&mut cx, &mut fx.cpu, 439, acc_args(AT_FDCWD, 0, 0x4000)),
                 Errno::EINVAL.to_syscall_return()
             );
 
@@ -1958,49 +1916,24 @@ mod tests {
             cx.set_cred(setuid_cred);
             // Stale fast epoch falls back before refresh.
             write_cstr(&cx, path_addr, b"/bin/secret");
+            let eaccess_args = acc_args(AT_FDCWD, R_OK | W_OK, AT_EACCESS);
             assert_eq!(
-                run_fast_outcome(
-                    &fast,
-                    &shared,
-                    cx.task,
-                    &mut fx.cpu,
-                    439,
-                    [
-                        AT_FDCWD as i64 as u64,
-                        path_addr,
-                        u64::from(R_OK | W_OK),
-                        u64::from(AT_EACCESS),
-                        0,
-                        0
-                    ]
-                ),
+                run_fast_outcome(&fast, &shared, cx.task, &mut fx.cpu, 439, eaccess_args),
                 FastOutcome::Fallback
             );
             fast.refresh(&shared, cx.task, cx.t);
-            let eaccess_args = [
-                AT_FDCWD as i64 as u64,
-                path_addr,
-                u64::from(R_OK | W_OK),
-                u64::from(AT_EACCESS),
+            assert_fast_in_guest_matches_slow(
+                &fast,
+                &shared,
+                &mut cx,
+                &mut fx.cpu,
+                439,
+                eaccess_args,
                 0,
-                0,
-            ];
-            assert_eq!(
-                run_fast_outcome(&fast, &shared, cx.task, &mut fx.cpu, 439, eaccess_args),
-                FastOutcome::InGuest
             );
-            assert_eq!(fx.cpu.state().x[0], 0);
-            assert_eq!(run_slow(&mut cx, &mut fx.cpu, 439, eaccess_args), 0);
 
             for (nr, flags) in [(48u64, 0u32), (439, 0)] {
-                let args = [
-                    AT_FDCWD as i64 as u64,
-                    path_addr,
-                    u64::from(R_OK),
-                    u64::from(flags),
-                    0,
-                    0,
-                ];
+                let args = acc_args(AT_FDCWD, R_OK, flags);
                 assert_eq!(
                     run_fast_outcome(&fast, &shared, cx.task, &mut fx.cpu, nr, args),
                     FastOutcome::Fallback,
@@ -2024,23 +1957,23 @@ mod tests {
             fast.refresh(&shared, cx.task, cx.t);
 
             write_cstr(&cx, path_addr, b"/bin/owned_ro");
-            let ro_r_args = [AT_FDCWD as i64 as u64, path_addr, u64::from(R_OK), 0, 0, 0];
-            assert_eq!(
-                run_fast_outcome(&fast, &shared, cx.task, &mut fx.cpu, 48, ro_r_args),
-                FastOutcome::InGuest
+            assert_fast_in_guest_matches_slow(
+                &fast,
+                &shared,
+                &mut cx,
+                &mut fx.cpu,
+                48,
+                acc_args(AT_FDCWD, R_OK, 0),
+                0,
             );
-            assert_eq!(fx.cpu.state().x[0], 0);
-            assert_eq!(run_slow(&mut cx, &mut fx.cpu, 48, ro_r_args), 0);
-
-            let ro_w_args = [AT_FDCWD as i64 as u64, path_addr, u64::from(W_OK), 0, 0, 0];
-            assert_eq!(
-                run_fast_outcome(&fast, &shared, cx.task, &mut fx.cpu, 48, ro_w_args),
-                FastOutcome::InGuest
-            );
-            assert_eq!(fx.cpu.state().x[0], Errno::EACCES.to_syscall_return());
-            assert_eq!(
-                run_slow(&mut cx, &mut fx.cpu, 48, ro_w_args),
-                Errno::EACCES.to_syscall_return()
+            assert_fast_in_guest_matches_slow(
+                &fast,
+                &shared,
+                &mut cx,
+                &mut fx.cpu,
+                48,
+                acc_args(AT_FDCWD, W_OK, 0),
+                Errno::EACCES.to_syscall_return(),
             );
 
             write_cstr(&cx, path_addr, b"/bin/plain");
@@ -2051,7 +1984,7 @@ mod tests {
                     cx.task,
                     &mut fx.cpu,
                     48,
-                    [AT_FDCWD as i64 as u64, path_addr, u64::from(W_OK), 0, 0, 0]
+                    acc_args(AT_FDCWD, W_OK, 0)
                 ),
                 FastOutcome::Fallback
             );
@@ -2065,15 +1998,14 @@ mod tests {
             shared.fast_changed();
             fast.refresh(&shared, cx.task, cx.t);
             write_cstr(&cx, path_addr, b"/bin/busybox");
-            let x_args = [AT_FDCWD as i64 as u64, path_addr, u64::from(X_OK), 0, 0, 0];
-            assert_eq!(
-                run_fast_outcome(&fast, &shared, cx.task, &mut fx.cpu, 48, x_args),
-                FastOutcome::InGuest
-            );
-            assert_eq!(fx.cpu.state().x[0], Errno::EACCES.to_syscall_return());
-            assert_eq!(
-                run_slow(&mut cx, &mut fx.cpu, 48, x_args),
-                Errno::EACCES.to_syscall_return()
+            assert_fast_in_guest_matches_slow(
+                &fast,
+                &shared,
+                &mut cx,
+                &mut fx.cpu,
+                48,
+                acc_args(AT_FDCWD, X_OK, 0),
+                Errno::EACCES.to_syscall_return(),
             );
             {
                 let vfs = cx.vfs().unwrap();
@@ -2083,29 +2015,24 @@ mod tests {
             shared.fast_changed();
             // Stale epoch before refresh must fall back.
             write_cstr(&cx, path_addr, b"/bin/plain");
-            let w_args = [AT_FDCWD as i64 as u64, path_addr, u64::from(W_OK), 0, 0, 0];
+            let w_args = acc_args(AT_FDCWD, W_OK, 0);
             assert_eq!(
                 run_fast_outcome(&fast, &shared, cx.task, &mut fx.cpu, 48, w_args),
                 FastOutcome::Fallback
             );
             fast.refresh(&shared, cx.task, cx.t);
-            assert_eq!(
-                run_fast_outcome(&fast, &shared, cx.task, &mut fx.cpu, 48, w_args),
-                FastOutcome::InGuest
-            );
-            assert_eq!(fx.cpu.state().x[0], Errno::EROFS.to_syscall_return());
-            assert_eq!(
-                run_slow(&mut cx, &mut fx.cpu, 48, w_args),
-                Errno::EROFS.to_syscall_return()
+            assert_fast_in_guest_matches_slow(
+                &fast,
+                &shared,
+                &mut cx,
+                &mut fx.cpu,
+                48,
+                w_args,
+                Errno::EROFS.to_syscall_return(),
             );
             // Special file (FIFO) is exempt from EROFS.
             write_cstr(&cx, path_addr, b"/bin/pipe");
-            assert_eq!(
-                run_fast_outcome(&fast, &shared, cx.task, &mut fx.cpu, 48, w_args),
-                FastOutcome::InGuest
-            );
-            assert_eq!(fx.cpu.state().x[0], 0);
-            assert_eq!(run_slow(&mut cx, &mut fx.cpu, 48, w_args), 0);
+            assert_fast_in_guest_matches_slow(&fast, &shared, &mut cx, &mut fx.cpu, 48, w_args, 0);
         }
     }
 }

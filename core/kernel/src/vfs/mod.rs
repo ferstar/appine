@@ -990,27 +990,20 @@ impl Mounts {
             .collect()
     }
 
-    /// The boot root filesystem is still attached and not nosymfollow: no-BKL resolution walks
-    /// only inside it.
-    fn fast_usable(&self) -> bool {
-        self.get_attached(ROOT_MOUNT)
-            .is_some_and(|m| m.flags & ms::NOSYMFOLLOW == 0)
-    }
-
-    /// Whether the boot root mount or its superblock is read-only (for [`Cached::access`]).
-    fn root_readonly(&self) -> bool {
-        self.get_attached(ROOT_MOUNT)
-            .is_some_and(|m| m.flags & ms::RDONLY != 0)
-            || self
-                .sb_flags
-                .get(&ROOT_DEV)
-                .is_some_and(|f| f & ms::RDONLY != 0)
-    }
-
-    /// Whether the boot root mount has `MS_NOEXEC` set (for [`Cached::access`]).
-    fn root_noexec(&self) -> bool {
-        self.get_attached(ROOT_MOUNT)
-            .is_some_and(|m| m.flags & ms::NOEXEC != 0)
+    /// Snapshot of [`ROOT_MOUNT`] state for no-BKL path resolution ([`Cached`]).
+    fn cached(&self, meta: Arc<store::Meta>) -> Cached {
+        let root_flags = self.get_attached(ROOT_MOUNT).map(|m| m.flags);
+        let sb_readonly = self
+            .sb_flags
+            .get(&ROOT_DEV)
+            .is_some_and(|f| f & ms::RDONLY != 0);
+        Cached {
+            meta,
+            mounts: self.store_points(),
+            usable: root_flags.is_some_and(|f| f & ms::NOSYMFOLLOW == 0),
+            root_readonly: root_flags.is_some_and(|f| f & ms::RDONLY != 0) || sb_readonly,
+            root_noexec: root_flags.is_some_and(|f| f & ms::NOEXEC != 0),
+        }
     }
 }
 
@@ -1463,8 +1456,68 @@ struct UnlinkedTmpfs {
 /// snapshot without `Rc<UserNs>`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CachedCred {
-    pub(crate) fsuid: u32,
-    pub(crate) cap_effective: u64,
+    fsuid: u32,
+    cap_effective: u64,
+}
+
+impl CachedCred {
+    pub(crate) fn from_cred(cred: &Cred) -> Self {
+        Self {
+            fsuid: cred.fsuid,
+            cap_effective: cred.cap_effective,
+        }
+    }
+
+    #[inline]
+    fn has_cap(self, c: u32) -> bool {
+        self.cap_effective & (1 << c) != 0
+    }
+
+    /// Whether these initial-user-namespace credentials can bypass directory search checks
+    /// (`CAP_DAC_OVERRIDE` or `CAP_DAC_READ_SEARCH`), required for no-BKL [`Cached::access`].
+    #[inline]
+    pub(crate) fn searches_all(self) -> bool {
+        self.has_cap(cap::DAC_OVERRIDE) || self.has_cap(cap::DAC_READ_SEARCH)
+    }
+
+    /// DAC check matching [`Cred::permission`] in the initial user namespace (caller already
+    /// verified [`Self::searches_all`]). Returns `None` when an extended ACL or non-owner
+    /// group/other check requires the full BKL path.
+    fn check_dac(self, st: &Stat, amode: u32) -> Option<Result<(), Errno>> {
+        let has_override = self.has_cap(cap::DAC_OVERRIDE);
+        let has_read_search = self.has_cap(cap::DAC_READ_SEARCH);
+        if st.kind() == mode::S_IFDIR {
+            if has_override || (amode & MAY_WRITE == 0 && has_read_search) {
+                return Some(Ok(()));
+            }
+            return self.owner_dac(st, amode);
+        }
+        if has_override {
+            if amode & MAY_EXEC != 0 && st.mode & 0o111 == 0 {
+                return if st.access_acl.is_some() {
+                    None
+                } else {
+                    Some(Err(Errno::EACCES))
+                };
+            }
+            return Some(Ok(()));
+        }
+        if amode == MAY_READ {
+            return Some(Ok(()));
+        }
+        self.owner_dac(st, amode)
+    }
+
+    fn owner_dac(self, st: &Stat, amode: u32) -> Option<Result<(), Errno>> {
+        if self.fsuid != st.uid {
+            return None;
+        }
+        if amode & !(st.mode >> 6) & 7 != 0 {
+            Some(Err(Errno::EACCES))
+        } else {
+            Some(Ok(()))
+        }
+    }
 }
 
 /// What no-BKL path resolution needs (`syscall::fast`): the store's metadata cache and the mount
@@ -1523,6 +1576,7 @@ impl Cached {
         if buf.is_empty() {
             return Some(Err(Errno::EINVAL));
         }
+        // Empty path reads `dirfd` directly in `readlinkat(2)` rather than walking; fall back.
         if path.is_empty() {
             return None;
         }
@@ -1556,12 +1610,11 @@ impl Cached {
         if amode & !7 != 0 {
             return Some(Err(Errno::EINVAL));
         }
+        // Empty path (`AT_EMPTY_PATH`) operates on `dirfd` rather than walking; fall back.
         if path.is_empty() {
             return None;
         }
-        let has_override = cred.cap_effective & (1 << cap::DAC_OVERRIDE) != 0;
-        let has_read_search = cred.cap_effective & (1 << cap::DAC_READ_SEARCH) != 0;
-        if !has_override && !has_read_search {
+        if !cred.searches_all() {
             return None;
         }
         let r = self.meta.reader()?;
@@ -1581,33 +1634,8 @@ impl Cached {
         if amode & MAY_WRITE != 0 && st.flags & store::inode_flags::IMMUTABLE != 0 {
             return Some(Err(Errno::EPERM));
         }
-        // DAC check matching Cred::permission in the initial user namespace.
-        if st.kind() == mode::S_IFDIR {
-            let override_ok = has_override || (amode & MAY_WRITE == 0 && has_read_search);
-            if !override_ok {
-                if cred.fsuid == st.uid {
-                    if amode & !(st.mode >> 6) & 7 != 0 {
-                        return Some(Err(Errno::EACCES));
-                    }
-                } else {
-                    return None;
-                }
-            }
-        } else if has_override {
-            if amode & MAY_EXEC != 0 && st.mode & 0o111 == 0 {
-                if st.access_acl.is_some() {
-                    return None;
-                }
-                return Some(Err(Errno::EACCES));
-            }
-        } else if amode != MAY_READ {
-            if cred.fsuid == st.uid {
-                if amode & !(st.mode >> 6) & 7 != 0 {
-                    return Some(Err(Errno::EACCES));
-                }
-            } else {
-                return None;
-            }
+        if let Err(e) = cred.check_dac(st, amode)? {
+            return Some(Err(e));
         }
         // W_OK on a regular file, directory or symlink on a read-only mount/sb is EROFS (after DAC).
         let special = !matches!(st.kind(), mode::S_IFREG | mode::S_IFDIR | mode::S_IFLNK);
@@ -1698,8 +1726,8 @@ impl Cached {
     }
 }
 
-/// Path components [`Cached::walk`] has not handled yet (the result of [`components`] in
-/// reverse).
+/// Path components [`Cached::walk`] has not handled yet, stored in reverse order (next component
+/// on top).
 struct Pending<'p> {
     comps: [&'p [u8]; 64],
     len: usize,
@@ -1937,13 +1965,7 @@ impl Vfs {
                 crate::debug::log(format_args!("cannot mount /run: {e}"));
             }
         }
-        let cached = Cached {
-            meta: store.meta().clone(),
-            mounts: mounts.store_points(),
-            usable: mounts.fast_usable(),
-            root_readonly: mounts.root_readonly(),
-            root_noexec: mounts.root_noexec(),
-        };
+        let cached = mounts.cached(store.meta().clone());
         let sweep_bits = std::rc::Rc::new(std::cell::Cell::new(0));
         Ok(Vfs {
             store,
@@ -5248,22 +5270,15 @@ impl Vfs {
     /// Rebuilds the mount-point cache used by no-BKL path resolution without bumping any
     /// namespace's poll event counter.
     fn rebuild_cached(&self) {
-        let (points, usable, root_readonly, root_noexec, expiring) = {
+        let (next, expiring) = {
             let mounts = self.mounts.borrow();
             (
-                mounts.store_points(),
-                mounts.fast_usable(),
-                mounts.root_readonly(),
-                mounts.root_noexec(),
+                mounts.cached(self.store.meta().clone()),
                 mounts.list.iter().filter(|m| m.expiring).count(),
             )
         };
         self.expiring.set(expiring);
-        let mut cached = self.cached.borrow_mut();
-        cached.mounts = points;
-        cached.usable = usable;
-        cached.root_readonly = root_readonly;
-        cached.root_noexec = root_noexec;
+        *self.cached.borrow_mut() = next;
     }
 
     /// The mount table changed in namespaces `nss`: rebuilds the no-BKL path cache (the caller
@@ -8106,7 +8121,7 @@ pub(crate) mod tests {
         let root = Node::ROOT;
         let store = vfs.store();
 
-        // 1. Deep directory path (> WalkPending::INLINE = 32) exercises overflow spilling.
+        // 1. Deep directory path (> WALK_INLINE = 32) exercises overflow spilling.
         let mut parent = ROOT;
         let mut deep_path = Vec::new();
         for i in 0..40 {
@@ -8230,16 +8245,16 @@ pub(crate) mod tests {
         let root_cred = Cred::root();
         let store = vfs.store();
         let bin = store.lookup(ROOT, b"bin").unwrap().unwrap();
-        let (plain_ino, _) = store.create_file(bin, b"plain", 0o644, 0, 0).unwrap();
+        store.create_file(bin, b"plain", 0o644, 0, 0).unwrap();
         let (imm_ino, _) = store.create_file(bin, b"imm", 0o644, 0, 0).unwrap();
         store
             .set_flags(imm_ino, store::inode_flags::IMMUTABLE)
             .unwrap();
-        let (owned_ro, _) = store
+        store
             .create_file(bin, b"owned_ro", 0o400, 1000, 1000)
             .unwrap();
-        let (other_file, _) = store.create_file(bin, b"other", 0o660, 2000, 2000).unwrap();
-        let fifo_ino = store
+        store.create_file(bin, b"other", 0o660, 2000, 2000).unwrap();
+        store
             .mknod(bin, b"pipe", mode::S_IFIFO | 0o644, 0, 0, 0)
             .unwrap();
         store
@@ -8289,7 +8304,6 @@ pub(crate) mod tests {
             }
         }
         let _ = store.lookup(ROOT, b"no");
-        let _ = (plain_ino, fifo_ino, owned_ro, other_file);
 
         let cached = vfs.cached();
         let mut buf = [0u8; 64];
