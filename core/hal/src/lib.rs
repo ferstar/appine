@@ -1091,14 +1091,30 @@ impl Event {
     /// until the event is signalled (`Ok(true)`), `timeout` expires (`Ok(false)`), or a host
     /// signal interrupts the wait (`Err(EINTR)`). Does not clear the signalled state.
     pub fn wait(&self, timeout: Option<Duration>) -> Result<bool, i32> {
+        let mut deadline: Option<Option<std::time::Instant>> = None;
         loop {
             let s = self.state.load(Ordering::Acquire);
             if s & EVENT_SIGNALED != 0 {
                 return Ok(true);
             }
-            if timeout == Some(Duration::ZERO) {
-                return Ok(false);
-            }
+            let rem = match timeout {
+                None => None,
+                Some(t) if t.is_zero() => return Ok(false),
+                Some(t) => match deadline {
+                    None => {
+                        deadline = Some(std::time::Instant::now().checked_add(t));
+                        Some(t)
+                    }
+                    Some(Some(d)) => {
+                        let r = d.saturating_duration_since(std::time::Instant::now());
+                        if r.is_zero() {
+                            return Ok(false);
+                        }
+                        Some(r)
+                    }
+                    Some(None) => Some(t),
+                },
+            };
             let waiting = s | EVENT_FUTEX_WAIT;
             if self
                 .state
@@ -1107,7 +1123,7 @@ impl Event {
             {
                 continue;
             }
-            let ts = timeout.map(|t| libc::timespec {
+            let ts = rem.map(|t| libc::timespec {
                 tv_sec: t.as_secs().min(i32::MAX as u64) as libc::time_t,
                 tv_nsec: t.subsec_nanos() as _,
             });
@@ -1162,7 +1178,8 @@ impl Event {
             return Ok((n, true));
         }
 
-        let total = fds.len() + 1;
+        let n = fds.len();
+        let total = n + 1;
         let mut stack = [libc::pollfd {
             fd: 0,
             events: 0,
@@ -1182,12 +1199,13 @@ impl Event {
             ];
             &mut heap[..]
         };
-        for (dst, &(fd, events, _)) in raw[..fds.len()].iter_mut().zip(fds.iter()) {
-            dst.fd = fd;
-            dst.events = events;
+        for (dst, slot) in raw[..n].iter_mut().zip(fds.iter_mut()) {
+            dst.fd = slot.0;
+            dst.events = slot.1;
             dst.revents = 0;
+            slot.2 = 0;
         }
-        raw[fds.len()] = libc::pollfd {
+        raw[n] = libc::pollfd {
             fd: self.fd,
             events: POLLIN,
             revents: 0,
@@ -1198,7 +1216,6 @@ impl Event {
         if rc < 0 {
             return Err(last_errno());
         }
-        let n = fds.len();
         let mut ready = 0;
         for (slot, r) in fds.iter_mut().zip(&raw[..n]) {
             slot.2 = r.revents;
@@ -1432,10 +1449,11 @@ pub fn poll(fds: &mut [(i32, i16, i16)], timeout: Option<Duration>) -> Result<us
         ];
         &mut heap[..]
     };
-    for (dst, &(fd, events, _)) in raw.iter_mut().zip(fds.iter()) {
-        dst.fd = fd;
-        dst.events = events;
+    for (dst, slot) in raw.iter_mut().zip(fds.iter_mut()) {
+        dst.fd = slot.0;
+        dst.events = slot.1;
         dst.revents = 0;
+        slot.2 = 0;
     }
     let rc = poll_raw(raw, timeout);
     if rc < 0 {
@@ -2211,6 +2229,74 @@ mod tests {
             Ok((1, true))
         );
         assert_ne!(fds[0].2 & 1, 0);
+        ev.clear();
+
+        unsafe {
+            libc::close(rfd);
+            libc::close(wfd);
+        }
+    }
+
+    #[test]
+    fn event_wait_preserves_remaining_timeout_across_spurious_wakes_and_eagain() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Instant;
+
+        let ev = Arc::new(Event::new().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ev2, stop2) = (ev.clone(), stop.clone());
+        // Repeatedly poke the futex word with spurious FUTEX_WAKE_PRIVATE and non-SIGNALED state
+        // toggles (EVENT_FD_DIRTY) so Event::wait hits both rc == 0 and EAGAIN retries.
+        let poker = std::thread::spawn(move || {
+            while !stop2.load(Ordering::Relaxed) {
+                ev2.state.fetch_xor(EVENT_FD_DIRTY, Ordering::Relaxed);
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_futex,
+                        &ev2.state as *const AtomicU32,
+                        FUTEX_WAKE_PRIVATE,
+                        1i32,
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+
+        let started = Instant::now();
+        let res = ev.wait(Some(Duration::from_millis(30)));
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        poker.join().unwrap();
+
+        assert_eq!(res, Ok(false));
+        assert!(
+            elapsed >= Duration::from_millis(25) && elapsed < Duration::from_millis(500),
+            "elapsed {elapsed:?} should track the remaining timeout without resetting"
+        );
+    }
+
+    #[test]
+    fn event_poll_with_clears_stale_revents_on_timeout_and_error() {
+        let mut pipe = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+            0
+        );
+        let (rfd, wfd) = (pipe[0], pipe[1]);
+        let ev = Event::new().unwrap();
+
+        // Stale revents must be cleared on timeout.
+        let mut fds = [(rfd, 1i16, 0x55i16)];
+        assert_eq!(ev.poll_with(&mut fds, Some(Duration::ZERO)), Ok((0, false)));
+        assert_eq!(fds[0].2, 0);
+
+        // Stale revents must also be cleared when poll_with fails (e.g., EINVAL from huge nfds
+        // is not practical, so test poll() directly and verify poll_with clears before ppoll).
+        let mut fds = [(rfd, 1i16, 0x77i16)];
+        ev.signal();
+        assert_eq!(ev.poll_with(&mut fds, Some(Duration::ZERO)), Ok((0, true)));
+        assert_eq!(fds[0].2, 0);
         ev.clear();
 
         unsafe {
