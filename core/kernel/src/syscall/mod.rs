@@ -666,8 +666,10 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     };
     // Mappings were removed or permissions changed: other threads sharing the address space must
     // flush their TLBs first before the host memory can be freed
-    let sync = cx.task.sync.clone();
-    cx.mm_mut().sync(&sync);
+    if cx.mm().needs_sync() {
+        let sync = cx.task.sync.clone();
+        cx.mm_mut().sync(&sync);
+    }
     // PTRACE_SYSCALL: stop at exit, where the tracer sees the return value; a single-stepped svc is
     // reported here
     if exit_stop && !crate::ptrace::syscall_exit(cx, cpu) {

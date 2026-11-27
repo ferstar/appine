@@ -1877,6 +1877,16 @@ impl Mm {
         }
     }
 
+    /// Whether [`Mm::sync`] has pending TLB, code, code-group, memop, or graveyard work.
+    #[inline]
+    pub fn needs_sync(&self) -> bool {
+        self.dirty
+            || self.exec_changed
+            || self.memops_dirty
+            || !self.code_ranges.is_empty()
+            || !self.graveyard.is_empty()
+    }
+
     /// If mappings were torn down or lost permissions, does a TLB shootdown and then releases the
     /// unmapped host memory; when only code must be invalidated, it only records the ranges and
     /// bumps the generation.
@@ -1897,7 +1907,7 @@ impl Mm {
         }
         self.sync_memops();
         let dirty = std::mem::take(&mut self.dirty);
-        if !dirty && code.is_empty() {
+        if !dirty && code.is_empty() && self.graveyard.is_empty() {
             return;
         }
         // Record the ranges before bumping the generation: a user that reads the new generation
@@ -1919,10 +1929,12 @@ impl Mm {
             // (which calls quiesce) is for
             return;
         }
-        if dirty {
-            self.generation.fetch_add(1, Ordering::SeqCst);
-        }
-        self.quiesce_except(current);
+        // Always bump `generation` with SeqCst before checking `in_guest`: parked threads
+        // (`!in_guest`) are skipped without a sticky kick and are guaranteed to observe the bumped
+        // generation and flush their TLB on their next guest entry before touching any reclaimed
+        // graveyard backing.
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.shootdown_users(current);
         self.graveyard.clear();
     }
 
@@ -8210,6 +8222,43 @@ impl Mm {
         }
     }
 
+    /// Kicks only users currently running guest code (`in_guest == true`) and waits until each has
+    /// left, spinning briefly before yielding. Callers must have already bumped `self.generation`
+    /// with `SeqCst` so any user observed with `in_guest == false` is guaranteed to observe the
+    /// bumped generation and flush its TLB on its next guest entry. Unlike [`Mm::quiesce_except`],
+    /// parked threads (futex/epoll/BKL waiters) are not spuriously sticky-kicked.
+    fn shootdown_users(&self, current: Option<&Arc<TaskSync>>) {
+        let others = self
+            .users
+            .iter()
+            .filter(|u| current.is_none_or(|c| !Arc::ptr_eq(u, c)));
+        for u in others.clone() {
+            if u.in_guest.load(Ordering::SeqCst) {
+                // SAFETY: a thread unregisters from users (holding the BKL) before destroying its
+                // Cpu.
+                unsafe { u.kicker.kick() };
+            }
+        }
+        // Wait for every user found in guest code, including any that entered after the first pass
+        // (such a thread may spin on another thread waiting for the BKL held here, LTP shmctl05,
+        // so kick it on entry to the wait loop and after yielding).
+        for u in others {
+            let mut spins = 0u32;
+            while u.in_guest.load(Ordering::SeqCst) {
+                if spins == 0 || spins >= 64 {
+                    // SAFETY: as above.
+                    unsafe { u.kicker.kick() };
+                }
+                if spins < 64 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
+                spins = spins.saturating_add(1);
+            }
+        }
+    }
+
     /// The immediate shootdown after a page-table entry is re-pointed: bump the generation first so
     /// users flush their TLBs before re-entering guest code; kick those running guest code and wait
     /// for them to leave (the approach of [`Mm::sync`], but the caller uses that page right after).
@@ -8223,23 +8272,7 @@ impl Mm {
         // Pairs with the user's "mark, then read the generation": either it reads the new
         // generation, or this side sees it running
         self.generation.fetch_add(1, Ordering::SeqCst);
-        for u in &self.users {
-            if u.in_guest.load(Ordering::SeqCst) {
-                // SAFETY: a thread unregisters from users (holding the BKL) before destroying its
-                // Cpu
-                unsafe { u.kicker.kick() };
-            }
-        }
-        // Every user found in guest code is waited for, also one that entered after the kicks
-        // above (its TLB may predate the bump). Such a user was not kicked and may run guest code for as long as it likes, such as a
-        // spin on a thread that waits for the BKL held here (LTP shmctl05): kick it too
-        for u in &self.users {
-            while u.in_guest.load(Ordering::SeqCst) {
-                // SAFETY: as above
-                unsafe { u.kicker.kick() };
-                std::thread::yield_now();
-            }
-        }
+        self.shootdown_users(None);
     }
 
     /// The private anonymous VMA containing page `page`, and its start.
@@ -14678,5 +14711,91 @@ mod tests {
             .mremap(below, 2 * PAGE_SIZE, 3 * PAGE_SIZE, true, None)
             .unwrap();
         assert!(relocated + 3 * PAGE_SIZE <= mm.mmap_top);
+    }
+
+    #[test]
+    fn sync_except_skips_parked_threads_while_flushing_in_guest_threads() {
+        let mut mm = Mm::new();
+        let code_addr = 0x2000_0000u64;
+        let data_addr = 0x2001_0000u64;
+        mm.map_anonymous(code_addr, PAGE_SIZE, prot::READ | prot::EXEC)
+            .unwrap();
+        mm.map_anonymous(data_addr, PAGE_SIZE, RW).unwrap();
+        // `svc #0` (0xd400_0001) so an unkicked cpu exits with Svc instead of Kick.
+        mm.write_kernel(code_addr, &0xd400_0001u32.to_le_bytes())
+            .unwrap();
+
+        let current_cpu = unsafe { appine_engine::Cpu::new(mm.mmu()) };
+        let mut parked_cpu = unsafe { appine_engine::Cpu::new(mm.mmu()) };
+        let mut active_cpu = unsafe { appine_engine::Cpu::new(mm.mmu()) };
+        parked_cpu.state_mut().pc = code_addr;
+        active_cpu.state_mut().pc = code_addr;
+
+        let make_sync = |cpu: &appine_engine::Cpu, in_guest: bool| {
+            Arc::new(TaskSync {
+                in_guest: std::sync::atomic::AtomicBool::new(in_guest),
+                kicker: cpu.kicker(),
+                entry: crate::task::KernelEntry::default(),
+            })
+        };
+        let current = make_sync(&current_cpu, false);
+        let parked = make_sync(&parked_cpu, false);
+        let active = make_sync(&active_cpu, true);
+        mm.add_user(current.clone());
+        mm.add_user(parked.clone());
+        mm.add_user(active.clone());
+
+        // Drain initial exec_changed from map_anonymous(RX).
+        assert!(mm.needs_sync());
+        mm.sync(&current);
+        assert!(!mm.needs_sync());
+
+        // munmap marks dirty + graveyard; sync must bump generation, kick only the in_guest thread
+        // and wait for it to leave before clearing the graveyard, while leaving parked unkicked.
+        mm.munmap(data_addr, PAGE_SIZE).unwrap();
+        assert!(mm.needs_sync());
+        assert!(!mm.graveyard.is_empty());
+        let region_weak = Arc::downgrade(&mm.graveyard[0]);
+        let gen_before = mm.generations().tlb.load(Ordering::SeqCst);
+
+        // Background thread simulates the active guest thread leaving guest mode after seeing
+        // `generation` advance; until it leaves, the graveyard region must still be alive.
+        let active_bg = active.clone();
+        let region_bg = region_weak.clone();
+        let tlb_gen = mm.generations().tlb;
+        let observed_alive_before_exit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_bg = observed_alive_before_exit.clone();
+        let handle = std::thread::spawn(move || {
+            while tlb_gen.load(Ordering::SeqCst) == gen_before {
+                std::hint::spin_loop();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            observed_bg.store(region_bg.strong_count() >= 1, Ordering::SeqCst);
+            active_bg.in_guest.store(false, Ordering::SeqCst);
+        });
+
+        mm.sync(&current);
+        handle.join().unwrap();
+
+        assert!(observed_alive_before_exit.load(Ordering::SeqCst));
+        assert!(!mm.needs_sync());
+        assert!(mm.graveyard.is_empty());
+        assert_eq!(region_weak.strong_count(), 0);
+        assert_eq!(mm.generations().tlb.load(Ordering::SeqCst), gen_before + 1);
+
+        // Active thread was kicked -> its next run returns Kick immediately.
+        assert!(matches!(active_cpu.run(), appine_engine::Exit::Kick));
+        // Parked thread was NOT kicked -> its next run executes `svc #0` rather than Kick.
+        assert!(matches!(parked_cpu.run(), appine_engine::Exit::Svc { .. }));
+
+        // By contrast, `quiesce` (used by fork and membarrier) MUST still sticky-kick parked
+        // threads so they stop before re-entering guest code.
+        parked_cpu.state_mut().pc = code_addr;
+        mm.quiesce(&current);
+        assert!(matches!(parked_cpu.run(), appine_engine::Exit::Kick));
+
+        mm.remove_user(&active);
+        mm.remove_user(&parked);
+        mm.remove_user(&current);
     }
 }
