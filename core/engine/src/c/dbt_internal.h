@@ -315,6 +315,9 @@ struct appine_dbt {
     uint32_t *memop_memmove;
     uint32_t *memop_memcmp;
     uint32_t *memop_memchr;
+    uint32_t *memop_strlen;
+    uint32_t *memop_strcmp;
+    uint32_t *memop_strncmp;
     struct table *table; /* read with __atomic_load_n when not holding the lock */
     uint32_t *table_used; /* slots used, in insertion order, at most TABLE_LIMIT of them */
     size_t table_count;
@@ -501,7 +504,12 @@ enum {
     TO_MEMOP_MEMCHR,
     TO_LOAD_FP,
     TO_RET_MISS,
+    TO_MEMOP_STRLEN,
+    TO_MEMOP_STRCMP,
+    TO_MEMOP_STRNCMP,
+    TO_COUNT,
 };
+_Static_assert(TO_COUNT <= 16, "TO_* routine relocation tags must fit in 4 bits");
 
 /* The most bytes and the most accesses one group of accesses sharing a check may cover, and the
  * most groups at once (plan_group). GROUP_SPAN <= 4096 fits in the 12-bit refill byte count. */
@@ -653,6 +661,12 @@ static inline uint32_t *routine(const struct appine_dbt *d, unsigned to)
         return d->memop_memcmp;
     case TO_MEMOP_MEMCHR:
         return d->memop_memchr;
+    case TO_MEMOP_STRLEN:
+        return d->memop_strlen;
+    case TO_MEMOP_STRCMP:
+        return d->memop_strcmp;
+    case TO_MEMOP_STRNCMP:
+        return d->memop_strncmp;
     case TO_LOAD_FP:
         return d->load_fp;
     case TO_RET_MISS:

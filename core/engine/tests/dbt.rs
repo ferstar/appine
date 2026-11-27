@@ -8,8 +8,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use appine_engine::{
     Access, Cpu, Dbt, DbtMemop, DbtRegs, DbtSource, DbtSpace, Exit, FaultKind, MEMOP_MEMCHR,
-    MEMOP_MEMCMP, MEMOP_MEMCPY, MEMOP_MEMMOVE, MEMOP_MEMSET, MEMOP_STRNCMP, Mmu, PAGE_SIZE,
-    WATCH_LOAD, WATCH_STORE, prot,
+    MEMOP_MEMCMP, MEMOP_MEMCPY, MEMOP_MEMMOVE, MEMOP_MEMSET, MEMOP_STRCMP, MEMOP_STRLEN,
+    MEMOP_STRNCMP, Mmu, PAGE_SIZE, WATCH_LOAD, WATCH_STORE, prot,
 };
 
 /// Serializes tests that rely on keyed [`DbtSpace`] instances staying in the process-wide pool
@@ -7141,5 +7141,1598 @@ fn inlined_sysregs_dit_fpsr_and_128bit_exclusives_match_tier0() {
                 "reserved encoding {bad:#x} must remain UNDEF ({regs:?})"
             );
         }
+    }
+}
+
+#[test]
+fn memops_superpage_stlb_in_cache_and_fallbacks() {
+    const SUPER: u64 = PAGE_SIZE << 9; // 2 MiB
+    const RW: u32 = prot::READ | prot::WRITE;
+
+    struct SuperBuf {
+        _backing: Vec<u8>,
+        alt_host: NonNull<u8>,
+        super_host: NonNull<u8>,
+    }
+
+    impl SuperBuf {
+        fn new(super_bytes: usize) -> Self {
+            // Offset `super_host` by +4 KiB so it is 4 KiB-aligned but not necessarily
+            // 2 MiB-aligned, matching `superpage_refill_prefill_fast_loops_demotion_and_memops`.
+            let mut backing = vec![0u8; super_bytes + 2 * PAGE_SIZE as usize + 4096];
+            let align_off = (4096 - (backing.as_ptr() as usize & 4095)) & 4095;
+            let base_ptr = unsafe { backing.as_mut_ptr().add(align_off) };
+            let alt_host = unsafe { NonNull::new_unchecked(base_ptr) };
+            let super_host = unsafe { NonNull::new_unchecked(base_ptr.add(PAGE_SIZE as usize)) };
+            Self {
+                _backing: backing,
+                alt_host,
+                super_host,
+            }
+        }
+
+        fn slice(&self, off: usize, len: usize) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.super_host.as_ptr().add(off), len) }
+        }
+
+        fn slice_mut(&mut self, off: usize, len: usize) -> &mut [u8] {
+            unsafe { std::slice::from_raw_parts_mut(self.super_host.as_ptr().add(off), len) }
+        }
+
+        fn alt(&self, off: usize, len: usize) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.alt_host.as_ptr().add(off), len) }
+        }
+
+        fn alt_mut(&mut self, off: usize, len: usize) -> &mut [u8] {
+            unsafe { std::slice::from_raw_parts_mut(self.alt_host.as_ptr().add(off), len) }
+        }
+    }
+
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let Some(space) = DbtSpace::new(0, regs) else {
+            return;
+        };
+
+        // Allocate backing before `g` so `g.mmu` is dropped before the host buffer.
+        let mut buf = SuperBuf::new((2 * SUPER) as usize);
+        let buf_va = 0x2000_0000u64; // 2 MiB-aligned, 4 MiB total (two superpages)
+
+        let mut dbt = Dbt::attach(&space, 0).unwrap();
+        let mut g = Guest::new();
+        unsafe {
+            g.mmu.map(buf_va, buf.super_host, 2 * SUPER, RW).unwrap();
+        }
+
+        let warm_rw_fn = CODE + 0x20;
+        g.code(
+            warm_rw_fn,
+            &[
+                0xf900_0001, // str x1, [x0]
+                0xf940_0043, // ldr x3, [x2]
+                SVC,
+            ],
+        );
+        let warm_rw = |g: &mut Guest, dbt: &mut Dbt, addr: u64| {
+            let s = g.cpu.state_mut();
+            s.x[0] = addr;
+            s.x[1] = 0;
+            s.x[2] = addr;
+            g.run_at(dbt, warm_rw_fn);
+        };
+
+        let f_memset = CODE + 0x100;
+        let f_memcpy = CODE + 0x120;
+        let f_memmove = CODE + 0x140;
+        let f_memcmp = CODE + 0x160;
+        let f_memchr = CODE + 0x180;
+        let f_strlen = CODE + 0x1a0;
+        let f_strcmp = CODE + 0x1c0;
+        let f_strncmp = CODE + 0x1e0;
+        for pc in [
+            f_memset, f_memcpy, f_memmove, f_memcmp, f_memchr, f_strlen, f_strcmp,
+        ] {
+            g.code(pc, &[movz_x0(0x7777), RET]);
+        }
+        // strncmp guest stub: return 0 for n == 0, sentinel 0x7777 for n != 0.
+        g.code(
+            f_strncmp,
+            &[
+                0xb400_0062, // cbz x2, +12
+                movz_x0(0x7777),
+                RET,
+                movz_x0(0),
+                RET,
+            ],
+        );
+        space.set_memops(&[
+            DbtMemop {
+                pc: f_memset,
+                kind: MEMOP_MEMSET,
+                reserved: 0,
+            },
+            DbtMemop {
+                pc: f_memcpy,
+                kind: MEMOP_MEMCPY,
+                reserved: 0,
+            },
+            DbtMemop {
+                pc: f_memmove,
+                kind: MEMOP_MEMMOVE,
+                reserved: 0,
+            },
+            DbtMemop {
+                pc: f_memcmp,
+                kind: MEMOP_MEMCMP,
+                reserved: 0,
+            },
+            DbtMemop {
+                pc: f_memchr,
+                kind: MEMOP_MEMCHR,
+                reserved: 0,
+            },
+            DbtMemop {
+                pc: f_strlen,
+                kind: MEMOP_STRLEN,
+                reserved: 0,
+            },
+            DbtMemop {
+                pc: f_strcmp,
+                kind: MEMOP_STRCMP,
+                reserved: 0,
+            },
+            DbtMemop {
+                pc: f_strncmp,
+                kind: MEMOP_STRNCMP,
+                reserved: 0,
+            },
+        ]);
+
+        let caller = CODE + 0x40;
+        g.code(caller, &[0xd63f_0120, SVC]); // blr x9; svc #0
+        let call_checked =
+            |g: &mut Guest, dbt: &mut Dbt, target: u64, x0: u64, x1: u64, x2: u64| -> (u64, u64) {
+                let before_interp = dbt.stats().exits_interp;
+                let s = g.cpu.state_mut();
+                s.x[9] = target;
+                s.x[0] = x0;
+                s.x[1] = x1;
+                s.x[2] = x2;
+                for r in 3..=29 {
+                    if r != 9 {
+                        s.x[r] = 0x1111_0000_0000_0000 + r as u64;
+                    }
+                }
+                s.nzcv = 0xa000_0000;
+                let ret = g.run_at(dbt, caller);
+                let s = g.cpu.state();
+                assert_eq!(s.x[1], x1, "x1 clobbered for {regs:?}");
+                assert_eq!(s.x[2], x2, "x2 clobbered for {regs:?}");
+                for r in 3..=29 {
+                    if r != 9 {
+                        assert_eq!(
+                            s.x[r],
+                            0x1111_0000_0000_0000 + r as u64,
+                            "x{r} clobbered for {regs:?}"
+                        );
+                    }
+                }
+                assert_eq!(s.nzcv, 0xa000_0000, "NZCV clobbered for {regs:?}");
+                (ret, dbt.stats().exits_interp - before_interp)
+            };
+
+        // 1. Warm cpu->stlb for superpage 0 only (touching page 0 leaves pages 15..64 cold in 4 KiB
+        //    tlb, forcing every cross-4 KiB memop below onto the 2 MiB stlb fast path).
+        warm_rw(&mut g, &mut dbt, buf_va);
+
+        let off_a = 16 * 4096 - 19; // starts 19 B before 4 KiB boundary
+        let off_b = 48 * 4096 - 19;
+        let va_a = buf_va + off_a as u64;
+        let va_b = buf_va + off_b as u64;
+
+        // Note: len = 64 (< 128) proves the 2 MiB stlb in-cache path ran instead of falling back
+        // to the guest stub (0x7777). Copy/fill ops (`memset`/`memcpy`/`memmove`) stay in-cache
+        // via `stlb` up to 4 KiB (handing 8192/16384 to `exec_memop`), while compare/scan ops
+        // (`memcmp`/`memchr`/`strlen`/`strcmp`/`strncmp`) stay in-cache up to 64 KiB.
+        for &len in &[64usize, 512, 4096, 8192, 16384] {
+            // MEMOP_MEMSET
+            buf.slice_mut(off_a - 16, len + 32).fill(0x55);
+            let (ret, interps) = call_checked(&mut g, &mut dbt, f_memset, va_a, 0x1ab, len as u64);
+            assert_eq!(ret, va_a, "stlb memset({len}) ({regs:?})");
+            assert_eq!(interps, 0, "stlb memset({len}) exits_interp ({regs:?})");
+            assert!(buf.slice(off_a - 16, 16).iter().all(|&b| b == 0x55));
+            assert!(buf.slice(off_a, len).iter().all(|&b| b == 0xab));
+            assert!(buf.slice(off_a + len, 16).iter().all(|&b| b == 0x55));
+
+            // MEMOP_MEMCPY & non-overlapping MEMOP_MEMMOVE
+            let pat: Vec<u8> = (0..len).map(|i| ((i * 73 + 19) & 0xff) as u8).collect();
+            for (name, target) in [("memcpy", f_memcpy), ("memmove", f_memmove)] {
+                buf.slice_mut(off_b, len).copy_from_slice(&pat);
+                buf.slice_mut(off_a - 16, len + 32).fill(0xee);
+                let (ret, interps) = call_checked(&mut g, &mut dbt, target, va_a, va_b, len as u64);
+                assert_eq!(ret, va_a, "stlb {name}({len}) ({regs:?})");
+                assert_eq!(interps, 0, "stlb {name}({len}) exits_interp ({regs:?})");
+                assert!(buf.slice(off_a - 16, 16).iter().all(|&b| b == 0xee));
+                assert_eq!(buf.slice(off_a, len), &pat[..]);
+                assert!(buf.slice(off_a + len, 16).iter().all(|&b| b == 0xee));
+            }
+
+            // MEMOP_MEMCMP (equal and differing past the 4 KiB page boundary)
+            buf.slice_mut(off_a, len).copy_from_slice(&pat);
+            buf.slice_mut(off_b, len).copy_from_slice(&pat);
+            assert_eq!(
+                call_checked(&mut g, &mut dbt, f_memcmp, va_a, va_b, len as u64),
+                (0, 0),
+                "stlb memcmp eq({len}) ({regs:?})"
+            );
+            for pos in [32usize, len - 1] {
+                buf.slice_mut(off_a, len)[pos] = 0xff;
+                buf.slice_mut(off_b, len)[pos] = 0x00;
+                let (res, interps) =
+                    call_checked(&mut g, &mut dbt, f_memcmp, va_a, va_b, len as u64);
+                assert_eq!(interps, 0);
+                assert_eq!(
+                    res as i32, 255,
+                    "stlb memcmp +diff len={len} pos={pos} ({regs:?})"
+                );
+                let (res, interps) =
+                    call_checked(&mut g, &mut dbt, f_memcmp, va_b, va_a, len as u64);
+                assert_eq!(interps, 0);
+                assert_eq!(
+                    res as i32, -255,
+                    "stlb memcmp -diff len={len} pos={pos} ({regs:?})"
+                );
+                buf.slice_mut(off_a, len)[pos] = pat[pos];
+                buf.slice_mut(off_b, len)[pos] = pat[pos];
+            }
+
+            // MEMOP_MEMCHR (miss and hit past the 4 KiB boundary, including SIZE_MAX)
+            buf.slice_mut(off_a, len + 32).fill(b'a');
+            assert_eq!(
+                call_checked(&mut g, &mut dbt, f_memchr, va_a, b'Z' as u64, len as u64),
+                (0, 0),
+                "stlb memchr miss({len}) ({regs:?})"
+            );
+            buf.slice_mut(off_a, len)[len - 1] = b'Z';
+            assert_eq!(
+                call_checked(&mut g, &mut dbt, f_memchr, va_a, b'Z' as u64, len as u64),
+                (va_a + (len - 1) as u64, 0),
+                "stlb memchr hit({len}) ({regs:?})"
+            );
+            assert_eq!(
+                call_checked(&mut g, &mut dbt, f_memchr, va_a, b'Z' as u64, u64::MAX),
+                (va_a + (len - 1) as u64, 0),
+                "stlb memchr SIZE_MAX hit({len}) ({regs:?})"
+            );
+
+            // MEMOP_STRLEN, MEMOP_STRCMP, MEMOP_STRNCMP crossing 4 KiB boundaries
+            let str_pat: Vec<u8> = (0..len).map(|i| ((i % 251) + 1) as u8).collect();
+            buf.slice_mut(off_a, len).copy_from_slice(&str_pat);
+            buf.slice_mut(off_a + len, 2).copy_from_slice(&[0, 0x11]);
+            buf.slice_mut(off_b, len).copy_from_slice(&str_pat);
+            buf.slice_mut(off_b + len, 2).copy_from_slice(&[0, 0x22]);
+
+            assert_eq!(
+                call_checked(&mut g, &mut dbt, f_strlen, va_a, 0xdead, 0xbeef),
+                (len as u64, 0),
+                "stlb strlen({len}) ({regs:?})"
+            );
+            assert_eq!(
+                call_checked(&mut g, &mut dbt, f_strcmp, va_a, va_b, 0xbeef),
+                (0, 0),
+                "stlb strcmp eq({len}) ({regs:?})"
+            );
+            for n in [len as u64, (len + 64) as u64, u64::MAX] {
+                assert_eq!(
+                    call_checked(&mut g, &mut dbt, f_strncmp, va_a, va_b, n),
+                    (0, 0),
+                    "stlb strncmp eq({len}, n={n}) ({regs:?})"
+                );
+            }
+            // Differ past the 4 KiB boundary at len - 1
+            buf.slice_mut(off_a, len)[len - 1] = 0xfe;
+            buf.slice_mut(off_b, len)[len - 1] = 0x02;
+            let (res, interps) = call_checked(&mut g, &mut dbt, f_strcmp, va_a, va_b, 0xbeef);
+            assert_eq!(interps, 0);
+            assert_eq!(
+                res as i32,
+                0xfe - 0x02,
+                "stlb strcmp +diff({len}) ({regs:?})"
+            );
+            let (res, interps) = call_checked(&mut g, &mut dbt, f_strcmp, va_b, va_a, 0xbeef);
+            assert_eq!(interps, 0);
+            assert_eq!(
+                res as i32,
+                0x02 - 0xfe,
+                "stlb strcmp -diff({len}) ({regs:?})"
+            );
+            assert_eq!(
+                call_checked(&mut g, &mut dbt, f_strncmp, va_a, va_b, (len - 1) as u64),
+                (0, 0),
+                "stlb strncmp diff after n({len}) ({regs:?})"
+            );
+            for n in [len as u64, u64::MAX] {
+                let (res, interps) = call_checked(&mut g, &mut dbt, f_strncmp, va_a, va_b, n);
+                assert_eq!(interps, 0);
+                assert_eq!(
+                    res as i32,
+                    0xfe - 0x02,
+                    "stlb strncmp +diff({len}, n={n}) ({regs:?})"
+                );
+                let (res, interps) = call_checked(&mut g, &mut dbt, f_strncmp, va_b, va_a, n);
+                assert_eq!(interps, 0);
+                assert_eq!(
+                    res as i32,
+                    0x02 - 0xfe,
+                    "stlb strncmp -diff({len}, n={n}) ({regs:?})"
+                );
+            }
+        }
+
+        // 2. CRITICAL regression: overlapping MEMOP_MEMMOVE inside one 2 MiB superpage, covering
+        //    both cross-4K in-cache `stlb` overlap up to the 4 KiB cap (`(2048, 4096)`,
+        //    `(37, 4096)`, `(19, 64)`) and `> 4 KiB` `exec_memop` overlap (`4096 <= dst - src < n`),
+        //    plus forward overlap and `dst == src`.
+        for &(shift, len) in &[
+            (2048usize, 4096usize),
+            (37, 4096),
+            (4096, 8192),
+            (4096 + 37, 16384),
+            (8191, 8192),
+            (37, 8192),
+            (19, 64),
+        ] {
+            let span = shift + len;
+            let init: Vec<u8> = (0..span).map(|i| ((i * 37 + 11) & 0xff) as u8).collect();
+
+            // Backward overlap: dst = src + shift (host_dst > host_src, 0 < shift < len)
+            buf.slice_mut(off_a - 16, span + 32).fill(0xcc);
+            buf.slice_mut(off_a, span).copy_from_slice(&init);
+            let mut expected = init.clone();
+            expected.copy_within(0..len, shift);
+            let (ret, interps) = call_checked(
+                &mut g,
+                &mut dbt,
+                f_memmove,
+                va_a + shift as u64,
+                va_a,
+                len as u64,
+            );
+            assert_eq!(
+                ret,
+                va_a + shift as u64,
+                "stlb bwd overlap shift={shift} len={len} ({regs:?})"
+            );
+            assert_eq!(interps, 0);
+            assert!(buf.slice(off_a - 16, 16).iter().all(|&b| b == 0xcc));
+            assert_eq!(
+                buf.slice(off_a, span),
+                &expected[..],
+                "stlb bwd overlap corrupted shift={shift} len={len} ({regs:?})"
+            );
+            assert!(buf.slice(off_a + span, 16).iter().all(|&b| b == 0xcc));
+
+            // Forward overlap: dst < src (src - dst == shift)
+            buf.slice_mut(off_a - 16, span + 32).fill(0xcc);
+            buf.slice_mut(off_a, span).copy_from_slice(&init);
+            let mut expected = init.clone();
+            expected.copy_within(shift..shift + len, 0);
+            let (ret, interps) = call_checked(
+                &mut g,
+                &mut dbt,
+                f_memmove,
+                va_a,
+                va_a + shift as u64,
+                len as u64,
+            );
+            assert_eq!(
+                ret, va_a,
+                "stlb fwd overlap shift={shift} len={len} ({regs:?})"
+            );
+            assert_eq!(interps, 0);
+            assert!(buf.slice(off_a - 16, 16).iter().all(|&b| b == 0xcc));
+            assert_eq!(
+                buf.slice(off_a, span),
+                &expected[..],
+                "stlb fwd overlap corrupted shift={shift} len={len} ({regs:?})"
+            );
+            assert!(buf.slice(off_a + span, 16).iter().all(|&b| b == 0xcc));
+        }
+        // dst == src across 4 KiB page boundaries inside superpage 0
+        for &len in &[64usize, 8192] {
+            let init: Vec<u8> = (0..len).map(|i| ((i * 53 + 7) & 0xff) as u8).collect();
+            buf.slice_mut(off_a, len).copy_from_slice(&init);
+            assert_eq!(
+                call_checked(&mut g, &mut dbt, f_memmove, va_a, va_a, len as u64),
+                (va_a, 0),
+                "stlb dst==src len={len} ({regs:?})"
+            );
+            assert_eq!(buf.slice(off_a, len), &init[..]);
+        }
+
+        // 3. Fallback when crossing a 2 MiB superpage boundary (even with BOTH superpages warm in
+        //    stlb): n = 64 (< 128) must fall back to the guest stub (0x7777), while n = 256 and
+        //    strlen/strcmp fall back cleanly to exec_memop with exact results.
+        warm_rw(&mut g, &mut dbt, buf_va + SUPER);
+        let cross_off = SUPER as usize - 19;
+        let cross_va = buf_va + cross_off as u64;
+        buf.slice_mut(cross_off, 256).fill(b'm');
+        buf.slice_mut(off_b, 256).fill(b'm');
+        buf.slice_mut(cross_off, 256)[40] = b'Z';
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_memset, cross_va, 0x99, 64).0,
+            0x7777,
+            "2 MiB crossing memset(64) must not use stlb ({regs:?})"
+        );
+        assert_eq!(buf.slice(cross_off, 1)[0], b'm');
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_memcpy, cross_va, va_b, 64).0,
+            0x7777
+        );
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_memmove, cross_va, va_b, 64).0,
+            0x7777
+        );
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_memcmp, cross_va, va_b, 64).0,
+            0x7777
+        );
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_memchr, cross_va, b'Z' as u64, 64).0,
+            0x7777
+        );
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_strncmp, cross_va, va_b, 64).0,
+            0x7777
+        );
+
+        // n = 256 and strlen/strcmp crossing 2 MiB boundary succeed via exec_memop.
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_memset, cross_va, 0x6b, 256),
+            (cross_va, 0)
+        );
+        assert!(buf.slice(cross_off, 256).iter().all(|&b| b == 0x6b));
+        let pat256: Vec<u8> = (0..256).map(|i| ((i * 17 + 5) & 0xff) as u8).collect();
+        buf.slice_mut(off_b, 256).copy_from_slice(&pat256);
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_memcpy, cross_va, va_b, 256),
+            (cross_va, 0)
+        );
+        assert_eq!(buf.slice(cross_off, 256), &pat256[..]);
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_memcmp, cross_va, va_b, 256),
+            (0, 0)
+        );
+        // Backward overlapping memmove across 2 MiB boundary
+        buf.slice_mut(cross_off + 256, 32).fill(0);
+        let (ret, interps) =
+            call_checked(&mut g, &mut dbt, f_memmove, cross_va + 32, cross_va, 256);
+        assert_eq!((ret, interps), (cross_va + 32, 0));
+        assert_eq!(buf.slice(cross_off + 32, 256), &pat256[..]);
+        // memchr, strlen, strcmp, strncmp across 2 MiB boundary
+        buf.slice_mut(cross_off, 256).fill(b'q');
+        buf.slice_mut(off_b, 256).fill(b'q');
+        buf.slice_mut(cross_off, 256)[100] = 0;
+        buf.slice_mut(off_b, 256)[100] = 0;
+        buf.slice_mut(cross_off, 256)[70] = b'W';
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_memchr, cross_va, b'W' as u64, 256),
+            (cross_va + 70, 0)
+        );
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_strlen, cross_va, 0, 0),
+            (100, 0)
+        );
+        buf.slice_mut(off_b, 256)[70] = b'W';
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_strcmp, cross_va, va_b, 0),
+            (0, 0)
+        );
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_strncmp, cross_va, va_b, 256),
+            (0, 0)
+        );
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_strncmp, cross_va, va_b, u64::MAX),
+            (0, 0)
+        );
+        buf.slice_mut(cross_off, 256)[70] = 0x80;
+        buf.slice_mut(off_b, 256)[70] = 0x7f;
+        let (res, interps) = call_checked(&mut g, &mut dbt, f_strcmp, cross_va, va_b, 0);
+        assert_eq!(interps, 0);
+        assert_ne!(res, 0x7777);
+        assert!((res as i32) > 0, "2 MiB cross strcmp sign ({regs:?})");
+        let (res, interps) = call_checked(&mut g, &mut dbt, f_strncmp, cross_va, va_b, u64::MAX);
+        assert_eq!(interps, 0);
+        assert_ne!(res, 0x7777);
+        assert!((res as i32) > 0, "2 MiB cross strncmp sign ({regs:?})");
+
+        // 4. Fallback when n exceeds the in-cache caps (4 KiB for copy/fill, 64 KiB for
+        //    compare/scan; 256 KiB exceeds both) inside superpage 0.
+        let big_len = 256 * 1024usize;
+        let big_a = 0x1_0000usize;
+        let big_b = 0x8_0000usize;
+        let big_va_a = buf_va + big_a as u64;
+        let big_va_b = buf_va + big_b as u64;
+        buf.slice_mut(big_a - 16, 16).fill(0x21);
+        buf.slice_mut(big_a + big_len, 16).fill(0x21);
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_memset, big_va_a, 0x3d, big_len as u64),
+            (big_va_a, 0)
+        );
+        assert!(buf.slice(big_a - 16, 16).iter().all(|&b| b == 0x21));
+        assert!(buf.slice(big_a, big_len).iter().all(|&b| b == 0x3d));
+        assert!(buf.slice(big_a + big_len, 16).iter().all(|&b| b == 0x21));
+
+        for (i, b) in buf.slice_mut(big_b, big_len).iter_mut().enumerate() {
+            *b = ((i * 29 + 1) % 251 + 1) as u8;
+        }
+        assert_eq!(
+            call_checked(
+                &mut g,
+                &mut dbt,
+                f_memcpy,
+                big_va_a,
+                big_va_b,
+                big_len as u64
+            ),
+            (big_va_a, 0)
+        );
+        assert_eq!(buf.slice(big_a, big_len), buf.slice(big_b, big_len));
+        assert_eq!(
+            call_checked(
+                &mut g,
+                &mut dbt,
+                f_memcmp,
+                big_va_a,
+                big_va_b,
+                big_len as u64
+            ),
+            (0, 0)
+        );
+        // Backward overlapping memmove > 64 KiB
+        let big_expected = buf.slice(big_a, big_len).to_vec();
+        assert_eq!(
+            call_checked(
+                &mut g,
+                &mut dbt,
+                f_memmove,
+                big_va_a + 8192,
+                big_va_a,
+                big_len as u64
+            ),
+            (big_va_a + 8192, 0)
+        );
+        assert_eq!(buf.slice(big_a + 8192, big_len), &big_expected[..]);
+
+        // memchr, strlen, strcmp, strncmp > 64 KiB
+        let str_big = 128 * 1024usize;
+        buf.slice_mut(big_a, str_big).fill(b'k');
+        buf.slice_mut(big_b, str_big).fill(b'k');
+        buf.slice_mut(big_a + str_big, 1)[0] = 0;
+        buf.slice_mut(big_b + str_big, 1)[0] = 0;
+        buf.slice_mut(big_a + str_big - 7, 1)[0] = b'!';
+        assert_eq!(
+            call_checked(
+                &mut g,
+                &mut dbt,
+                f_memchr,
+                big_va_a,
+                b'!' as u64,
+                big_len as u64
+            ),
+            (big_va_a + (str_big - 7) as u64, 0)
+        );
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_strlen, big_va_a, 0, 0),
+            (str_big as u64, 0)
+        );
+        buf.slice_mut(big_b + str_big - 7, 1)[0] = b'!';
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_strcmp, big_va_a, big_va_b, 0),
+            (0, 0)
+        );
+        assert_eq!(
+            call_checked(
+                &mut g,
+                &mut dbt,
+                f_strncmp,
+                big_va_a,
+                big_va_b,
+                big_len as u64
+            ),
+            (0, 0)
+        );
+
+        // 5. MEMOP_STRNCMP warms tlb/stlb on exec_memop and stays in-cache (exits_interp == 0) on
+        //    subsequent short calls including n < 128 cross-4K, n = 256, and n = u64::MAX.
+        g.cpu.tlb_flush();
+        let s1_a_off = SUPER as usize + 0x100;
+        let s1_b_off = SUPER as usize + 0x200;
+        let s1_a = buf_va + s1_a_off as u64;
+        let s1_b = buf_va + s1_b_off as u64;
+        buf.slice_mut(s1_a_off, 13)
+            .copy_from_slice(b"hello_world!\0");
+        buf.slice_mut(s1_b_off, 13)
+            .copy_from_slice(b"hello_world!\0");
+        let s1_c_off = SUPER as usize + 5 * 4096 - 8;
+        let s1_d_off = SUPER as usize + 8 * 4096 - 8;
+        let s1_c = buf_va + s1_c_off as u64;
+        let s1_d = buf_va + s1_d_off as u64;
+        buf.slice_mut(s1_c_off, 33).fill(b'r');
+        buf.slice_mut(s1_d_off, 33).fill(b'r');
+        buf.slice_mut(s1_c_off + 20, 1)[0] = b'X';
+        buf.slice_mut(s1_d_off + 20, 1)[0] = b'Y';
+        buf.slice_mut(s1_c_off + 32, 1)[0] = 0;
+        buf.slice_mut(s1_d_off + 32, 1)[0] = 0;
+
+        // Cold superpage 1: exec_memop runs and warms both tlb and stlb.
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_strncmp, s1_a, s1_b, 256),
+            (0, 0),
+            "cold superpage strncmp(256) ({regs:?})"
+        );
+        // Immediately call cross-4K strncmp with n = 64 (< 128!): MUST stay in-cache via the stlb
+        // entry warmed by the previous call (returning 'X' - 'Y' = -1, NOT guest stub 0x7777!).
+        let (res, interps) = call_checked(&mut g, &mut dbt, f_strncmp, s1_c, s1_d, 64);
+        assert_eq!(interps, 0);
+        assert_eq!(
+            res as i32,
+            b'X' as i32 - b'Y' as i32,
+            "strncmp exec_memop must warm stlb for subsequent cross-4K n=64 call ({regs:?})"
+        );
+        // Subsequent short-string calls with n = 256 and n = u64::MAX stay in-cache.
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_strncmp, s1_a, s1_b, 256),
+            (0, 0)
+        );
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_strncmp, s1_a, s1_b, u64::MAX),
+            (0, 0)
+        );
+
+        // 6. Superpage demotion: partial unmap/map_shared demotes L2 superpage to L3, invalidating
+        //    the stlb fast path on cross-4K spans and respecting new page permissions/holes.
+        warm_rw(&mut g, &mut dbt, buf_va);
+        let p20_cross_off = 20 * 4096 - 19;
+        let p20_cross_va = buf_va + p20_cross_off as u64;
+        // Before demotion: cross-4K n = 64 hits stlb in-cache.
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_memset, p20_cross_va, 0x44, 64),
+            (p20_cross_va, 0)
+        );
+
+        // Demote superpage 0 to L3 by unmapping distant page 25 and flushing TLB. Pages 19 and 20
+        // remain writable L3 pages, so n = 64 must now fall back to guest stub while n = 256 falls
+        // back to exec_memop and succeeds.
+        g.mmu.unmap(buf_va + 25 * PAGE_SIZE, PAGE_SIZE).unwrap();
+        g.cpu.tlb_flush();
+        warm_rw(&mut g, &mut dbt, buf_va + 19 * PAGE_SIZE);
+        warm_rw(&mut g, &mut dbt, buf_va + 20 * PAGE_SIZE);
+        buf.slice_mut(p20_cross_off, 256).fill(0x11);
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_memset, p20_cross_va, 0xdd, 64).0,
+            0x7777,
+            "demoted L3 pages must not hit stlb for cross-4K memset(64) ({regs:?})"
+        );
+        assert!(buf.slice(p20_cross_off, 64).iter().all(|&b| b == 0x11));
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_memset, p20_cross_va, 0xdd, 256),
+            (p20_cross_va, 0),
+            "demoted L3 pages must fall back to exec_memop for cross-4K memset(256) ({regs:?})"
+        );
+        assert!(buf.slice(p20_cross_off, 256).iter().all(|&b| b == 0xdd));
+
+        // Replace page 20 with read-only alt_host and unmap page 21: memset across 19->20 must
+        // decline exec_memop without touching page 19, and strlen at page 20's tail must respect
+        // the unmapped page 21 boundary.
+        buf.alt_mut(0, 4096).fill(0x22);
+        unsafe {
+            g.mmu
+                .map_shared(buf_va + 20 * PAGE_SIZE, buf.alt_host, PAGE_SIZE, prot::READ)
+                .unwrap();
+        }
+        g.mmu.unmap(buf_va + 21 * PAGE_SIZE, PAGE_SIZE).unwrap();
+        g.cpu.tlb_flush();
+        warm_rw(&mut g, &mut dbt, buf_va + 19 * PAGE_SIZE);
+        buf.slice_mut(p20_cross_off, 19).fill(0x11);
+        let (ret, interps) = call_checked(&mut g, &mut dbt, f_memset, p20_cross_va, 0xee, 256);
+        assert_eq!(ret, 0x7777, "demoted RO page 20 must decline ({regs:?})");
+        assert!(interps >= 1);
+        assert!(buf.slice(p20_cross_off, 19).iter().all(|&b| b == 0x11));
+        assert!(buf.alt(0, 256).iter().all(|&b| b == 0x22));
+
+        buf.alt_mut(4085, 10).fill(b'z');
+        buf.alt_mut(4095, 1)[0] = 0;
+        assert_eq!(
+            call_checked(
+                &mut g,
+                &mut dbt,
+                f_strlen,
+                buf_va + 20 * PAGE_SIZE + 4085,
+                0,
+                0
+            ),
+            (10, 0),
+            "strlen ending at last byte before unmapped demoted page 21 ({regs:?})"
+        );
+        buf.alt_mut(4095, 1)[0] = b'z';
+        let (ret, interps) = call_checked(
+            &mut g,
+            &mut dbt,
+            f_strlen,
+            buf_va + 20 * PAGE_SIZE + 4085,
+            0,
+            0,
+        );
+        assert_eq!(
+            ret, 0x7777,
+            "unterminated strlen into unmapped demoted page 21 must fall back ({regs:?})"
+        );
+        assert!(interps >= 1);
+    }
+}
+
+#[test]
+fn memops_strlen_strcmp_strncmp_correctness_and_boundaries() {
+    const SUPER: u64 = PAGE_SIZE << 9; // 2 MiB
+    const RW: u32 = prot::READ | prot::WRITE;
+    const TAG_A: u64 = 0x5a << 56;
+    const TAG_B: u64 = 0xab << 56;
+
+    for regs in [DbtRegs::Default, DbtRegs::Go] {
+        let Some(space) = DbtSpace::new(0, regs) else {
+            return;
+        };
+
+        // Backing for the single-superpage boundary check, declared before `g` for drop order.
+        let mut sp_backing = vec![0u8; (SUPER + 2 * PAGE_SIZE) as usize + 4096];
+        let sp_align = (4096 - (sp_backing.as_ptr() as usize & 4095)) & 4095;
+        let sp_host = unsafe {
+            NonNull::new_unchecked(sp_backing.as_mut_ptr().add(sp_align + PAGE_SIZE as usize))
+        };
+        let sp_va = 0x2400_0000u64; // 2 MiB-aligned; sp_va + SUPER is UNMAPPED
+
+        let mut dbt = Dbt::attach(&space, 0).unwrap();
+        let mut g = Guest::with_data();
+        unsafe {
+            g.mmu.map(sp_va, sp_host, SUPER, RW).unwrap();
+        }
+
+        let warm_ro_fn = CODE + 0x30;
+        let caller = CODE + 0x40;
+        g.code(warm_ro_fn, &[0xf940_0003, SVC]); // ldr x3, [x0]; svc
+        g.code(caller, &[0xd63f_0120, SVC]); // blr x9; svc
+
+        let warm_all = |g: &mut Guest, dbt: &mut Dbt| {
+            // Read-only warm so existing test strings at page offsets (including offset 0) are
+            // never clobbered.
+            for p in 0..6u64 {
+                g.cpu.state_mut().x[0] = DATA + p * PAGE_SIZE;
+                g.run_at(dbt, warm_ro_fn);
+            }
+            // Warm superpage read STLB at slot 16 so its 4 KiB TLB fill does not evict
+            // `DATA + 0..5 * PAGE_SIZE` (4 KiB TLB slots 0..5).
+            g.cpu.state_mut().x[0] = sp_va + 16 * PAGE_SIZE;
+            g.run_at(dbt, warm_ro_fn);
+        };
+
+        let f_strlen = CODE + 0x100;
+        let f_strcmp = CODE + 0x120;
+        let f_strncmp = CODE + 0x140;
+        let f_strcmp_real = CODE + 0x180;
+        g.code(f_strlen, &[movz_x0(0x7777), RET]);
+        g.code(f_strcmp, &[movz_x0(0x7777), RET]);
+        g.code(
+            f_strncmp,
+            &[
+                0xb400_0062, // cbz x2, +12
+                movz_x0(0x7777),
+                RET,
+                movz_x0(0),
+                RET,
+            ],
+        );
+        // Real minimal guest strcmp loop used to verify exact Page fault on unterminated a == b.
+        g.code(
+            f_strcmp_real,
+            &[
+                0x3840_1402, // ldrb w2, [x0], #1
+                0x3840_1423, // ldrb w3, [x1], #1
+                0x4b03_0044, // sub w4, w2, w3
+                0x3500_0044, // cbnz w4, +8 (done)
+                0x35ff_ff82, // cbnz w2, -16 (loop)
+                0x9340_7c80, // sxtw x0, w4
+                RET,
+            ],
+        );
+
+        space.set_memops(&[
+            DbtMemop {
+                pc: f_strlen,
+                kind: MEMOP_STRLEN,
+                reserved: 0,
+            },
+            DbtMemop {
+                pc: f_strcmp,
+                kind: MEMOP_STRCMP,
+                reserved: 0,
+            },
+            DbtMemop {
+                pc: f_strncmp,
+                kind: MEMOP_STRNCMP,
+                reserved: 0,
+            },
+            DbtMemop {
+                pc: f_strcmp_real,
+                kind: MEMOP_STRCMP,
+                reserved: 0,
+            },
+        ]);
+
+        let call_checked =
+            |g: &mut Guest, dbt: &mut Dbt, target: u64, x0: u64, x1: u64, x2: u64| -> (u64, u64) {
+                let before_interp = dbt.stats().exits_interp;
+                let s = g.cpu.state_mut();
+                s.x[9] = target;
+                s.x[0] = x0;
+                s.x[1] = x1;
+                s.x[2] = x2;
+                for r in 3..=29 {
+                    if r != 9 {
+                        s.x[r] = 0x1111_0000_0000_0000 + r as u64;
+                    }
+                }
+                s.nzcv = 0xa000_0000;
+                let ret = g.run_at(dbt, caller);
+                let s = g.cpu.state();
+                assert_eq!(s.x[1], x1, "x1 clobbered for {regs:?}");
+                assert_eq!(s.x[2], x2, "x2 clobbered for {regs:?}");
+                for r in 3..=29 {
+                    if r != 9 {
+                        assert_eq!(
+                            s.x[r],
+                            0x1111_0000_0000_0000 + r as u64,
+                            "x{r} clobbered for {regs:?}"
+                        );
+                    }
+                }
+                assert_eq!(s.nzcv, 0xa000_0000, "NZCV clobbered for {regs:?}");
+                (ret, dbt.stats().exits_interp - before_interp)
+            };
+
+        warm_all(&mut g, &mut dbt);
+
+        // =====================================================================
+        // A. MEMOP_STRLEN correctness & boundary cases
+        // =====================================================================
+        let swar_bytes = [0x01u8, 0x7f, 0x80, 0x81, b'a', 0xfe, 0xff, 0x02];
+        let mut strlen_lens: Vec<usize> = (0..=16).collect();
+        strlen_lens.extend([31, 32, 63, 64]);
+        for off in 0..8usize {
+            for &len in &strlen_lens {
+                g.pages[3].0[..128].fill(0xfe);
+                let base = 16 + off;
+                for i in 0..len {
+                    g.pages[3].0[base + i] = swar_bytes[(i + off) % swar_bytes.len()];
+                }
+                g.pages[3].0[base + len] = 0;
+                g.pages[3].0[base + len + 1] = 0x01;
+                assert_eq!(
+                    call_checked(
+                        &mut g,
+                        &mut dbt,
+                        f_strlen,
+                        DATA + base as u64,
+                        0x1234,
+                        0x5678
+                    ),
+                    (len as u64, 0),
+                    "strlen off={off} len={len} ({regs:?})"
+                );
+            }
+        }
+
+        // String ending at the very last byte of 4 KiB page 5 (host page 8), immediately followed
+        // by UNMAPPED page 6: must succeed without faulting on both warm TLB and cold TLB.
+        for cold in [false, true] {
+            for &len in &[
+                0usize, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64,
+            ] {
+                if cold {
+                    g.cpu.tlb_flush();
+                }
+                let start = 4096 - 1 - len;
+                g.pages[8].0[start..4095].fill(b'p');
+                g.pages[8].0[4095] = 0;
+                assert_eq!(
+                    call_checked(
+                        &mut g,
+                        &mut dbt,
+                        f_strlen,
+                        DATA + 5 * PAGE_SIZE + start as u64,
+                        0,
+                        0
+                    ),
+                    (len as u64, 0),
+                    "strlen 4K tail cold={cold} len={len} ({regs:?})"
+                );
+            }
+        }
+        warm_all(&mut g, &mut dbt);
+
+        // String ending at the very last byte of a 2 MiB superpage immediately followed by an
+        // UNMAPPED page (including lengths crossing 4 KiB boundaries inside the superpage).
+        for &len in &[0usize, 1, 7, 8, 15, 16, 63, 64, 4100, 8200] {
+            let start = SUPER as usize - 1 - len;
+            unsafe {
+                let tail = std::slice::from_raw_parts_mut(sp_host.as_ptr().add(start), len + 1);
+                let ref_buf = std::slice::from_raw_parts_mut(sp_host.as_ptr().add(0x1000), len + 1);
+                for i in 0..len {
+                    let b = swar_bytes[i % swar_bytes.len()];
+                    tail[i] = b;
+                    ref_buf[i] = b;
+                }
+                tail[len] = 0;
+                ref_buf[len] = 0;
+            }
+            assert_eq!(
+                call_checked(&mut g, &mut dbt, f_strlen, sp_va + start as u64, 0, 0),
+                (len as u64, 0),
+                "strlen 2M tail len={len} ({regs:?})"
+            );
+            assert_eq!(
+                call_checked(
+                    &mut g,
+                    &mut dbt,
+                    f_strcmp,
+                    sp_va + start as u64,
+                    sp_va + 0x1000,
+                    0
+                ),
+                (0, 0),
+                "strcmp 2M tail len={len} ({regs:?})"
+            );
+            assert_eq!(
+                call_checked(
+                    &mut g,
+                    &mut dbt,
+                    f_strncmp,
+                    sp_va + start as u64,
+                    sp_va + 0x1000,
+                    u64::MAX
+                ),
+                (0, 0),
+                "strncmp 2M tail len={len} ({regs:?})"
+            );
+        }
+
+        // Cross-4K-page non-superpage strlen (reversed host pages 2 -> 3, i.e. host 6 -> host 5).
+        g.pages[6].0[4096 - 19..].fill(b'c');
+        g.pages[5].0[..128].fill(b'd');
+        for &tail_nul in &[0usize, 1, 7, 8, 77] {
+            g.pages[5].0[..128].fill(b'd');
+            g.pages[5].0[tail_nul] = 0;
+            assert_eq!(
+                call_checked(&mut g, &mut dbt, f_strlen, before_page(3, 19), 0, 0),
+                ((19 + tail_nul) as u64, 0),
+                "cross-page strlen tail_nul={tail_nul} ({regs:?})"
+            );
+        }
+
+        // TBI tagged pointer for strlen (same-page and cross-page).
+        g.pages[3].0[32..55].fill(b't');
+        g.pages[3].0[55] = 0;
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_strlen, TAG_A | (DATA + 32), 0, 0),
+            (23, 0),
+            "TBI same-page strlen ({regs:?})"
+        );
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_strlen, TAG_A | before_page(3, 19), 0, 0),
+            ((19 + 77) as u64, 0),
+            "TBI cross-page strlen ({regs:?})"
+        );
+
+        // =====================================================================
+        // B. MEMOP_STRCMP & MEMOP_STRNCMP correctness & SWAR edge cases
+        // =====================================================================
+        // 1. Equal strings (including empty "") across alignment pairs, with differing bytes after
+        //    the terminating NUL.
+        for off_a in 0..8usize {
+            for off_b in 0..8usize {
+                g.pages[3].0[16..48].fill(0xaa);
+                g.pages[4].0[16..48].fill(0x55);
+                g.pages[3].0[16 + off_a] = 0;
+                g.pages[4].0[16 + off_b] = 0;
+                let a = DATA + (16 + off_a) as u64;
+                let b = DATA + PAGE_SIZE + (16 + off_b) as u64;
+                assert_eq!(call_checked(&mut g, &mut dbt, f_strcmp, a, b, 0), (0, 0));
+                assert_eq!(call_checked(&mut g, &mut dbt, f_strncmp, a, b, 1), (0, 0));
+                assert_eq!(
+                    call_checked(&mut g, &mut dbt, f_strncmp, a, b, u64::MAX),
+                    (0, 0)
+                );
+            }
+        }
+        for &(off_a, off_b) in &[(0usize, 0usize), (1, 5), (3, 7), (7, 2)] {
+            for &len in &[1usize, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 31, 32, 63, 64] {
+                g.pages[3].0[..128].fill(0xaa);
+                g.pages[4].0[..128].fill(0x55);
+                let ba = 16 + off_a;
+                let bb = 16 + off_b;
+                for i in 0..len {
+                    let v = swar_bytes[i % swar_bytes.len()];
+                    g.pages[3].0[ba + i] = v;
+                    g.pages[4].0[bb + i] = v;
+                }
+                g.pages[3].0[ba + len] = 0;
+                g.pages[4].0[bb + len] = 0;
+                let a = DATA + ba as u64;
+                let b = DATA + PAGE_SIZE + bb as u64;
+                assert_eq!(
+                    call_checked(&mut g, &mut dbt, f_strcmp, a, b, 0),
+                    (0, 0),
+                    "strcmp eq ({off_a},{off_b}) len={len} ({regs:?})"
+                );
+                for n in [len as u64, (len + 1) as u64, 256, u64::MAX] {
+                    assert_eq!(
+                        call_checked(&mut g, &mut dbt, f_strncmp, a, b, n),
+                        (0, 0),
+                        "strncmp eq ({off_a},{off_b}) len={len} n={n} ({regs:?})"
+                    );
+                }
+            }
+        }
+
+        // 2. Mismatch at every byte 0..=15 (plus 31, 32, 63) at aligned & misaligned offsets.
+        let mut diff_positions: Vec<usize> = (0..=15).collect();
+        diff_positions.extend([31, 32, 63]);
+        for &(off_a, off_b) in &[(0usize, 0usize), (3, 5)] {
+            let ba = 16 + off_a;
+            let bb = 16 + off_b;
+            let a = DATA + ba as u64;
+            let b = DATA + PAGE_SIZE + bb as u64;
+            for &pos in &diff_positions {
+                let len = pos + 4;
+                g.pages[3].0[ba..ba + len].fill(b'm');
+                g.pages[4].0[bb..bb + len].fill(b'm');
+                g.pages[3].0[ba + len] = 0;
+                g.pages[4].0[bb + len] = 0;
+                g.pages[3].0[ba + pos] = b'z';
+                g.pages[4].0[bb + pos] = b'a';
+                let want = b'z' as i32 - b'a' as i32;
+                let (r1, i1) = call_checked(&mut g, &mut dbt, f_strcmp, a, b, 0);
+                let (r2, i2) = call_checked(&mut g, &mut dbt, f_strcmp, b, a, 0);
+                assert_eq!((r1 as i32, i1), (want, 0), "strcmp + pos={pos} ({regs:?})");
+                assert_eq!((r2 as i32, i2), (-want, 0), "strcmp - pos={pos} ({regs:?})");
+                for n in [(pos + 1) as u64, 128, u64::MAX] {
+                    let (r1, i1) = call_checked(&mut g, &mut dbt, f_strncmp, a, b, n);
+                    let (r2, i2) = call_checked(&mut g, &mut dbt, f_strncmp, b, a, n);
+                    assert_eq!(
+                        (r1 as i32, i1),
+                        (want, 0),
+                        "strncmp + pos={pos} n={n} ({regs:?})"
+                    );
+                    assert_eq!(
+                        (r2 as i32, i2),
+                        (-want, 0),
+                        "strncmp - pos={pos} n={n} ({regs:?})"
+                    );
+                }
+            }
+        }
+
+        // 3. Unsigned byte comparison with high-bit bytes (0x7f vs 0x80, 0xff vs 0x01, 0x00 vs 0x80).
+        for &pos in &[0usize, 3, 7, 8, 11] {
+            let a = DATA + 32;
+            let b = DATA + PAGE_SIZE + 32;
+            for &(ca, cb) in &[
+                (0x7fu8, 0x80u8),
+                (0x80, 0x7f),
+                (0xff, 0x01),
+                (0x01, 0xff),
+                (0x00, 0x80),
+                (0x80, 0x00),
+                (0x00, 0xff),
+                (0xff, 0x00),
+            ] {
+                g.pages[3].0[32..64].fill(b'A');
+                g.pages[4].0[32..64].fill(b'A');
+                g.pages[3].0[32 + pos] = ca;
+                g.pages[4].0[32 + pos] = cb;
+                g.pages[3].0[32 + pos + 2] = 0;
+                g.pages[4].0[32 + pos + 2] = 0;
+                let want = ca as i32 - cb as i32;
+                let (res, interps) = call_checked(&mut g, &mut dbt, f_strcmp, a, b, 0);
+                assert_eq!(
+                    (res as i32, interps),
+                    (want, 0),
+                    "strcmp unsigned {ca:#x} vs {cb:#x} at {pos} ({regs:?})"
+                );
+                for n in [16u64, u64::MAX] {
+                    let (res, interps) = call_checked(&mut g, &mut dbt, f_strncmp, a, b, n);
+                    assert_eq!(
+                        (res as i32, interps),
+                        (want, 0),
+                        "strncmp unsigned {ca:#x} vs {cb:#x} at {pos} n={n} ({regs:?})"
+                    );
+                }
+            }
+        }
+
+        // 4. Critical SWAR edge cases across multiple alignments:
+        for &off in &[0usize, 1, 3, 7] {
+            let ba = 64 + off;
+            let bb = 64 + off;
+            let a = DATA + ba as u64;
+            let b = DATA + PAGE_SIZE + bb as u64;
+
+            // (a) NUL in a and b at byte k, and mismatch AFTER k in the same 8-byte word:
+            //     MUST return 0, NOT the diff after NUL!
+            for k in 0..8usize {
+                g.pages[3].0[ba..ba + 16].fill(0xff);
+                g.pages[4].0[bb..bb + 16].fill(0x01);
+                for i in 0..k {
+                    g.pages[3].0[ba + i] = b'a' + i as u8;
+                    g.pages[4].0[bb + i] = b'a' + i as u8;
+                }
+                g.pages[3].0[ba + k] = 0;
+                g.pages[4].0[bb + k] = 0;
+                assert_eq!(
+                    call_checked(&mut g, &mut dbt, f_strcmp, a, b, 0),
+                    (0, 0),
+                    "SWAR NUL-before-diff strcmp off={off} k={k} ({regs:?})"
+                );
+                for n in [8u64, 64, u64::MAX] {
+                    assert_eq!(
+                        call_checked(&mut g, &mut dbt, f_strncmp, a, b, n),
+                        (0, 0),
+                        "SWAR NUL-before-diff strncmp off={off} k={k} n={n} ({regs:?})"
+                    );
+                }
+            }
+
+            // (b) Mismatch at byte j < k BEFORE NUL in the same 8-byte word:
+            //     MUST return exact a[j] - b[j]!
+            for k in 1..8usize {
+                for j in 0..k {
+                    g.pages[3].0[ba..ba + 16].fill(0x02);
+                    g.pages[4].0[bb..bb + 16].fill(0xfd);
+                    for i in 0..k {
+                        g.pages[3].0[ba + i] = b'a' + i as u8;
+                        g.pages[4].0[bb + i] = b'a' + i as u8;
+                    }
+                    g.pages[3].0[ba + j] = b'X';
+                    g.pages[4].0[bb + j] = b'Y';
+                    g.pages[3].0[ba + k] = 0;
+                    g.pages[4].0[bb + k] = 0;
+                    let want = b'X' as i32 - b'Y' as i32;
+                    let (res, interps) = call_checked(&mut g, &mut dbt, f_strcmp, a, b, 0);
+                    assert_eq!(
+                        (res as i32, interps),
+                        (want, 0),
+                        "SWAR diff-before-NUL strcmp off={off} j={j} k={k} ({regs:?})"
+                    );
+                    let (res, interps) = call_checked(&mut g, &mut dbt, f_strncmp, a, b, 8);
+                    assert_eq!(
+                        (res as i32, interps),
+                        (want, 0),
+                        "SWAR diff-before-NUL strncmp off={off} j={j} k={k} ({regs:?})"
+                    );
+                }
+            }
+
+            // (c) a ends with NUL while b continues (and vice versa), including high-bit next byte.
+            for k in 0..=8usize {
+                for &next_b in &[b'c', 0x80u8] {
+                    g.pages[3].0[ba..ba + 16].fill(b'Z');
+                    g.pages[4].0[bb..bb + 16].fill(b'Q');
+                    for i in 0..k {
+                        g.pages[3].0[ba + i] = b'a' + i as u8;
+                        g.pages[4].0[bb + i] = b'a' + i as u8;
+                    }
+                    g.pages[3].0[ba + k] = 0;
+                    g.pages[4].0[bb + k] = next_b;
+                    g.pages[4].0[bb + k + 1] = 0;
+                    let want_neg = -(next_b as i32);
+                    let want_pos = next_b as i32;
+                    let (r1, i1) = call_checked(&mut g, &mut dbt, f_strcmp, a, b, 0);
+                    let (r2, i2) = call_checked(&mut g, &mut dbt, f_strcmp, b, a, 0);
+                    assert_eq!(
+                        (r1 as i32, i1),
+                        (want_neg, 0),
+                        "prefix NUL strcmp(a,b) off={off} k={k} next={next_b:#x} ({regs:?})"
+                    );
+                    assert_eq!(
+                        (r2 as i32, i2),
+                        (want_pos, 0),
+                        "prefix NUL strcmp(b,a) off={off} k={k} next={next_b:#x} ({regs:?})"
+                    );
+                    for n in [32u64, u64::MAX] {
+                        let (r1, i1) = call_checked(&mut g, &mut dbt, f_strncmp, a, b, n);
+                        let (r2, i2) = call_checked(&mut g, &mut dbt, f_strncmp, b, a, n);
+                        assert_eq!((r1 as i32, i1), (want_neg, 0));
+                        assert_eq!((r2 as i32, i2), (want_pos, 0));
+                    }
+                }
+            }
+        }
+
+        // (d) a == b edge cases near unmapped page 6:
+        //     - Terminated at last byte of page 5 -> MUST return 0 cleanly.
+        for cold in [false, true] {
+            for &len in &[0usize, 1, 7, 8, 15, 16, 64] {
+                if cold {
+                    g.cpu.tlb_flush();
+                }
+                let start = 4096 - 1 - len;
+                g.pages[8].0[start..4095].fill(b's');
+                g.pages[8].0[4095] = 0;
+                let p = DATA + 5 * PAGE_SIZE + start as u64;
+                assert_eq!(
+                    call_checked(&mut g, &mut dbt, f_strcmp, p, p, 0),
+                    (0, 0),
+                    "a==b terminated strcmp cold={cold} len={len} ({regs:?})"
+                );
+                assert_eq!(
+                    call_checked(&mut g, &mut dbt, f_strncmp, p, p, u64::MAX),
+                    (0, 0),
+                    "a==b terminated strncmp cold={cold} len={len} ({regs:?})"
+                );
+            }
+        }
+        warm_all(&mut g, &mut dbt);
+
+        //     - NON-NUL-terminated page 5 followed by UNMAPPED page 6:
+        //       MUST NOT silently return 0! Must fall back to guest code / fault at page 6.
+        g.pages[8].0[4080..4096].fill(b'x');
+        let p_unterm = DATA + 5 * PAGE_SIZE + 4080;
+        let (ret, interps) = call_checked(&mut g, &mut dbt, f_strcmp, p_unterm, p_unterm, 0);
+        assert_eq!(
+            ret, 0x7777,
+            "a==b unterminated strcmp must fall back, NOT return 0 ({regs:?})"
+        );
+        assert!(interps >= 1);
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_strncmp, p_unterm, p_unterm, 32).0,
+            0x7777,
+            "a==b unterminated strncmp(32) must fall back ({regs:?})"
+        );
+        let (ret, interps) =
+            call_checked(&mut g, &mut dbt, f_strncmp, p_unterm, p_unterm, u64::MAX);
+        assert_eq!(
+            ret, 0x7777,
+            "a==b unterminated strncmp(SIZE_MAX) must fall back ({regs:?})"
+        );
+        assert!(interps >= 1);
+        // Exact n == 16 remaining bytes on page 5 (no NUL) MUST return 0 without reading page 6!
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_strncmp, p_unterm, p_unterm, 16),
+            (0, 0),
+            "a==b strncmp(16) exact page end must not touch unmapped page 6 ({regs:?})"
+        );
+        // With real guest strcmp body, a == b unterminated faults precisely at unmapped page 6.
+        {
+            let s = g.cpu.state_mut();
+            s.x[9] = f_strcmp_real;
+            s.x[0] = p_unterm;
+            s.x[1] = p_unterm;
+            s.sp = STACK;
+        }
+        assert_eq!(
+            go(&mut g, &mut dbt, caller),
+            Exit::Fault {
+                addr: DATA + 6 * PAGE_SIZE,
+                access: Access::Read,
+                kind: FaultKind::Page,
+            },
+            "a==b unterminated real strcmp must fault at page 6 ({regs:?})"
+        );
+
+        // 5. strncmp n = 0, 1, < len, == len, > len, u64::MAX, and diff after n.
+        let unmapped = DATA + 6 * PAGE_SIZE;
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_strncmp, unmapped, unmapped, 0),
+            (0, 0),
+            "strncmp(n=0) must return 0 without dereferencing ({regs:?})"
+        );
+        g.pages[3].0[100..104].copy_from_slice(b"aX\0\0");
+        g.pages[4].0[100..104].copy_from_slice(b"aY\0\0");
+        assert_eq!(
+            call_checked(
+                &mut g,
+                &mut dbt,
+                f_strncmp,
+                DATA + 100,
+                DATA + PAGE_SIZE + 100,
+                1
+            ),
+            (0, 0),
+            "strncmp(n=1) equal prefix ({regs:?})"
+        );
+        g.pages[4].0[100] = b'b';
+        let (res, interps) = call_checked(
+            &mut g,
+            &mut dbt,
+            f_strncmp,
+            DATA + 100,
+            DATA + PAGE_SIZE + 100,
+            1,
+        );
+        assert_eq!((res as i32, interps), (b'a' as i32 - b'b' as i32, 0));
+
+        for &len in &[1usize, 3, 7, 8, 9, 15, 16, 31, 32] {
+            let a = DATA + 200;
+            let b = DATA + PAGE_SIZE + 200;
+            g.pages[3].0[200..200 + len].fill(b'g');
+            g.pages[4].0[200..200 + len].fill(b'g');
+            // Diff at byte `len` (just after n = len):
+            g.pages[3].0[200 + len] = b'A';
+            g.pages[4].0[200 + len] = b'Z';
+            g.pages[3].0[200 + len + 1] = 0;
+            g.pages[4].0[200 + len + 1] = 0;
+            assert_eq!(
+                call_checked(&mut g, &mut dbt, f_strncmp, a, b, len as u64),
+                (0, 0),
+                "strncmp diff after n={len} ({regs:?})"
+            );
+            let (res, interps) = call_checked(&mut g, &mut dbt, f_strncmp, a, b, (len + 1) as u64);
+            assert_eq!((res as i32, interps), (b'A' as i32 - b'Z' as i32, 0));
+            let (res, interps) = call_checked(&mut g, &mut dbt, f_strncmp, a, b, u64::MAX);
+            assert_eq!((res as i32, interps), (b'A' as i32 - b'Z' as i32, 0));
+            // NUL at `len` in a vs 'z' in b:
+            g.pages[3].0[200 + len] = 0;
+            g.pages[4].0[200 + len] = b'z';
+            assert_eq!(
+                call_checked(&mut g, &mut dbt, f_strncmp, a, b, len as u64),
+                (0, 0),
+                "strncmp n==len before NUL/char ({regs:?})"
+            );
+            let (res, interps) = call_checked(&mut g, &mut dbt, f_strncmp, a, b, (len + 1) as u64);
+            assert_eq!((res as i32, interps), (-(b'z' as i32), 0));
+        }
+
+        // 6. Strings ending at page 5 boundary before unmapped page 6 (asymmetric rem_a vs rem_b,
+        //    warm TLB and cold TLB, and exact-n non-NUL strncmp).
+        for cold in [false, true] {
+            for &len in &[0usize, 1, 7, 8, 9, 15, 16, 33] {
+                if cold {
+                    g.cpu.tlb_flush();
+                }
+                let p5_start = 4096 - 1 - len;
+                g.pages[8].0[p5_start..4095].fill(b'e');
+                g.pages[8].0[4095] = 0;
+                g.pages[3].0[300..300 + len].fill(b'e');
+                g.pages[3].0[300 + len] = 0;
+                let p0 = DATA + 300;
+                let p5 = DATA + 5 * PAGE_SIZE + p5_start as u64;
+                assert_eq!(call_checked(&mut g, &mut dbt, f_strcmp, p0, p5, 0), (0, 0));
+                assert_eq!(call_checked(&mut g, &mut dbt, f_strcmp, p5, p0, 0), (0, 0));
+                assert_eq!(
+                    call_checked(&mut g, &mut dbt, f_strncmp, p0, p5, u64::MAX),
+                    (0, 0)
+                );
+                assert_eq!(
+                    call_checked(&mut g, &mut dbt, f_strncmp, p5, p0, u64::MAX),
+                    (0, 0)
+                );
+                // Differ at the very last byte before unmapped page 6 (NUL on p5 vs '!' on p0):
+                g.pages[3].0[300 + len] = b'!';
+                g.pages[3].0[300 + len + 1] = 0;
+                let (r1, i1) = call_checked(&mut g, &mut dbt, f_strcmp, p5, p0, 0);
+                let (r2, i2) = call_checked(&mut g, &mut dbt, f_strcmp, p0, p5, 0);
+                assert_eq!(i1, 0);
+                assert_eq!(i2, 0);
+                assert_ne!(r1, 0x7777);
+                assert_ne!(r2, 0x7777);
+                assert!((r1 as i32) < 0);
+                assert!((r2 as i32) > 0);
+            }
+        }
+        warm_all(&mut g, &mut dbt);
+        for &k in &[1usize, 3, 7, 8, 9, 15, 16] {
+            let p5_start = 4096 - k;
+            g.pages[8].0[p5_start..4096].fill(b'n');
+            g.pages[3].0[300..300 + k].fill(b'n');
+            g.pages[3].0[300 + k] = b'!'; // after n
+            let p0 = DATA + 300;
+            let p5 = DATA + 5 * PAGE_SIZE + p5_start as u64;
+            assert_eq!(
+                call_checked(&mut g, &mut dbt, f_strncmp, p5, p0, k as u64),
+                (0, 0),
+                "strncmp exact non-NUL page-end k={k} ({regs:?})"
+            );
+            assert_eq!(
+                call_checked(&mut g, &mut dbt, f_strncmp, p0, p5, k as u64),
+                (0, 0)
+            );
+        }
+
+        // 7. Cross-page strcmp & strncmp via exec_memop (scattered non-contiguous host pages).
+        g.pages[3].0[4096 - 24..].fill(b'v');
+        g.pages[4].0[..64].fill(b'v');
+        g.pages[6].0[4096 - 24..].fill(b'v');
+        g.pages[5].0[..64].fill(b'v');
+        g.pages[4].0[40] = 0;
+        g.pages[5].0[40] = 0;
+        g.pages[4].0[41] = b'1';
+        g.pages[5].0[41] = b'2';
+        let ca = before_page(1, 24);
+        let cb = before_page(3, 24);
+        assert_eq!(call_checked(&mut g, &mut dbt, f_strcmp, ca, cb, 0), (0, 0));
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_strncmp, ca, cb, 256),
+            (0, 0)
+        );
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_strncmp, ca, cb, u64::MAX),
+            (0, 0)
+        );
+        // High-bit unsigned diff right at byte 0 of the second page:
+        g.pages[4].0[0] = 0x7f;
+        g.pages[5].0[0] = 0x80;
+        let (r1, i1) = call_checked(&mut g, &mut dbt, f_strcmp, ca, cb, 0);
+        let (r2, i2) = call_checked(&mut g, &mut dbt, f_strcmp, cb, ca, 0);
+        assert_eq!((i1, i2), (0, 0));
+        assert_ne!(r1, 0x7777);
+        assert_ne!(r2, 0x7777);
+        assert!((r1 as i32) < 0 && (r2 as i32) > 0);
+        let (r1, i1) = call_checked(&mut g, &mut dbt, f_strncmp, ca, cb, u64::MAX);
+        assert_eq!(i1, 0);
+        assert_ne!(r1, 0x7777);
+        assert!((r1 as i32) < 0);
+
+        // 8. TBI tagged pointers (a tagged, b tagged, both tagged; same-page and cross-page).
+        g.pages[3].0[400..412].copy_from_slice(b"tagged_str!\0");
+        g.pages[4].0[400..412].copy_from_slice(b"tagged_str!\0");
+        let ta = DATA + 400;
+        let tb = DATA + PAGE_SIZE + 400;
+        for (pa, pb) in [
+            (TAG_A | ta, tb),
+            (ta, TAG_B | tb),
+            (TAG_A | ta, TAG_B | tb),
+            (TAG_A | ca, TAG_B | cb),
+        ] {
+            let want_neg = pa == (TAG_A | ca);
+            let (r_sc, i_sc) = call_checked(&mut g, &mut dbt, f_strcmp, pa, pb, 0);
+            let (r_sn, i_sn) = call_checked(&mut g, &mut dbt, f_strncmp, pa, pb, 256);
+            let (r_sm, i_sm) = call_checked(&mut g, &mut dbt, f_strncmp, pa, pb, u64::MAX);
+            assert_eq!((i_sc, i_sn, i_sm), (0, 0, 0));
+            for r in [r_sc, r_sn, r_sm] {
+                assert_ne!(r, 0x7777);
+                if want_neg {
+                    assert!((r as i32) < 0, "TBI diff ({regs:?})");
+                } else {
+                    assert_eq!(r, 0, "TBI eq ({regs:?})");
+                }
+            }
+        }
+
+        // 9. Active watchpoints (nwatch != 0): strlen, strcmp, and strncmp must fall back to guest.
+        g.cpu
+            .state_mut()
+            .set_hw_debug(&[], &[(DATA, DATA + 8, WATCH_LOAD)]);
+        g.cpu.tlb_flush();
+        let (r_sl, i_sl) = call_checked(&mut g, &mut dbt, f_strlen, DATA, 0, 0);
+        assert_eq!(r_sl, 0x7777, "watchpoint strlen must fall back ({regs:?})");
+        assert!(i_sl >= 1);
+        let (r_sc, i_sc) = call_checked(&mut g, &mut dbt, f_strcmp, DATA, DATA + 64, 0);
+        assert_eq!(r_sc, 0x7777, "watchpoint strcmp must fall back ({regs:?})");
+        assert!(i_sc >= 1);
+        assert_eq!(
+            call_checked(&mut g, &mut dbt, f_strncmp, DATA, DATA + 64, 16).0,
+            0x7777,
+            "watchpoint strncmp(16) must fall back ({regs:?})"
+        );
+        let (r_sn, i_sn) = call_checked(&mut g, &mut dbt, f_strncmp, DATA, DATA + 64, 256);
+        assert_eq!(
+            r_sn, 0x7777,
+            "watchpoint strncmp(256) must fall back ({regs:?})"
+        );
+        assert!(i_sn >= 1);
+        g.cpu.state_mut().set_hw_debug(&[], &[]);
+
+        // 10. 4 KiB TLB warming on MEMOP_STRNCMP exec_memop: after a cold n=256 call, a subsequent
+        //     n=16 (< 128) call on the same page stays in-cache (not 0x7777), as does n=u64::MAX.
+        g.cpu.tlb_flush();
+        g.pages[3].0[500..512].copy_from_slice(b"warm_4k_abc\0");
+        g.pages[3].0[560..572].copy_from_slice(b"warm_4k_abd\0");
+        let (r_cold, i_cold) =
+            call_checked(&mut g, &mut dbt, f_strncmp, DATA + 500, DATA + 560, 256);
+        assert_eq!(i_cold, 0);
+        assert_ne!(r_cold, 0x7777);
+        assert!((r_cold as i32) < 0);
+        let (r_hot16, i_hot16) =
+            call_checked(&mut g, &mut dbt, f_strncmp, DATA + 500, DATA + 560, 16);
+        assert_eq!(
+            (r_hot16 as i32, i_hot16),
+            (b'c' as i32 - b'd' as i32, 0),
+            "strncmp exec_memop must warm 4 KiB tlb for subsequent n=16 call ({regs:?})"
+        );
+        let (r_hotmax, i_hotmax) = call_checked(
+            &mut g,
+            &mut dbt,
+            f_strncmp,
+            DATA + 500,
+            DATA + 560,
+            u64::MAX,
+        );
+        assert_eq!((r_hotmax as i32, i_hotmax), (b'c' as i32 - b'd' as i32, 0));
+
+        // 11. Shadow return stack (dbt_rs) + full x1..=x29 (including x9) + NZCV preservation
+        //     across nested BL frames for both warm in-cache and cross-page exec_memop paths.
+        warm_all(&mut g, &mut dbt);
+        let nested = [
+            (CODE + 0x200, CODE + 0x280, f_strlen),
+            (CODE + 0x220, CODE + 0x2a0, f_strcmp),
+            (CODE + 0x240, CODE + 0x2c0, f_strncmp),
+        ];
+        for (inner, outer, target) in nested {
+            g.code(outer, &[bl(outer, inner), SVC]);
+            g.code(
+                inner,
+                &[STP_FP_LR_PRE, bl(inner + 4, target), LDP_FP_LR_POST, RET],
+            );
+        }
+        let check_nested =
+            |g: &mut Guest, dbt: &mut Dbt, outer: u64, x0: u64, x1: u64, x2: u64| -> (u64, u64) {
+                let before = dbt.stats().exits_interp;
+                let s = g.cpu.state_mut();
+                s.sp = STACK;
+                s.x[0] = x0;
+                s.x[1] = x1;
+                s.x[2] = x2;
+                for r in 3..=29 {
+                    s.x[r] = 0x2222_0000_0000_0000 + r as u64;
+                }
+                s.nzcv = 0xa000_0000;
+                let ret = g.run_at(dbt, outer);
+                let s = g.cpu.state();
+                assert_eq!(s.sp, STACK, "sp clobbered in nested call ({regs:?})");
+                assert_eq!(s.x[1], x1, "x1 clobbered in nested call ({regs:?})");
+                assert_eq!(s.x[2], x2, "x2 clobbered in nested call ({regs:?})");
+                for r in 3..=29 {
+                    assert_eq!(
+                        s.x[r],
+                        0x2222_0000_0000_0000 + r as u64,
+                        "x{r} clobbered in nested call ({regs:?})"
+                    );
+                }
+                assert_eq!(
+                    s.nzcv, 0xa000_0000,
+                    "NZCV clobbered in nested call ({regs:?})"
+                );
+                (ret, dbt.stats().exits_interp - before)
+            };
+        // In-cache nested calls
+        assert_eq!(
+            check_nested(&mut g, &mut dbt, CODE + 0x280, ta, 11, 22),
+            (11, 0)
+        );
+        assert_eq!(
+            check_nested(&mut g, &mut dbt, CODE + 0x2a0, ta, tb, 22),
+            (0, 0)
+        );
+        assert_eq!(
+            check_nested(&mut g, &mut dbt, CODE + 0x2c0, ta, tb, u64::MAX),
+            (0, 0)
+        );
+        // Cross-page exec_memop nested calls (`before_page(3, 19)` has 19 B on page 2 + 40 B on
+        // page 3 before NUL at offset 40, set by section 7 above).
+        assert_eq!(
+            check_nested(&mut g, &mut dbt, CODE + 0x280, before_page(3, 19), 11, 22),
+            (59, 0)
+        );
+        let (r_sc, i_sc) = check_nested(&mut g, &mut dbt, CODE + 0x2a0, ca, cb, 22);
+        assert_eq!(i_sc, 0);
+        assert_ne!(r_sc, 0x7777);
+        assert!((r_sc as i32) < 0);
+        let (r_sn, i_sn) = check_nested(&mut g, &mut dbt, CODE + 0x2c0, ca, cb, 256);
+        assert_eq!(i_sn, 0);
+        assert_ne!(r_sn, 0x7777);
+        assert!((r_sn as i32) < 0);
+
+        g.mmu.unmap(sp_va, SUPER).unwrap();
+        g.cpu.tlb_flush();
     }
 }

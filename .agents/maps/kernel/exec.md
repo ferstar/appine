@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-26 (targeted verification only since the full mapping; latest change: FUSE exec set-id/file capabilities and pinned FUSE `ExeFile`)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: register bundled musl strlen and strcmp memops alongside length-bounded memops)
 
 ## Responsibilities
 
@@ -145,7 +145,7 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
   `end_data` from its segments) are recorded in the address space for `/proc/<pid>/stat`.
 - A Go build-ID note in the main program selects the translator's Go register set (`engine/dbt`;
   `APPINE_DBT_REGS` overrides it).
-- Tier 1 discovers length-gated libc memops only in the exact AArch64 musl from the pinned
+- Tier 1 discovers libc memops only in the exact AArch64 musl from the pinned
   Alpine rootfs (`scripts/fetch-rootfs`). An executable private mapping uses a read-only snapshot
   of the bytes verified by SHA-256; symbol names, file paths and build IDs alone never admit a
   function. File versions cache verification results. File offsets locate symbols across mappings

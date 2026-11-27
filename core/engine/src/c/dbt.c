@@ -222,12 +222,15 @@ retry_prepare:
     emit_to_stub(x, enc_cbnz_x(T0), FIX_IMM19, R_KICK, pc);
     _Static_assert(ENTRY_CHECK_WORDS == 2, "the length of the block entry check");
 
-    bool uses_fp = force_fp || scan_block_uses_fp(x);
+    bool memop_uncond =
+        memop_kind == APPINE_MEMOP_STRLEN || memop_kind == APPINE_MEMOP_STRCMP;
+    bool uses_fp = !memop_uncond && (force_fp || scan_block_uses_fp(x));
 
     if (memop_kind) {
-        /* Try the in-cache same-page fast path first (avoiding exit/enter and V0-V31 spill/reload
-         * while preserving NZCV and all non-return guest registers); on cross-page, TLB miss, or
-         * watched pages, fall back to R_INTERP (n >= 128) or guest code (n < 128). */
+        /* Try the in-cache 4 KiB TLB / 2 MiB STLB fast path first (avoiding exit/enter and V0-V31
+         * spill/reload while preserving NZCV and all non-return guest registers); on miss, cap
+         * overflow, cross-superpage span, or watchpoints, fall back to R_INTERP (when n >= 128
+         * for bounded ops, or unconditionally for strlen/strcmp) or guest code. */
         switch (memop_kind) {
         case APPINE_MEMOP_MEMSET:
         case APPINE_MEMOP_MEMCPY:
@@ -253,19 +256,22 @@ retry_prepare:
             patch_local(x, tiny, here(x));
             break;
         }
-        case APPINE_MEMOP_MEMCHR: {
+        case APPINE_MEMOP_MEMCHR:
+        case APPINE_MEMOP_STRNCMP: {
             uint32_t *tiny = here(x);
             emit(x, enc_cbz_x(2)); /* n == 0 stays in guest code */
             emit(x, enc_adr(T0, 8));
-            emit_to_routine(x, TO_MEMOP_MEMCHR);
+            emit_to_routine(x, memop_kind == APPINE_MEMOP_MEMCHR ? TO_MEMOP_MEMCHR : TO_MEMOP_STRNCMP);
             emit(x, enc_ubfx(T0, 2, 7, 57));
             emit_to_stub(x, enc_cbnz_x(T0), FIX_IMM19, R_INTERP, pc);
             patch_local(x, tiny, here(x));
             break;
         }
-        default:
-            emit(x, enc_ubfx(T0, 2, 7, 57));
-            emit_to_stub(x, enc_cbnz_x(T0), FIX_IMM19, R_INTERP, pc);
+        case APPINE_MEMOP_STRLEN:
+        case APPINE_MEMOP_STRCMP:
+            emit(x, enc_adr(T0, 8));
+            emit_to_routine(x, memop_kind == APPINE_MEMOP_STRLEN ? TO_MEMOP_STRLEN : TO_MEMOP_STRCMP);
+            emit_exit_stub(x, R_INTERP, pc);
             break;
         }
     }
@@ -301,23 +307,30 @@ retry_prepare:
     }
 
     uint32_t nguest = 0;
-    for (;; nguest++) {
-        uint64_t va = pc + 4ull * nguest;
-        bool budget_full =
-            nguest > 0 &&
-            (x->n + (size_t)(x->nstubs + INSN_MAX_STUBS) * MAX_STUB_WORDS + INSN_MAX_WORDS > MAX_BLOCK_WORDS ||
-             x->nstubs + INSN_MAX_STUBS > MAX_STUBS ||
-             x->nfixups + INSN_MAX_FIXUPS > MAX_FIXUPS ||
-             x->nrelocs + x->nstubs + INSN_MAX_STUBS + 2 > MAX_RELOCS);
-        if (nguest == MAX_BLOCK_INSNS || budget_full || (nguest > 0 && (va & PAGE_MASK) == 0)) {
-            emit_exit_stub(x, R_CHAIN_FWD, va);
-            break;
-        }
-        x->st->insns++;
-        x->idx = nguest;
-        if (!dbt_translate_insn(x, fetch_guest(x, nguest), va)) {
-            nguest++;
-            break;
+    if (memop_uncond) {
+        /* Unconditional memop gate never falls through to guest code here; snapshot the entry word
+         * so install() and content-based invalidation still track code changes at pc. */
+        (void)fetch_guest(x, 0);
+        nguest = 1;
+    } else {
+        for (;; nguest++) {
+            uint64_t va = pc + 4ull * nguest;
+            bool budget_full =
+                nguest > 0 &&
+                (x->n + (size_t)(x->nstubs + INSN_MAX_STUBS) * MAX_STUB_WORDS + INSN_MAX_WORDS > MAX_BLOCK_WORDS ||
+                 x->nstubs + INSN_MAX_STUBS > MAX_STUBS ||
+                 x->nfixups + INSN_MAX_FIXUPS > MAX_FIXUPS ||
+                 x->nrelocs + x->nstubs + INSN_MAX_STUBS + 2 > MAX_RELOCS);
+            if (nguest == MAX_BLOCK_INSNS || budget_full || (nguest > 0 && (va & PAGE_MASK) == 0)) {
+                emit_exit_stub(x, R_CHAIN_FWD, va);
+                break;
+            }
+            x->st->insns++;
+            x->idx = nguest;
+            if (!dbt_translate_insn(x, fetch_guest(x, nguest), va)) {
+                nguest++;
+                break;
+            }
         }
     }
 
@@ -943,7 +956,7 @@ void appine_dbt_set_memops(struct appine_dbt *d, const struct appine_dbt_memop *
     for (size_t i = 0; i < n && count < APPINE_DBT_MEMOPS; i++) {
         uint64_t pc = ops[i].pc;
         uint32_t kind = ops[i].kind;
-        if (!kind || kind > APPINE_MEMOP_STRNCMP || (pc & (3 | ~PC_MASK)))
+        if (!kind || kind > APPINE_MEMOP_STRCMP || (pc & (3 | ~PC_MASK)))
             continue;
         sorted[count++] = (struct appine_dbt_memop){.pc = pc, .kind = kind, .reserved = 0};
     }
@@ -1205,8 +1218,32 @@ static bool exec_memop(struct appine_cpu *c, uint32_t kind)
         c->x[0] = 0;
         return true;
     }
-    case APPINE_MEMOP_STRNCMP: {
-        uint64_t a_cur = untag(c->x[0]), b_cur = untag(c->x[1]), total = c->x[2];
+    case APPINE_MEMOP_STRLEN: {
+        uint64_t raw_s = c->x[0], start = untag(raw_s), cur = start, rem = MEMOP_MAX_BYTES;
+        while (rem > 0) {
+            uint64_t chunk = 0;
+            uint8_t *hp = memop_translate_span(mmu, cur, APPINE_PROT_READ, &chunk);
+            if (UNLIKELY(!hp))
+                return false;
+            if (chunk > rem)
+                chunk = rem;
+            uint8_t *f = (uint8_t *)memchr(hp, 0, chunk);
+            if (f) {
+                memop_warm_tlb(c, raw_s, APPINE_ACCESS_READ);
+                c->x[0] = (cur - start) + (uint64_t)(f - hp);
+                return true;
+            }
+            cur += chunk;
+            rem -= chunk;
+        }
+        return false;
+    }
+    case APPINE_MEMOP_STRNCMP:
+    case APPINE_MEMOP_STRCMP: {
+        bool bounded = kind == APPINE_MEMOP_STRNCMP;
+        uint64_t raw_a = c->x[0], raw_b = c->x[1];
+        uint64_t a_cur = untag(raw_a), b_cur = untag(raw_b);
+        uint64_t total = bounded ? c->x[2] : MEMOP_MAX_BYTES;
         uint64_t rem = total > MEMOP_MAX_BYTES ? MEMOP_MAX_BYTES : total;
         while (rem > 0) {
             uint64_t a_span = 0, b_span = 0;
@@ -1220,20 +1257,22 @@ static bool exec_memop(struct appine_cpu *c, uint32_t kind)
             uint8_t *za = (uint8_t *)memchr(ah, 0, chunk);
             uint64_t span = za ? (uint64_t)(za - ah) + 1 : chunk;
             int r = memcmp(ah, bh, span);
-            if (r != 0) {
-                c->x[0] = (uint64_t)(int64_t)r;
-                return true;
-            }
-            if (za) {
-                c->x[0] = 0;
+            if (r != 0 || za) {
+                memop_warm_tlb(c, raw_a, APPINE_ACCESS_READ);
+                memop_warm_tlb(c, raw_b, APPINE_ACCESS_READ);
+                c->x[0] = r != 0 ? (uint64_t)(int64_t)r : 0;
                 return true;
             }
             a_cur += chunk;
             b_cur += chunk;
             rem -= chunk;
         }
-        if (total > MEMOP_MAX_BYTES)
+        if (!bounded || total > MEMOP_MAX_BYTES)
             return false;
+        if (total > 0) {
+            memop_warm_tlb(c, raw_a, APPINE_ACCESS_READ);
+            memop_warm_tlb(c, raw_b, APPINE_ACCESS_READ);
+        }
         c->x[0] = 0;
         return true;
     }

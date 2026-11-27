@@ -467,26 +467,121 @@ static uint32_t *emit_memop_ret(struct xlate *x, struct appine_dbt *d)
 }
 
 /*
- * In-cache same-page memset (n >= 32, n <= 4096): X0 = dst, X1 = c, X2 = n, T0 = fallback PC.
- * Validates 1 <= n <= 4096 and same-page write TLB hit (which also excludes watched and read-only
- * pages) before touching any guest register or memory. Preserves X0..X30 and NZCV.
+ * Kick-safe upper bound (64 KiB) for in-cache 2 MiB STLB read/scan memop helpers (memcmp, memchr,
+ * strlen, strcmp, strncmp): keeps any single in-cache loop short enough not to starve c->pending
+ * kicks while letting >4 KiB superpage scans stay in the code cache. Staying strictly below
+ * MMU_SUPER_SIZE also preserves the single-compare last-byte STLB index check (crossing a 2 MiB
+ * boundary always lands in the next STLB slot).
+ *
+ * Mutating copy/fill helpers (memset, memcpy, memmove) use a tighter 4 KiB cap
+ * (MEMOP_COPY_SUPER_MAX): cross-4 KiB transfers of 32 B..=4096 B stay in-cache via STLB without
+ * loading guest FP state, while >4 KiB transfers go directly to exec_memop so host libc NEON /
+ * DC ZVA beats our GPR-only loop.
+ */
+#define MEMOP_SUPER_MAX_SHIFT 16
+#define MEMOP_SUPER_MAX (UINT64_C(1) << MEMOP_SUPER_MAX_SHIFT)
+#define MEMOP_COPY_SUPER_MAX_SHIFT APPINE_PAGE_SHIFT
+#define MEMOP_COPY_SUPER_MAX (UINT64_C(1) << MEMOP_COPY_SUPER_MAX_SHIFT)
+_Static_assert(MEMOP_SUPER_MAX < MMU_SUPER_SIZE,
+               "in-cache superpage cap must stay below 2 MiB so last-byte STLB index rejects crossings");
+_Static_assert(MEMOP_COPY_SUPER_MAX == APPINE_PAGE_SIZE && MEMOP_COPY_SUPER_MAX < MMU_SUPER_SIZE,
+               "in-cache copy/fill superpage cap must match 4 KiB and stay below 2 MiB");
+
+/* AND Xd, Xn, #0x8080808080808080 (logical immediate: N=0, esize=8, ones=1, ror=1; NZCV-free). */
+static inline uint32_t enc_and_80s(unsigned rd, unsigned rn)
+{
+    return 0x9201c000u | rn << 5 | rd;
+}
+
+/* Probe 2 MiB STLB for [addr, addr + T1] where T1 = n - 1 < MEMOP_SUPER_MAX. On hit T2 = addend;
+ * returns the cbnz T1 miss branch to be patched by the caller. Clobbers T1, T2; preserves addr,
+ * T0, and NZCV. */
+static uint32_t *emit_memop_stlb_span(struct xlate *x, unsigned addr, bool write)
+{
+    emit(x, enc_add_lsl(T2, addr, T1, 0)); /* last = addr + n - 1 */
+    emit(x, enc_ubfx(T2, T2, MMU_SUPER_SHIFT, STLB_BITS));
+    emit(x, enc_add_imm(T1, CTX, (uint32_t)(STLB_OFF >> 12), 1));
+    emit(x, enc_add_lsl(T1, T1, T2, 5));
+    emit(x, enc_ldp_x(T1, T2, T1, write ? 16 : 0));
+    emit(x, enc_eon_lsr(T1, T1, addr, MMU_SUPER_SHIFT));
+    uint32_t *miss = here(x);
+    emit(x, enc_cbnz_x(T1));
+    return miss;
+}
+
+/* Probe 2 MiB STLB read half for `addr`. When load_addend is true, sets T2 = addend_read on hit.
+ * Returns the cbnz T1 miss branch. Clobbers T1, T2; preserves addr, T0, and NZCV. */
+static uint32_t *emit_memop_stlb_point(struct xlate *x, unsigned addr, bool load_addend)
+{
+    emit(x, enc_add_imm(T1, CTX, (uint32_t)(STLB_OFF >> 12), 1));
+    emit(x, enc_ubfx(T2, addr, MMU_SUPER_SHIFT, STLB_BITS));
+    emit(x, enc_add_lsl(T1, T1, T2, 5));
+    if (load_addend)
+        emit(x, enc_ldp_x(T1, T2, T1, 0));
+    else
+        emit(x, enc_ldr_x(T1, T1, 0));
+    emit(x, enc_eon_lsr(T1, T1, addr, MMU_SUPER_SHIFT));
+    uint32_t *miss = here(x);
+    emit(x, enc_cbnz_x(T1));
+    return miss;
+}
+
+/* Set T1 = min(MMU_SUPER_SIZE - (addr & MMU_SUPER_MASK), MEMOP_SUPER_MAX) in [1, MEMOP_SUPER_MAX].
+ * Clobbers T2; preserves addr, T0, and NZCV. */
+static void emit_super_cap(struct xlate *x, unsigned addr)
+{
+    _Static_assert(MMU_SUPER_SIZE == (UINT64_C(0x20) << 16), "MMU_SUPER_SIZE movz encoding");
+    _Static_assert(MEMOP_SUPER_MAX == (UINT64_C(1) << 16), "MEMOP_SUPER_MAX movz encoding");
+    emit(x, enc_and_low(T1, addr, MMU_SUPER_SHIFT));
+    emit(x, enc_movz(T2, 0x20, 1));
+    emit(x, enc_sub_reg(T1, T2, T1));
+    emit(x, enc_sub_imm(T2, T1, 1, 0));
+    emit(x, enc_ubfx(T2, T2, MEMOP_SUPER_MAX_SHIFT, 64 - MEMOP_SUPER_MAX_SHIFT));
+    uint32_t *under = here(x);
+    emit(x, enc_cbz_x(T2));
+    emit(x, enc_movz(T1, 1, 1));
+    patch_branch(x->wdelta, under, here(x));
+}
+
+/* Clamp `reg` (in [1, MEMOP_SUPER_MAX]) to min(reg, X2) for unsigned X2 >= 1 (reg != T2, != X2).
+ * Clobbers T2; preserves NZCV. */
+static void emit_clamp_to_x2(struct xlate *x, unsigned reg)
+{
+    emit(x, enc_ubfx(T2, 2, MEMOP_SUPER_MAX_SHIFT, 64 - MEMOP_SUPER_MAX_SHIFT));
+    uint32_t *big = here(x);
+    emit(x, enc_cbnz_x(T2));
+    emit(x, enc_sub_reg(T2, 2, reg));
+    uint32_t *ge = here(x);
+    emit(x, enc_tbz(T2, 63));
+    emit(x, enc_mov(reg, 2));
+    uint32_t *done = here(x);
+    patch_branch(x->wdelta, big, done);
+    patch_branch(x->wdelta, ge, done);
+}
+
+/*
+ * In-cache memset (32 <= n <= MEMOP_COPY_SUPER_MAX): X0 = dst, X1 = c, X2 = n, T0 = fallback PC.
+ * Validates same-4 KiB-page write TLB hit first, falling back to 2 MiB STLB for cross-4 KiB spans
+ * up to 4 KiB; n > 4 KiB goes straight to exec_memop (host libc NEON / DC ZVA). Preserves X0..X30
+ * and NZCV.
  */
 static uint32_t *emit_memop_memset(struct xlate *x, struct appine_dbt *d)
 {
     size_t x0 = offsetof(struct appine_cpu, x);
     uint32_t *entry = here(x);
     emit(x, enc_sub_imm(T1, 2, 1, 0)); /* n - 1 */
-    emit(x, enc_ubfx(T2, T1, APPINE_PAGE_SHIFT, 64 - APPINE_PAGE_SHIFT));
+    emit(x, enc_ubfx(T2, T1, MEMOP_COPY_SUPER_MAX_SHIFT, 64 - MEMOP_COPY_SUPER_MAX_SHIFT));
     uint32_t *fail0 = here(x);
-    emit(x, enc_cbnz_x(T2)); /* n == 0 or n > 4096 */
+    emit(x, enc_cbnz_x(T2)); /* n == 0 or n > 4096 -> fallback to exec_memop */
     emit(x, enc_add_lsl(T1, 0, T1, 0)); /* dst + n - 1 */
     emit(x, enc_ubfx(T1, T1, APPINE_PAGE_SHIFT, TLB_BITS));
     emit(x, enc_add_lsl(T1, CTX, T1, 5));
     emit(x, enc_ldp_x(T1, T2, T1, (int)(TLB_OFF + 16))); /* tag_write, addend_write */
     emit(x, enc_eon_lsr(T1, T1, 0, APPINE_PAGE_SHIFT));
-    uint32_t *fail1 = here(x);
+    uint32_t *try_stlb = here(x);
     emit(x, enc_cbnz_x(T1));
 
+    uint32_t *hit = here(x);
     emit(x, enc_stp_x(3, 4, CTX, (int)x0 + 24));
     emit(x, enc_and_low(3, 1, 8));
     emit(x, enc_orr_lsl(3, 3, 3, 8));
@@ -520,6 +615,12 @@ static uint32_t *emit_memop_memset(struct xlate *x, struct appine_dbt *d)
     emit(x, enc_ldp_x(3, 4, CTX, (int)x0 + 24));
     emit(x, enc_b((intptr_t)d->memop_ret - (intptr_t)here(x)));
 
+    /* 4 KiB TLB miss or cross-4 KiB span with 1 <= n <= 4096: probe 2 MiB STLB */
+    patch_branch(x->wdelta, try_stlb, here(x));
+    emit(x, enc_sub_imm(T1, 2, 1, 0));
+    uint32_t *fail1 = emit_memop_stlb_span(x, 0, true);
+    emit(x, enc_b((intptr_t)hit - (intptr_t)here(x)));
+
     uint32_t *fail = here(x);
     patch_branch(x->wdelta, fail0, fail);
     patch_branch(x->wdelta, fail1, fail);
@@ -528,44 +629,48 @@ static uint32_t *emit_memop_memset(struct xlate *x, struct appine_dbt *d)
 }
 
 /*
- * In-cache same-page memcpy/memmove (n >= 32, n <= 4096): X0 = dst, X1 = src, X2 = n,
- * T0 = fallback PC. Overlap-safe for both forward and backward moves, including shared-page host
- * aliases. Preserves X0..X30 and NZCV.
+ * In-cache memcpy/memmove (32 <= n <= MEMOP_COPY_SUPER_MAX): X0 = dst, X1 = src, X2 = n,
+ * T0 = fallback PC. Probes 4 KiB TLB first, falling back to 2 MiB STLB for cross-4 KiB spans up
+ * to 4 KiB; n > 4 KiB goes straight to exec_memop (host libc NEON). Overlap-safe for both forward
+ * and backward moves, including shared-page host aliases. Preserves X0..X30 and NZCV.
  */
 static uint32_t *emit_memop_memmove(struct xlate *x, struct appine_dbt *d)
 {
     size_t x0 = offsetof(struct appine_cpu, x);
     uint32_t *entry = here(x);
     emit(x, enc_sub_imm(T1, 2, 1, 0));
-    emit(x, enc_ubfx(T2, T1, APPINE_PAGE_SHIFT, 64 - APPINE_PAGE_SHIFT));
+    emit(x, enc_ubfx(T2, T1, MEMOP_COPY_SUPER_MAX_SHIFT, 64 - MEMOP_COPY_SUPER_MAX_SHIFT));
     uint32_t *fail0 = here(x);
-    emit(x, enc_cbnz_x(T2));
-    /* dst write-TLB check */
+    emit(x, enc_cbnz_x(T2)); /* n == 0 or n > 4096 -> fallback to exec_memop */
+    /* dst 4 KiB write-TLB check */
     emit(x, enc_add_lsl(T1, 0, T1, 0));
     emit(x, enc_ubfx(T1, T1, APPINE_PAGE_SHIFT, TLB_BITS));
     emit(x, enc_add_lsl(T1, CTX, T1, 5));
     emit(x, enc_ldp_x(T1, T2, T1, (int)(TLB_OFF + 16)));
     emit(x, enc_eon_lsr(T1, T1, 0, APPINE_PAGE_SHIFT));
-    uint32_t *fail1 = here(x);
+    uint32_t *dst_miss = here(x);
     emit(x, enc_cbnz_x(T1));
+    uint32_t *dst_ok = here(x);
     emit(x, enc_stp_x(3, 4, CTX, (int)x0 + 24));
     emit(x, enc_add_lsl(3, T2, 0, 0)); /* x3 = host_dst */
-    /* src read-TLB check */
+    /* src 4 KiB read-TLB check */
     emit(x, enc_sub_imm(T1, 2, 1, 0));
     emit(x, enc_add_lsl(T1, 1, T1, 0));
     emit(x, enc_ubfx(T1, T1, APPINE_PAGE_SHIFT, TLB_BITS));
     emit(x, enc_add_lsl(T1, CTX, T1, 5));
     emit(x, enc_ldp_x(T1, T2, T1, (int)TLB_OFF));
     emit(x, enc_eon_lsr(T1, T1, 1, APPINE_PAGE_SHIFT));
-    uint32_t *fail2 = here(x);
+    uint32_t *src_miss = here(x);
     emit(x, enc_cbnz_x(T1));
 
+    uint32_t *src_ok = here(x);
     emit(x, enc_stp_x(5, 6, CTX, (int)x0 + 40));
     emit(x, enc_add_lsl(4, T2, 1, 0)); /* x4 = host_src */
     emit(x, enc_sub_reg(T1, 3, 4));    /* diff = host_dst - host_src */
     uint32_t *same = here(x);
     emit(x, enc_cbz_x(T1));
-    emit(x, enc_ubfx(T2, T1, APPINE_PAGE_SHIFT, 64 - APPINE_PAGE_SHIFT));
+    /* Check unsigned 0 < diff < n without touching NZCV (n <= MEMOP_COPY_SUPER_MAX). */
+    emit(x, enc_ubfx(T2, T1, MEMOP_COPY_SUPER_MAX_SHIFT, 64 - MEMOP_COPY_SUPER_MAX_SHIFT));
     uint32_t *go_fwd = here(x);
     emit(x, enc_cbnz_x(T2)); /* diff >= 4096 (incl. host_dst < host_src) -> forward */
     emit(x, enc_sub_reg(T2, T1, 2));
@@ -675,19 +780,31 @@ static uint32_t *emit_memop_memmove(struct xlate *x, struct appine_dbt *d)
     emit(x, enc_ldp_x(5, 6, CTX, (int)x0 + 40));
     emit(x, enc_b((intptr_t)d->memop_ret - (intptr_t)here(x)));
 
-    patch_branch(x->wdelta, fail2, here(x));
+    /* dst 4 KiB miss (1 <= n <= 4096): probe 2 MiB STLB for dst, then continue to src 4 KiB check */
+    patch_branch(x->wdelta, dst_miss, here(x));
+    emit(x, enc_sub_imm(T1, 2, 1, 0));
+    uint32_t *dst_stlb_miss = emit_memop_stlb_span(x, 0, true);
+    emit(x, enc_b((intptr_t)dst_ok - (intptr_t)here(x)));
+
+    patch_branch(x->wdelta, src_miss, here(x));
+    emit(x, enc_sub_imm(T1, 2, 1, 0));
+    uint32_t *src_stlb_miss = emit_memop_stlb_span(x, 1, false);
+    emit(x, enc_b((intptr_t)src_ok - (intptr_t)here(x)));
+
+    patch_branch(x->wdelta, src_stlb_miss, here(x));
     emit(x, enc_ldp_x(3, 4, CTX, (int)x0 + 24));
     uint32_t *fail = here(x);
     patch_branch(x->wdelta, fail0, fail);
-    patch_branch(x->wdelta, fail1, fail);
+    patch_branch(x->wdelta, dst_stlb_miss, fail);
     emit(x, enc_br(T0));
     return entry;
 }
 
 /*
- * In-cache same-page memcmp (n >= 8, n <= 4096): X0 = a, X1 = b, X2 = n, T0 = fallback PC.
- * Compares 8 bytes per iteration (with an overlapping final 8-byte read when n & 7 != 0) and
- * returns the exact signed byte difference in X0. Preserves X1..X30 and NZCV.
+ * In-cache memcmp (n >= 8): X0 = a, X1 = b, X2 = n, T0 = fallback PC.
+ * Probes 4 KiB TLB first, falling back to 2 MiB STLB (up to MEMOP_SUPER_MAX bytes). Compares 8
+ * bytes per iteration (with an overlapping final 8-byte read when n & 7 != 0) and returns the
+ * exact signed byte difference in X0. Preserves X1..X30 and NZCV.
  */
 static uint32_t *emit_memop_memcmp(struct xlate *x, struct appine_dbt *d)
 {
@@ -695,28 +812,30 @@ static uint32_t *emit_memop_memcmp(struct xlate *x, struct appine_dbt *d)
     uint32_t *entry = here(x);
     emit(x, enc_sub_imm(T1, 2, 1, 0));
     emit(x, enc_ubfx(T2, T1, APPINE_PAGE_SHIFT, 64 - APPINE_PAGE_SHIFT));
-    uint32_t *fail0 = here(x);
+    uint32_t *try_super = here(x);
     emit(x, enc_cbnz_x(T2));
-    /* a read-TLB check */
+    /* a 4 KiB read-TLB check */
     emit(x, enc_add_lsl(T1, 0, T1, 0));
     emit(x, enc_ubfx(T1, T1, APPINE_PAGE_SHIFT, TLB_BITS));
     emit(x, enc_add_lsl(T1, CTX, T1, 5));
     emit(x, enc_ldp_x(T1, T2, T1, (int)TLB_OFF));
     emit(x, enc_eon_lsr(T1, T1, 0, APPINE_PAGE_SHIFT));
-    uint32_t *fail1 = here(x);
+    uint32_t *a_miss = here(x);
     emit(x, enc_cbnz_x(T1));
+    uint32_t *a_ok = here(x);
     emit(x, enc_stp_x(3, 4, CTX, (int)x0 + 24));
     emit(x, enc_add_lsl(3, T2, 0, 0)); /* x3 = host_a */
-    /* b read-TLB check */
+    /* b 4 KiB read-TLB check */
     emit(x, enc_sub_imm(T1, 2, 1, 0));
     emit(x, enc_add_lsl(T1, 1, T1, 0));
     emit(x, enc_ubfx(T1, T1, APPINE_PAGE_SHIFT, TLB_BITS));
     emit(x, enc_add_lsl(T1, CTX, T1, 5));
     emit(x, enc_ldp_x(T1, T2, T1, (int)TLB_OFF));
     emit(x, enc_eon_lsr(T1, T1, 1, APPINE_PAGE_SHIFT));
-    uint32_t *fail2 = here(x);
+    uint32_t *b_miss = here(x);
     emit(x, enc_cbnz_x(T1));
 
+    uint32_t *b_ok = here(x);
     emit(x, enc_stp_x(5, 6, CTX, (int)x0 + 40));
     emit(x, enc_add_lsl(4, T2, 1, 0)); /* x4 = host_b */
     emit(x, enc_eor_lsr(T1, 3, 4, 0));
@@ -768,31 +887,81 @@ static uint32_t *emit_memop_memcmp(struct xlate *x, struct appine_dbt *d)
     emit(x, enc_ldp_x(5, 6, CTX, (int)x0 + 40));
     emit(x, enc_b((intptr_t)d->memop_ret - (intptr_t)here(x)));
 
-    patch_branch(x->wdelta, fail2, here(x));
+    patch_branch(x->wdelta, a_miss, here(x));
+    emit(x, enc_sub_imm(T1, 2, 1, 0));
+    uint32_t *a_stlb_miss = emit_memop_stlb_span(x, 0, false);
+    emit(x, enc_b((intptr_t)a_ok - (intptr_t)here(x)));
+
+    patch_branch(x->wdelta, try_super, here(x));
+    emit(x, enc_ubfx(T2, T1, MEMOP_SUPER_MAX_SHIFT, 64 - MEMOP_SUPER_MAX_SHIFT));
+    uint32_t *fail0 = here(x);
+    emit(x, enc_cbnz_x(T2));
+    uint32_t *super_a_miss = emit_memop_stlb_span(x, 0, false);
+    emit(x, enc_stp_x(3, 4, CTX, (int)x0 + 24));
+    emit(x, enc_add_lsl(3, T2, 0, 0)); /* x3 = host_a */
+
+    patch_branch(x->wdelta, b_miss, here(x));
+    emit(x, enc_sub_imm(T1, 2, 1, 0));
+    uint32_t *b_stlb_miss = emit_memop_stlb_span(x, 1, false);
+    emit(x, enc_b((intptr_t)b_ok - (intptr_t)here(x)));
+
+    patch_branch(x->wdelta, b_stlb_miss, here(x));
     emit(x, enc_ldp_x(3, 4, CTX, (int)x0 + 24));
     uint32_t *fail = here(x);
     patch_branch(x->wdelta, fail0, fail);
-    patch_branch(x->wdelta, fail1, fail);
+    patch_branch(x->wdelta, a_stlb_miss, fail);
+    patch_branch(x->wdelta, super_a_miss, fail);
     emit(x, enc_br(T0));
     return entry;
 }
 
+/* Probe 4 KiB TLB read half for `addr`. On hit T2 = addend_read; returns the cbnz T1 miss branch.
+ * Clobbers T1, T2; preserves addr, T0, and NZCV. */
+static uint32_t *emit_memop_tlb_point(struct xlate *x, unsigned addr)
+{
+    emit(x, enc_ubfx(T1, addr, APPINE_PAGE_SHIFT, TLB_BITS));
+    emit(x, enc_add_lsl(T1, CTX, T1, 5));
+    emit(x, enc_ldp_x(T1, T2, T1, (int)TLB_OFF));
+    emit(x, enc_eon_lsr(T1, T1, addr, APPINE_PAGE_SHIFT));
+    uint32_t *miss = here(x);
+    emit(x, enc_cbnz_x(T1));
+    return miss;
+}
+
+/* Set `dst` = 4096 - (addr & 4095) in [1, 4096] (dst != T2). Clobbers T1, T2; preserves addr,
+ * T0, and NZCV. */
+static void emit_page_rem(struct xlate *x, unsigned dst, unsigned addr)
+{
+    emit(x, enc_and_low(T1, addr, APPINE_PAGE_SHIFT));
+    emit(x, enc_movz(T2, APPINE_PAGE_SIZE, 0));
+    emit(x, enc_sub_reg(dst, T2, T1));
+}
+
+/* Probe 2 MiB STLB read half for `addr` to compute continuation runway T1: super_cap(addr) on
+ * STLB hit, else fall back to its already-verified 4 KiB page runway. Clobbers T1, T2. */
+static void emit_memop_cont_cap(struct xlate *x, unsigned addr)
+{
+    uint32_t *use_4k = emit_memop_stlb_point(x, addr, false);
+    emit_super_cap(x, addr);
+    uint32_t *got = here(x);
+    emit(x, enc_b(0));
+    patch_branch(x->wdelta, use_4k, here(x));
+    emit_page_rem(x, T1, addr);
+    patch_branch(x->wdelta, got, here(x));
+}
+
 /*
- * In-cache first-page memchr (n >= 1, including n = SIZE_MAX from strnlen): X0 = s, X1 = c,
- * X2 = n, T0 = fallback PC. Scans min(n, bytes_to_page_end) bytes via 8-byte SWAR; returns X0 + off
- * (preserving any TBI tag) on match, 0 if n stayed within the page, or jumps to fallback with all
- * guest registers untouched if the search reaches the next page.
+ * In-cache memchr (n >= 1, including n = SIZE_MAX from strnlen): X0 = s, X1 = c, X2 = n,
+ * T0 = fallback PC. Probes 4 KiB TLB first and continues through 2 MiB STLB (up to
+ * MEMOP_SUPER_MAX bytes) on 4 KiB miss or boundary crossing; returns X0 + off (preserving any TBI
+ * tag) on match, 0 if n stayed within the scanned span, or falls back with all guest registers
+ * untouched.
  */
 static uint32_t *emit_memop_memchr(struct xlate *x, struct appine_dbt *d)
 {
     size_t x0 = offsetof(struct appine_cpu, x);
     uint32_t *entry = here(x);
-    emit(x, enc_ubfx(T1, 0, APPINE_PAGE_SHIFT, TLB_BITS));
-    emit(x, enc_add_lsl(T1, CTX, T1, 5));
-    emit(x, enc_ldp_x(T1, T2, T1, (int)TLB_OFF));
-    emit(x, enc_eon_lsr(T1, T1, 0, APPINE_PAGE_SHIFT));
-    uint32_t *fail = here(x);
-    emit(x, enc_cbnz_x(T1));
+    uint32_t *tlb_miss = emit_memop_tlb_point(x, 0);
 
     emit(x, enc_stp_x(3, 4, CTX, (int)x0 + 24));
     emit(x, enc_stp_x(5, 6, CTX, (int)x0 + 40));
@@ -801,21 +970,10 @@ static uint32_t *emit_memop_memchr(struct xlate *x, struct appine_dbt *d)
     emit(x, enc_mov(T0, 7));                      /* T0 = cur */
 
     /* T1 = min(X2, 4096 - (X0 & 4095)), always in [1, 4096] */
-    emit(x, enc_and_low(T1, 0, APPINE_PAGE_SHIFT));
-    emit(x, enc_movz(T2, APPINE_PAGE_SIZE, 0));
-    emit(x, enc_sub_reg(T1, T2, T1));
-    emit(x, enc_ubfx(T2, 2, APPINE_PAGE_SHIFT, 64 - APPINE_PAGE_SHIFT));
-    uint32_t *bip0 = here(x);
-    emit(x, enc_cbnz_x(T2));
-    emit(x, enc_sub_reg(T2, 2, T1));
-    uint32_t *bip1 = here(x);
-    emit(x, enc_tbz(T2, 63));
-    emit(x, enc_mov(T1, 2));
-    uint32_t *have_lim = here(x);
-    patch_branch(x->wdelta, bip0, have_lim);
-    patch_branch(x->wdelta, bip1, have_lim);
-    emit(x, enc_str_x(T1, CTX, x0 + 72)); /* save limit */
+    emit_page_rem(x, T1, 0);
+    emit_clamp_to_x2(x, T1);
 
+    uint32_t *have_chunk = here(x);
     emit(x, enc_and_low(3, 1, 8));
     emit(x, enc_orr_lsl(3, 3, 3, 8));
     emit(x, enc_orr_lsl(3, 3, 3, 16));
@@ -823,7 +981,9 @@ static uint32_t *emit_memop_memchr(struct xlate *x, struct appine_dbt *d)
     emit_mov_const(x, 4, UINT64_C(0x0101010101010101));
     emit(x, enc_orr_lsl(5, 31, 4, 7)); /* 0x8080808080808080 */
 
-    emit(x, enc_ubfx(T2, T1, 3, 61)); /* count8 = limit / 8 */
+    uint32_t *scan_chunk = here(x);
+    emit(x, enc_str_x(T1, CTX, x0 + 72)); /* save current chunk_len */
+    emit(x, enc_ubfx(T2, T1, 3, 61));     /* count8 = chunk_len / 8 */
     uint32_t *no8 = here(x);
     emit(x, enc_cbz_x(T2));
     uint32_t *loop8 = here(x);
@@ -841,13 +1001,13 @@ static uint32_t *emit_memop_memchr(struct xlate *x, struct appine_dbt *d)
 
     patch_branch(x->wdelta, no8, here(x));
     emit(x, enc_ldr_x(T2, CTX, x0 + 72));
-    emit(x, enc_and_low(T2, T2, 3)); /* limit & 7 */
+    emit(x, enc_and_low(T2, T2, 3)); /* chunk_len & 7 */
     uint32_t *no1 = here(x);
     emit(x, enc_cbz_x(T2));
-    emit(x, enc_and_low(3, 1, 8));
+    emit(x, enc_and_low(T1, 3, 8)); /* preserve replicated c in x3 for STLB continuation */
     uint32_t *loop1 = here(x);
     emit(x, enc_ldr_post(0, 6, T0, 1));
-    emit(x, enc_eor_lsr(6, 6, 3, 0));
+    emit(x, enc_eor_lsr(6, 6, T1, 0));
     uint32_t *hit_byte = here(x);
     emit(x, enc_cbz_x(6));
     emit(x, enc_sub_imm(T2, T2, 1, 0));
@@ -855,24 +1015,51 @@ static uint32_t *emit_memop_memchr(struct xlate *x, struct appine_dbt *d)
     emit(x, enc_cbnz_x(T2));
     patch_branch(x->wdelta, back1, loop1);
 
-    /* Not found in first page: return NULL if n == limit, else fall back for cross-page scan */
+    /* Not found in chunk: return NULL if total_scanned == n, else try 2 MiB STLB continuation */
     patch_branch(x->wdelta, no1, here(x));
-    emit(x, enc_ldr_x(T1, CTX, x0 + 72));
-    emit(x, enc_sub_reg(T1, 2, T1));
-    uint32_t *cross = here(x);
-    emit(x, enc_cbnz_x(T1));
+    emit(x, enc_sub_reg(T1, T0, 7)); /* total_scanned = cur - host_s */
+    emit(x, enc_sub_reg(T2, 2, T1)); /* n - total_scanned */
+    uint32_t *more = here(x);
+    emit(x, enc_cbnz_x(T2));
     emit(x, enc_movz(0, 0, 0));
     emit(x, enc_ldp_x(3, 4, CTX, (int)x0 + 24));
     emit(x, enc_ldp_x(5, 6, CTX, (int)x0 + 40));
     emit(x, enc_ldr_x(7, CTX, x0 + 56));
     emit(x, enc_b((intptr_t)d->memop_ret - (intptr_t)here(x)));
 
-    patch_branch(x->wdelta, cross, here(x));
+    patch_branch(x->wdelta, more, here(x));
+    uint32_t *cont_miss = emit_memop_stlb_point(x, 0, false);
+    emit_super_cap(x, 0);
+    emit_clamp_to_x2(x, T1);
+    emit(x, enc_sub_reg(T2, T0, 7));  /* total_scanned */
+    emit(x, enc_sub_reg(T1, T1, T2)); /* extra = super_cap - total_scanned */
+    uint32_t *cont_done0 = here(x);
+    emit(x, enc_cbz_x(T1));
+    uint32_t *cont_done1 = here(x);
+    emit(x, enc_tbnz(T1, 63));
+    emit(x, enc_b((intptr_t)scan_chunk - (intptr_t)here(x)));
+
+    uint32_t *cross = here(x);
+    patch_branch(x->wdelta, cont_miss, cross);
+    patch_branch(x->wdelta, cont_done0, cross);
+    patch_branch(x->wdelta, cont_done1, cross);
     emit(x, enc_ldp_x(3, 4, CTX, (int)x0 + 24));
     emit(x, enc_ldp_x(5, 6, CTX, (int)x0 + 40));
     emit(x, enc_ldp_x(7, T0, CTX, (int)x0 + 56));
-    patch_branch(x->wdelta, fail, here(x));
+    uint32_t *fail = here(x);
     emit(x, enc_br(T0));
+
+    patch_branch(x->wdelta, tlb_miss, here(x));
+    uint32_t *entry_stlb_miss = emit_memop_stlb_point(x, 0, true);
+    patch_branch(x->wdelta, entry_stlb_miss, fail);
+    emit(x, enc_stp_x(3, 4, CTX, (int)x0 + 24));
+    emit(x, enc_stp_x(5, 6, CTX, (int)x0 + 40));
+    emit(x, enc_stp_x(7, T0, CTX, (int)x0 + 56));
+    emit(x, enc_add_lsl(7, T2, 0, 0)); /* x7 = host_s */
+    emit(x, enc_mov(T0, 7));           /* T0 = cur */
+    emit_super_cap(x, 0);
+    emit_clamp_to_x2(x, T1);
+    emit(x, enc_b((intptr_t)have_chunk - (intptr_t)here(x)));
 
     patch_branch(x->wdelta, hit_word, here(x));
     emit(x, enc_rbit_x(T1, T1));
@@ -895,6 +1082,292 @@ static uint32_t *emit_memop_memchr(struct xlate *x, struct appine_dbt *d)
     emit(x, enc_ldp_x(5, 6, CTX, (int)x0 + 40));
     emit(x, enc_ldr_x(7, CTX, x0 + 56));
     emit(x, enc_b((intptr_t)d->memop_ret - (intptr_t)here(x)));
+    return entry;
+}
+
+/*
+ * In-cache strlen: X0 = s, T0 = fallback PC. Probes 4 KiB TLB read half first and continues
+ * through 2 MiB STLB (up to MEMOP_SUPER_MAX bytes) on 4 KiB miss or boundary crossing; scans
+ * 8-byte SWAR + byte tail for NUL, returning length in X0 via d->memop_ret, or falls back with
+ * all guest registers and NZCV untouched.
+ */
+static uint32_t *emit_memop_strlen(struct xlate *x, struct appine_dbt *d)
+{
+    size_t x0 = offsetof(struct appine_cpu, x);
+    uint32_t *entry = here(x);
+    uint32_t *tlb_miss = emit_memop_tlb_point(x, 0);
+
+    emit(x, enc_stp_x(3, 4, CTX, (int)x0 + 24));
+    emit(x, enc_stp_x(5, 6, CTX, (int)x0 + 40));
+    emit(x, enc_str_x(T0, CTX, x0 + 56));
+    emit(x, enc_add_lsl(3, T2, 0, 0)); /* x3 = host_s */
+    emit(x, enc_mov(T0, 3));           /* T0 = cur */
+    emit_page_rem(x, T1, 0);           /* 4096 - (X0 & 4095) */
+
+    uint32_t *have_chunk = here(x);
+    emit_mov_const(x, 4, UINT64_C(0x0101010101010101));
+    emit(x, enc_orr_lsl(5, 31, 4, 7)); /* 0x8080808080808080 */
+
+    uint32_t *scan_chunk = here(x);
+    emit(x, enc_str_x(T1, CTX, x0 + 64)); /* save current chunk_len */
+    emit(x, enc_ubfx(T2, T1, 3, 61));     /* count8 = chunk_len / 8 */
+    uint32_t *no8 = here(x);
+    emit(x, enc_cbz_x(T2));
+    uint32_t *loop8 = here(x);
+    emit(x, enc_ldr_post(3, 6, T0, 8));
+    emit(x, enc_sub_reg(T1, 6, 4));
+    emit(x, enc_bic_reg(T1, T1, 6));
+    emit(x, enc_and_reg(T1, T1, 5));
+    uint32_t *hit_word = here(x);
+    emit(x, enc_cbnz_x(T1));
+    emit(x, enc_sub_imm(T2, T2, 1, 0));
+    uint32_t *back8 = here(x);
+    emit(x, enc_cbnz_x(T2));
+    patch_branch(x->wdelta, back8, loop8);
+
+    patch_branch(x->wdelta, no8, here(x));
+    emit(x, enc_ldr_x(T2, CTX, x0 + 64));
+    emit(x, enc_and_low(T2, T2, 3)); /* chunk_len & 7 */
+    uint32_t *no1 = here(x);
+    emit(x, enc_cbz_x(T2));
+    uint32_t *loop1 = here(x);
+    emit(x, enc_ldr_post(0, 6, T0, 1));
+    uint32_t *hit_byte = here(x);
+    emit(x, enc_cbz_x(6));
+    emit(x, enc_sub_imm(T2, T2, 1, 0));
+    uint32_t *back1 = here(x);
+    emit(x, enc_cbnz_x(T2));
+    patch_branch(x->wdelta, back1, loop1);
+
+    /* Boundary reached without NUL: try 2 MiB STLB continuation before falling back */
+    patch_branch(x->wdelta, no1, here(x));
+    uint32_t *cont_miss = emit_memop_stlb_point(x, 0, false);
+    emit_super_cap(x, 0);
+    emit(x, enc_sub_reg(T2, T0, 3));  /* total_scanned = cur - host_s */
+    emit(x, enc_sub_reg(T1, T1, T2)); /* extra = super_cap - total_scanned */
+    uint32_t *cont_done0 = here(x);
+    emit(x, enc_cbz_x(T1));
+    uint32_t *cont_done1 = here(x);
+    emit(x, enc_tbnz(T1, 63));
+    emit(x, enc_b((intptr_t)scan_chunk - (intptr_t)here(x)));
+
+    uint32_t *cross = here(x);
+    patch_branch(x->wdelta, cont_miss, cross);
+    patch_branch(x->wdelta, cont_done0, cross);
+    patch_branch(x->wdelta, cont_done1, cross);
+    emit(x, enc_ldp_x(3, 4, CTX, (int)x0 + 24));
+    emit(x, enc_ldp_x(5, 6, CTX, (int)x0 + 40));
+    emit(x, enc_ldr_x(T0, CTX, x0 + 56));
+    uint32_t *fail = here(x);
+    emit(x, enc_br(T0));
+
+    patch_branch(x->wdelta, tlb_miss, here(x));
+    uint32_t *entry_stlb_miss = emit_memop_stlb_point(x, 0, true);
+    patch_branch(x->wdelta, entry_stlb_miss, fail);
+    emit(x, enc_stp_x(3, 4, CTX, (int)x0 + 24));
+    emit(x, enc_stp_x(5, 6, CTX, (int)x0 + 40));
+    emit(x, enc_str_x(T0, CTX, x0 + 56));
+    emit(x, enc_add_lsl(3, T2, 0, 0)); /* x3 = host_s */
+    emit(x, enc_mov(T0, 3));           /* T0 = cur */
+    emit_super_cap(x, 0);
+    emit(x, enc_b((intptr_t)have_chunk - (intptr_t)here(x)));
+
+    patch_branch(x->wdelta, hit_word, here(x));
+    emit(x, enc_rbit_x(T1, T1));
+    emit(x, enc_clz_x(T1, T1));
+    emit(x, enc_ubfx(T1, T1, 3, 61)); /* byte index 0..7 */
+    emit(x, enc_sub_imm(T0, T0, 8, 0));
+    emit(x, enc_sub_reg(0, T0, 3));
+    emit(x, enc_add_lsl(0, 0, T1, 0));
+    emit(x, enc_ldp_x(3, 4, CTX, (int)x0 + 24));
+    emit(x, enc_ldp_x(5, 6, CTX, (int)x0 + 40));
+    emit(x, enc_b((intptr_t)d->memop_ret - (intptr_t)here(x)));
+
+    patch_branch(x->wdelta, hit_byte, here(x));
+    emit(x, enc_sub_imm(T0, T0, 1, 0));
+    emit(x, enc_sub_reg(0, T0, 3));
+    emit(x, enc_ldp_x(3, 4, CTX, (int)x0 + 24));
+    emit(x, enc_ldp_x(5, 6, CTX, (int)x0 + 40));
+    emit(x, enc_b((intptr_t)d->memop_ret - (intptr_t)here(x)));
+    return entry;
+}
+
+/*
+ * In-cache strcmp (bounded == false) / strncmp (bounded == true, X2 >= 1): X0 = a, X1 = b,
+ * [X2 = n], T0 = fallback PC. Probes 4 KiB TLB read half for both pointers with 2 MiB STLB
+ * fallback/continuation (up to MEMOP_SUPER_MAX bytes). Never shortcuts a == b without seeing NUL
+ * (or n bytes for strncmp) so unmapped tail pages fault accurately. Preserves X1..X30 and NZCV.
+ */
+static uint32_t *emit_memop_strcmp_common(struct xlate *x, struct appine_dbt *d, bool bounded)
+{
+    size_t x0 = offsetof(struct appine_cpu, x);
+    uint32_t *entry = here(x);
+
+    /* Probe a (X0) 4 KiB read TLB */
+    uint32_t *a_tlb_miss = emit_memop_tlb_point(x, 0);
+    emit(x, enc_stp_x(3, 4, CTX, (int)x0 + 24));
+    emit(x, enc_stp_x(5, 6, CTX, (int)x0 + 40));
+    emit(x, enc_stp_x(7, T0, CTX, (int)x0 + 56)); /* x7 + fallback PC */
+    emit(x, enc_add_lsl(3, T2, 0, 0));            /* x3 = host_a */
+    emit_page_rem(x, 5, 0);                       /* x5 = rem_a (1..4096) */
+
+    uint32_t *a_ready = here(x);
+    emit(x, enc_str_x(3, CTX, x0 + 72));          /* save host_a in cpu->x[9] */
+
+    /* Probe b (X1) 4 KiB read TLB */
+    uint32_t *b_tlb_miss = emit_memop_tlb_point(x, 1);
+    emit(x, enc_add_lsl(4, T2, 1, 0));            /* x4 = host_b */
+    emit_page_rem(x, T1, 1);                      /* T1 = rem_b (1..4096) */
+
+    uint32_t *b_ready = here(x);
+    /* T0 = min(rem_a, rem_b), both in [1, MEMOP_SUPER_MAX] */
+    emit(x, enc_sub_reg(T2, T1, 5));
+    emit(x, enc_mov(T0, 5));
+    uint32_t *keep_a = here(x);
+    emit(x, enc_tbz(T2, 63));
+    emit(x, enc_mov(T0, T1));
+    patch_branch(x->wdelta, keep_a, here(x));
+    if (bounded)
+        emit_clamp_to_x2(x, T0);
+
+    emit_mov_const(x, 7, UINT64_C(0x0101010101010101));
+
+    /* SWAR 8-byte scan + <8 B tail; T0 holds chunk_len (in [1, MEMOP_SUPER_MAX]). */
+    uint32_t *scan_chunk = here(x);
+    emit(x, enc_sub_imm(T0, T0, 8, 0));
+    uint32_t *lt8 = here(x);
+    emit(x, enc_tbnz(T0, 63));
+    uint32_t *loop8 = here(x);
+    emit(x, enc_ldr_post(3, 5, 3, 8));
+    emit(x, enc_ldr_post(3, 6, 4, 8));
+    emit(x, enc_eor_lsr(T1, 5, 6, 0)); /* diff = w1 ^ w2 */
+    emit(x, enc_sub_reg(T2, 5, 7));    /* w1 - 0x0101... */
+    emit(x, enc_bic_reg(T2, T2, 5));   /* (w1 - 0x0101...) & ~w1 */
+    emit(x, enc_and_80s(T2, T2));      /* nul = ... & 0x8080... */
+    emit(x, enc_orr_reg(T1, T1, T2));  /* diff | nul */
+    uint32_t *hit_word = here(x);
+    emit(x, enc_cbnz_x(T1));
+    emit(x, enc_sub_imm(T0, T0, 8, 0));
+    uint32_t *back8 = here(x);
+    emit(x, enc_tbz(T0, 63));
+    patch_branch(x->wdelta, back8, loop8);
+
+    patch_branch(x->wdelta, lt8, here(x));
+    emit(x, enc_add_imm(T0, T0, 8, 0)); /* chunk_len & 7 (0..7) */
+    uint32_t *no1 = here(x);
+    emit(x, enc_cbz_x(T0));
+    uint32_t *loop1 = here(x);
+    emit(x, enc_ldr_post(0, 5, 3, 1));
+    emit(x, enc_ldr_post(0, 6, 4, 1));
+    emit(x, enc_sub_reg(T1, 5, 6));
+    uint32_t *hit_byte = here(x);
+    emit(x, enc_cbnz_x(T1));
+    uint32_t *hit_nul = here(x);
+    emit(x, enc_cbz_x(5));
+    emit(x, enc_sub_imm(T0, T0, 1, 0));
+    uint32_t *back1 = here(x);
+    emit(x, enc_cbnz_x(T0));
+    patch_branch(x->wdelta, back1, loop1);
+
+    /* Chunk exhausted without diff or NUL */
+    patch_branch(x->wdelta, no1, here(x));
+    emit(x, enc_ldr_x(T2, CTX, x0 + 72)); /* host_a */
+    emit(x, enc_sub_reg(5, 3, T2));       /* x5 = total_scanned = cur_a - host_a */
+    uint32_t *done_n = NULL;
+    if (bounded) {
+        emit(x, enc_sub_reg(T1, 2, 5));
+        done_n = here(x);
+        emit(x, enc_cbz_x(T1)); /* matched all n bytes -> return 0 */
+    }
+
+    /* Try 2 MiB STLB continuation for a and/or b */
+    emit_memop_cont_cap(x, 0);
+    emit(x, enc_mov(6, T1)); /* x6 = cap_a */
+    emit(x, enc_sub_reg(T2, 6, 5));
+    uint32_t *cont_fail_a0 = here(x);
+    emit(x, enc_cbz_x(T2));
+    uint32_t *cont_fail_a1 = here(x);
+    emit(x, enc_tbnz(T2, 63));
+
+    emit_memop_cont_cap(x, 1);
+
+    /* T0 = min(cap_a, cap_b[, X2]) - total_scanned */
+    emit(x, enc_sub_reg(T2, T1, 6));
+    emit(x, enc_mov(T0, 6));
+    uint32_t *cont_keep_a = here(x);
+    emit(x, enc_tbz(T2, 63));
+    emit(x, enc_mov(T0, T1));
+    patch_branch(x->wdelta, cont_keep_a, here(x));
+    if (bounded)
+        emit_clamp_to_x2(x, T0);
+    emit(x, enc_sub_reg(T0, T0, 5));
+    uint32_t *cont_fail_0 = here(x);
+    emit(x, enc_cbz_x(T0));
+    uint32_t *cont_fail_1 = here(x);
+    emit(x, enc_tbnz(T0, 63));
+    emit(x, enc_b((intptr_t)scan_chunk - (intptr_t)here(x)));
+
+    /* Return 0 (NUL match or n bytes equal) */
+    uint32_t *ret_zero = here(x);
+    patch_branch(x->wdelta, hit_nul, ret_zero);
+    if (done_n)
+        patch_branch(x->wdelta, done_n, ret_zero);
+    emit(x, enc_movz(0, 0, 0));
+    uint32_t *ret_x0 = here(x);
+    emit(x, enc_ldp_x(3, 4, CTX, (int)x0 + 24));
+    emit(x, enc_ldp_x(5, 6, CTX, (int)x0 + 40));
+    emit(x, enc_ldr_x(7, CTX, x0 + 56));
+    emit(x, enc_b((intptr_t)d->memop_ret - (intptr_t)here(x)));
+
+    /* Byte tail diff: T1 = (uint8_t)a[i] - (uint8_t)b[i] */
+    patch_branch(x->wdelta, hit_byte, here(x));
+    emit(x, enc_mov(0, T1));
+    emit(x, enc_b((intptr_t)ret_x0 - (intptr_t)here(x)));
+
+    /* Word diff or NUL: lowest set bit of (diff | nul) lies in byte min(first_diff, first_nul) */
+    patch_branch(x->wdelta, hit_word, here(x));
+    emit(x, enc_rbit_x(T1, T1));
+    emit(x, enc_clz_x(T1, T1));
+    emit(x, enc_and_clear_low(T1, T1, 3)); /* shift = 8 * min(first_diff, first_nul) */
+    emit(x, enc_lsrv(5, 5, T1));
+    emit(x, enc_lsrv(6, 6, T1));
+    emit(x, enc_and_low(5, 5, 8));
+    emit(x, enc_and_low(6, 6, 8));
+    emit(x, enc_sub_reg(0, 5, 6));
+    emit(x, enc_b((intptr_t)ret_x0 - (intptr_t)here(x)));
+
+    /* Fallback paths (restore borrowed regs on cross_fail; untouched on a entry miss) */
+    uint32_t *cross_fail = here(x);
+    patch_branch(x->wdelta, cont_fail_a0, cross_fail);
+    patch_branch(x->wdelta, cont_fail_a1, cross_fail);
+    patch_branch(x->wdelta, cont_fail_0, cross_fail);
+    patch_branch(x->wdelta, cont_fail_1, cross_fail);
+    emit(x, enc_ldp_x(3, 4, CTX, (int)x0 + 24));
+    emit(x, enc_ldp_x(5, 6, CTX, (int)x0 + 40));
+    emit(x, enc_ldp_x(7, T0, CTX, (int)x0 + 56));
+    uint32_t *fail = here(x);
+    emit(x, enc_br(T0));
+
+    /* Entry 2 MiB STLB fallback for a (X0) */
+    patch_branch(x->wdelta, a_tlb_miss, here(x));
+    uint32_t *a_stlb_miss = emit_memop_stlb_point(x, 0, true);
+    patch_branch(x->wdelta, a_stlb_miss, fail);
+    emit(x, enc_stp_x(3, 4, CTX, (int)x0 + 24));
+    emit(x, enc_stp_x(5, 6, CTX, (int)x0 + 40));
+    emit(x, enc_stp_x(7, T0, CTX, (int)x0 + 56));
+    emit(x, enc_add_lsl(3, T2, 0, 0)); /* x3 = host_a */
+    emit_super_cap(x, 0);
+    emit(x, enc_mov(5, T1));           /* x5 = rem_a */
+    emit(x, enc_b((intptr_t)a_ready - (intptr_t)here(x)));
+
+    /* Entry 2 MiB STLB fallback for b (X1) */
+    patch_branch(x->wdelta, b_tlb_miss, here(x));
+    uint32_t *b_stlb_miss = emit_memop_stlb_point(x, 1, true);
+    patch_branch(x->wdelta, b_stlb_miss, cross_fail);
+    emit(x, enc_add_lsl(4, T2, 1, 0)); /* x4 = host_b */
+    emit_super_cap(x, 1);              /* T1 = rem_b */
+    emit(x, enc_b((intptr_t)b_ready - (intptr_t)here(x)));
+
     return entry;
 }
 
@@ -1013,6 +1486,9 @@ void dbt_emit_routines(struct appine_dbt *d)
     d->memop_memmove = emit_memop_memmove(x, d);
     d->memop_memcmp = emit_memop_memcmp(x, d);
     d->memop_memchr = emit_memop_memchr(x, d);
+    d->memop_strlen = emit_memop_strlen(x, d);
+    d->memop_strcmp = emit_memop_strcmp_common(x, d, false);
+    d->memop_strncmp = emit_memop_strcmp_common(x, d, true);
 
     if (x->n >= MAX_BLOCK_WORDS)
         appine_guard_fail();

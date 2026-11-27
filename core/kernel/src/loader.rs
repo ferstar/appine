@@ -1025,6 +1025,8 @@ fn memop_kind_for(name: &[u8], bind: u8) -> u32 {
         b"memcmp" => appine_engine::MEMOP_MEMCMP,
         b"memchr" => appine_engine::MEMOP_MEMCHR,
         b"strncmp" => appine_engine::MEMOP_STRNCMP,
+        b"strlen" => appine_engine::MEMOP_STRLEN,
+        b"strcmp" => appine_engine::MEMOP_STRCMP,
         _ => 0,
     }
 }
@@ -1763,6 +1765,8 @@ mod tests {
         let s_memset = add_str(b"memset");
         let s_memmove_ifunc = add_str(b"memmove");
         let s_strlen = add_str(b"strlen");
+        let s_strcmp = add_str(b"strcmp");
+        let s_strcpy = add_str(b"strcpy");
 
         let mut symtab = vec![0u8; 24]; // STN_UNDEF
         let mut add_sym = |name: u32, bind: u8, typ: u8, value: u64| {
@@ -1781,8 +1785,12 @@ mod tests {
         add_sym(s_memset, STB_WEAK, STT_FUNC, p_vaddr + 0x300);
         // Global STT_GNU_IFUNC (10) memmove -> must be ignored.
         add_sym(s_memmove_ifunc, STB_GLOBAL, 10, p_vaddr + 0x400);
-        // Global strlen -> not in the length-gated memop set, must be ignored.
+        // Global STT_FUNC strlen -> accepted at file offset 0x1500.
         add_sym(s_strlen, STB_GLOBAL, STT_FUNC, p_vaddr + 0x500);
+        // Global STT_FUNC strcmp -> accepted at file offset 0x1600.
+        add_sym(s_strcmp, STB_GLOBAL, STT_FUNC, p_vaddr + 0x600);
+        // Global strcpy -> not in the supported memop set, must be ignored.
+        add_sym(s_strcpy, STB_GLOBAL, STT_FUNC, p_vaddr + 0x700);
 
         let sym_off: u64 = 0x2000;
         let str_off: u64 = 0x2400;
@@ -1857,6 +1865,16 @@ mod tests {
                     p_vaddr + 0x300,
                     p_offset + 0x300,
                     appine_engine::MEMOP_MEMSET
+                ),
+                (
+                    p_vaddr + 0x500,
+                    p_offset + 0x500,
+                    appine_engine::MEMOP_STRLEN
+                ),
+                (
+                    p_vaddr + 0x600,
+                    p_offset + 0x600,
+                    appine_engine::MEMOP_STRCMP
                 ),
             ]
         );

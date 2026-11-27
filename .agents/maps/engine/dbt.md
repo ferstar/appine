@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-23 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: lazy FP activation, eager inline linking, MT pre-translate, wider grouping, inline sysreg/pair-exclusive lowering, and extended fast-loop matcher)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: 2 MiB STLB in-cache memop helpers and in-cache/exec_memop strlen, strcmp and strncmp)
 
 ## Responsibilities
 
@@ -63,7 +63,7 @@ triggers (`kernel/oom`).
   `T0..T2=x16/x17/x27`, `SP_HOST=x26`; stolen `x16–x18, x26–x28`) or `Go` (`CTX=x25`,
   `T0..T2=x21/x22/x23`, `SP_HOST=x24`; stolen `x18, x21–x25`).
 - `DbtMemop` (`struct appine_dbt_memop`) — registered libc memop `(pc, kind)` (`memcpy`, `memset`,
-  `memmove`, `memcmp`, `memchr`, `strncmp`; up to `APPINE_DBT_MEMOPS` = 32).
+  `memmove`, `memcmp`, `memchr`, `strncmp`, `strlen`, `strcmp`; up to `APPINE_DBT_MEMOPS` = 32).
 - `DbtSource` — trusted code range: `start`, `len` and 5-word identity (`dev`, `ino`, `off`,
   `ctime`, `size`; all-ones for the vDSO).
 - `struct template` / static `templates` — process-global 32 MB anonymous bump arena with 65,536
@@ -307,23 +307,27 @@ triggers (`kernel/oom`).
   - `R_CODE`: invalidate `c->ivau_page` in place and clear it;
   - `R_SVC`: clear `exit_info` and `excl_size`, return `APPINE_EXIT_SVC`;
   - `R_KICK`: loop back to flush/pending checks.
-- Libc memops (`memcpy`, `memset`, `memmove`, `memcmp`, `memchr`, `strncmp`; up to 32 sorted in
-  immutable `memop_table`): `appine_dbt_set_memops` publishes the new table (`RELEASE`, chaining old
-  tables on `older` until `drop_memops`) before retiring changed/added/removed PCs. Private tagged
-  blocks ignore memops; memop blocks bypass templates and fast loops, recheck `memop_kind` under
-  `d->lock` at `install`, and are retired before pooling in `appine_dbt_free`.
-  - In-cache same-page helpers at the base of the code cache (`dbt_routines.c`, borrowing
-    `cpu->x[3..9]`, preserving non-return regs and NZCV, returning via predicted-return
-    `d->memop_ret`): `memset` and overlap-safe `memcpy`/`memmove` (`x2 >= 32`), 8-byte `memcmp`
-    (`x2 >= 8`), and first-page SWAR `memchr` (`x2 >= 1`, including `SIZE_MAX`). On cross-page,
-    TLB miss or watchpoints they jump to fallback `x2 >= 128` -> `R_INTERP` (else guest code);
-    `strncmp` checks `x2 >= 128` directly.
+- Libc memops (`memcpy`, `memset`, `memmove`, `memcmp`, `memchr`, `strncmp`, `strlen`, `strcmp`;
+  up to 32 sorted in immutable `memop_table`): `appine_dbt_set_memops` publishes the new table
+  (`RELEASE`, chaining old tables on `older` until `drop_memops`) before retiring changed/added/
+  removed PCs. Private tagged blocks ignore memops; memop blocks bypass templates and fast loops,
+  recheck `memop_kind` under `d->lock` at `install`, and are retired before pooling in
+  `appine_dbt_free`.
+  - In-cache helpers at the base of the code cache (`dbt_routines.c`, borrowing `cpu->x[3..9]`,
+    preserving non-return regs, NZCV and lazy FP state, returning via predicted-return
+    `d->memop_ret`): probe 4 KiB `tlb` first and fall back to 2 MiB `stlb` (capped at 4 KiB for
+    `memset` and overlap-safe `memcpy`/`memmove` (`x2 >= 32`), and 64 KiB for 8-byte `memcmp`
+    (`x2 >= 8`), 8-byte SWAR `memchr`/`strncmp` (`x2 >= 1`, including `SIZE_MAX`) and
+    `strlen`/`strcmp`). On cross-superpage span, cap overflow, TLB+STLB miss or watchpoints,
+    bounded ops jump to fallback `x2 >= 128` -> `R_INTERP` (else guest code), while
+    `strlen`/`strcmp` emit an inline `R_INTERP` stub with `nguest = 1` (skipping `uses_fp` and
+    guest body).
   - Out-of-line `exec_memop` (`dbt.c`): declines on `nwatch != 0`; translates 2 MiB L2 superpage or
     4 KiB L3 spans via `appine_mmu_lookup_super` with TBI untagged; caps `memset`/`memcpy`/`memmove`/
-    `memcmp` at 64 MiB while scanning `memchr`/`strncmp` up to a 64 MiB budget (handling `SIZE_MAX`);
-    pre-validates mutating ranges before writing; translates compare/scan ranges lazily; preserves
-    TBI tag in `memchr` result; warms 4 KiB `tlb` and 2 MiB `stlb` via `appine_tlb_fill` for
-    untagged 48-bit addresses (except `strncmp`).
+    `memcmp` at 64 MiB while scanning `memchr`/`strncmp`/`strlen`/`strcmp` up to a 64 MiB budget
+    (handling `SIZE_MAX`); pre-validates mutating ranges before writing; translates compare/scan
+    ranges lazily; preserves TBI tag in `memchr` result; warms 4 KiB `tlb` and 2 MiB `stlb` via
+    `appine_tlb_fill` for untagged 48-bit addresses across all registered ops.
 
 ### Code cache, table, sharing and invalidation
 

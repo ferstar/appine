@@ -824,6 +824,8 @@ pub const MEMOP_MEMMOVE: u32 = 3;
 pub const MEMOP_MEMCMP: u32 = 4;
 pub const MEMOP_MEMCHR: u32 = 5;
 pub const MEMOP_STRNCMP: u32 = 6;
+pub const MEMOP_STRLEN: u32 = 7;
+pub const MEMOP_STRCMP: u32 = 8;
 
 /// A mapping that translations come from ([`DbtSpace::set_sources`]): a guest address range, and
 /// an identity (the file and its version) from which identical content can be concluded.

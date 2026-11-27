@@ -411,10 +411,13 @@ struct appine_dbt_source {
 void appine_dbt_set_sources(struct appine_dbt *dbt, const struct appine_dbt_source *s, size_t n);
 
 /*
- * Known libc memory primitives accelerated by Tier 1: same-page calls use in-cache helpers with
- * inline TLB checks (n >= 32 B for memset/memcpy/memmove, n >= 8 B for memcmp, first page for
- * memchr), while cross-page or cold-TLB large calls (n >= 128 B in guest X2) fall back to a
- * page-validated host libc call. Tiny operations stay inline in translated guest code, and any
+ * Known libc memory and string primitives accelerated by Tier 1: calls inside a single 4 KiB
+ * page or 2 MiB superpage (up to 4 KiB for memset/memcpy/memmove, up to 64 KiB for
+ * memcmp/memchr/strncmp/strlen/strcmp) use in-cache helpers with inline TLB/STLB checks
+ * (n >= 32 B for memset/memcpy/memmove, n >= 8 B for memcmp, n >= 1 B for memchr/strncmp, all
+ * lengths for strlen/strcmp), while cold-TLB, cross-superpage, or over-cap calls fall back to a
+ * page-validated host libc call (when n >= 128 B for length-bounded ops, or unconditionally for
+ * strlen/strcmp). Tiny bounded operations stay inline in translated guest code, and any
  * watchpoint or missing page permission falls back to guest execution with precise faults.
  */
 enum appine_memop_kind {
@@ -425,6 +428,8 @@ enum appine_memop_kind {
     APPINE_MEMOP_MEMCMP = 4,
     APPINE_MEMOP_MEMCHR = 5,
     APPINE_MEMOP_STRNCMP = 6,
+    APPINE_MEMOP_STRLEN = 7,
+    APPINE_MEMOP_STRCMP = 8,
 };
 
 #define APPINE_DBT_MEMOPS 32
