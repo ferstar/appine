@@ -101,6 +101,15 @@ struct Entry {
     pi: Option<PiWaiter>,
 }
 
+impl Entry {
+    /// Marks the waiter woken (Release) before scheduling its event wake-up so the woken thread
+    /// observes `is_woken() == true` without re-locking its bucket.
+    fn wake(&self) {
+        self.slot.woken.store(true, Ordering::Release);
+        crate::kernel::signal_later(&self.event);
+    }
+}
+
 /// A thread blocked in `FUTEX_LOCK_PI`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PiWaiter {
@@ -177,13 +186,45 @@ impl BucketGuard<'_> {
         if let Some(i) = self.entries.iter().position(|e| e.id == id) {
             let e = self.entries.remove(i);
             if e.pi.is_some() {
-                self.futexes.buckets[self.index]
-                    .pi_count
-                    .fetch_sub(1, Ordering::Relaxed);
-                self.futexes.pi_count.fetch_sub(1, Ordering::Release);
+                self.futexes.dec_pi_count(self.index);
             }
-            e.slot.woken.store(true, Ordering::Release);
-            crate::kernel::signal_later(&e.event);
+            e.wake();
+        }
+    }
+
+    /// The first `FUTEX_LOCK_PI` waiter for each key present in this bucket.
+    fn pi_heads(&self) -> Vec<(u64, PiWaiter)> {
+        let mut keys = Vec::new();
+        let mut heads = Vec::new();
+        for e in self.entries.iter() {
+            if let Some(w) = e.pi
+                && !keys.contains(&e.key)
+            {
+                keys.push(e.key);
+                heads.push((e.id, w));
+            }
+        }
+        heads
+    }
+}
+
+/// One or two bucket locks acquired in canonical ascending index order (`first` corresponds to
+/// `key`, `second` to `key2`).
+enum TwoBuckets<'a> {
+    Same(MutexGuard<'a, Vec<Entry>>),
+    Distinct(MutexGuard<'a, Vec<Entry>>, MutexGuard<'a, Vec<Entry>>),
+}
+
+impl TwoBuckets<'_> {
+    fn first_mut(&mut self) -> &mut Vec<Entry> {
+        match self {
+            Self::Same(g) | Self::Distinct(g, _) => g,
+        }
+    }
+
+    fn second_mut(&mut self) -> &mut Vec<Entry> {
+        match self {
+            Self::Same(g) | Self::Distinct(_, g) => g,
         }
     }
 }
@@ -243,15 +284,62 @@ impl Futexes {
         Waiter { id, slot }
     }
 
-    /// Runs `f` while holding the bucket lock for `key`.
-    pub fn with_bucket<R>(&self, key: Key, f: impl FnOnce(&mut BucketGuard<'_>) -> R) -> R {
-        let index = bucket_index(key);
-        let entries = self.buckets[index].lock();
-        let mut guard = BucketGuard {
+    fn dec_pi_count(&self, bucket: usize) {
+        self.buckets[bucket]
+            .pi_count
+            .fetch_sub(1, Ordering::Relaxed);
+        self.pi_count.fetch_sub(1, Ordering::Release);
+    }
+
+    fn lock_bucket(&self, index: usize) -> BucketGuard<'_> {
+        BucketGuard {
             futexes: self,
             index,
-            entries,
-        };
+            entries: self.buckets[index].lock(),
+        }
+    }
+
+    /// Locks buckets `b1` and `b2` in strictly ascending index order (`min` then `max`) to prevent
+    /// deadlock, returning handles ordered as `(b1, b2)`.
+    fn lock_two_buckets(&self, b1: usize, b2: usize) -> TwoBuckets<'_> {
+        if b1 == b2 {
+            TwoBuckets::Same(self.buckets[b1].lock())
+        } else if b1 < b2 {
+            let g1 = self.buckets[b1].lock();
+            let g2 = self.buckets[b2].lock();
+            TwoBuckets::Distinct(g1, g2)
+        } else {
+            let g2 = self.buckets[b2].lock();
+            let g1 = self.buckets[b1].lock();
+            TwoBuckets::Distinct(g1, g2)
+        }
+    }
+
+    /// Locks the bucket currently holding `waiter` (retrying if a concurrent `requeue` moves it),
+    /// returning `None` immediately if a waker has already marked `waiter` woken.
+    fn lock_waiter_bucket(&self, waiter: &Waiter) -> Option<(usize, MutexGuard<'_, Vec<Entry>>)> {
+        loop {
+            if waiter.is_woken() {
+                return None;
+            }
+            let b = waiter.slot.bucket.load(Ordering::Acquire);
+            let entries = self.buckets[b].lock();
+            if waiter.is_woken() {
+                return None;
+            }
+            // A concurrent `requeue` updates `slot.bucket` while holding both old and new bucket
+            // locks, so observing `slot.bucket == b` under `buckets[b]` guarantees `waiter` cannot
+            // move until this lock is released.
+            if waiter.slot.bucket.load(Ordering::Acquire) != b {
+                continue;
+            }
+            return Some((b, entries));
+        }
+    }
+
+    /// Runs `f` while holding the bucket lock for `key`.
+    pub fn with_bucket<R>(&self, key: Key, f: impl FnOnce(&mut BucketGuard<'_>) -> R) -> R {
+        let mut guard = self.lock_bucket(bucket_index(key));
         f(&mut guard)
     }
 
@@ -328,7 +416,7 @@ impl Futexes {
 
     /// FUTEX_REQUEUE: wakes at most `n_wake` waiters on `key`, then moves at most `n_requeue`
     /// more to `key2`. Returns the total woken and moved.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn requeue(&self, key: Key, n_wake: u32, key2: Key, n_requeue: u32) -> u32 {
         self.requeue_if::<()>(key, n_wake, key2, n_requeue, || Ok(true))
             .unwrap()
@@ -346,55 +434,25 @@ impl Futexes {
         n_requeue: u32,
         check: impl FnOnce() -> Result<bool, E>,
     ) -> Result<Option<u32>, E> {
-        let b1 = bucket_index(key);
-        let b2 = bucket_index(key2);
-        if b1 == b2 {
-            let mut entries = self.buckets[b1].lock();
-            if !check()? {
-                return Ok(None);
-            }
-            let woken = wake_in_bucket(&mut entries, key, n_wake, u32::MAX);
-            let mut moved = Vec::new();
-            let mut i = 0;
-            while i < entries.len() && (moved.len() as u32) < n_requeue {
-                if entries[i].key == key && entries[i].pi.is_none() {
-                    let mut e = entries.remove(i);
-                    e.key = key2;
-                    moved.push(e);
-                } else {
-                    i += 1;
-                }
-            }
-            let n_moved = moved.len() as u32;
-            entries.extend(moved);
-            return Ok(Some(woken + n_moved));
-        }
-        // Canonical lock order: min(b1, b2) -> max(b1, b2) prevents deadlock.
-        let (first, second) = if b1 < b2 { (b1, b2) } else { (b2, b1) };
-        let mut g_first = self.buckets[first].lock();
-        let mut g_second = self.buckets[second].lock();
+        let (b1, b2) = (bucket_index(key), bucket_index(key2));
+        let mut buckets = self.lock_two_buckets(b1, b2);
         if !check()? {
             return Ok(None);
         }
-        let (src, dst) = if b1 < b2 {
-            (&mut *g_first, &mut *g_second)
-        } else {
-            (&mut *g_second, &mut *g_first)
-        };
-        let woken = wake_in_bucket(src, key, n_wake, u32::MAX);
-        let mut n_moved = 0u32;
-        let mut i = 0;
-        while i < src.len() && n_moved < n_requeue {
-            if src[i].key == key && src[i].pi.is_none() {
-                let mut e = src.remove(i);
-                e.key = key2;
-                e.slot.bucket.store(b2, Ordering::Release);
-                dst.push(e);
-                n_moved += 1;
-            } else {
-                i += 1;
+        let woken = wake_in_bucket(buckets.first_mut(), key, n_wake, u32::MAX);
+        let n_moved = match &mut buckets {
+            TwoBuckets::Same(entries) => {
+                // Append moved entries to the tail to preserve FIFO order behind existing `key2`
+                // waiters in the same bucket.
+                let mut moved = Vec::new();
+                let n = move_entries(entries, &mut moved, key, key2, None, n_requeue);
+                entries.extend(moved);
+                n
             }
-        }
+            TwoBuckets::Distinct(src, dst) => {
+                move_entries(src, dst, key, key2, Some(b2), n_requeue)
+            }
+        };
         Ok(Some(woken + n_moved))
     }
 
@@ -409,29 +467,11 @@ impl Futexes {
         n2: u32,
         op: impl FnOnce() -> Result<bool, E>,
     ) -> Result<u32, E> {
-        let b1 = bucket_index(key);
-        let b2 = bucket_index(key2);
-        if b1 == b2 {
-            let mut entries = self.buckets[b1].lock();
-            let matched = op()?;
-            let mut woken = wake_in_bucket(&mut entries, key, n1, u32::MAX);
-            if matched {
-                woken += wake_in_bucket(&mut entries, key2, n2, u32::MAX);
-            }
-            return Ok(woken);
-        }
-        let (first, second) = if b1 < b2 { (b1, b2) } else { (b2, b1) };
-        let mut g_first = self.buckets[first].lock();
-        let mut g_second = self.buckets[second].lock();
+        let mut buckets = self.lock_two_buckets(bucket_index(key), bucket_index(key2));
         let matched = op()?;
-        let (e1, e2) = if b1 < b2 {
-            (&mut *g_first, &mut *g_second)
-        } else {
-            (&mut *g_second, &mut *g_first)
-        };
-        let mut woken = wake_in_bucket(e1, key, n1, u32::MAX);
+        let mut woken = wake_in_bucket(buckets.first_mut(), key, n1, u32::MAX);
         if matched {
-            woken += wake_in_bucket(e2, key2, n2, u32::MAX);
+            woken += wake_in_bucket(buckets.second_mut(), key2, n2, u32::MAX);
         }
         Ok(woken)
     }
@@ -439,49 +479,25 @@ impl Futexes {
     /// Whether `waiter` is still queued (if not, it has been woken or removed).
     #[cfg(test)]
     pub fn is_queued(&self, waiter: &Waiter) -> bool {
-        if waiter.is_woken() {
-            return false;
-        }
-        loop {
-            let b = waiter.slot.bucket.load(Ordering::Acquire);
-            let entries = self.buckets[b].lock();
-            if waiter.is_woken() {
-                return false;
-            }
-            if waiter.slot.bucket.load(Ordering::Acquire) != b {
-                continue;
-            }
-            return entries.iter().any(|e| e.id == waiter.id);
-        }
+        self.lock_waiter_bucket(waiter)
+            .is_some_and(|(_, entries)| entries.iter().any(|e| e.id == waiter.id))
     }
 
     /// Removes a waiter (timed out, interrupted by a signal, or unwinding). Returns `true` if a
     /// waker had already dequeued this waiter (so the wake is not lost), or `false` if this call
     /// removed it from its bucket.
     pub fn remove(&self, waiter: &Waiter) -> bool {
-        loop {
-            if waiter.is_woken() {
-                return true;
-            }
-            let b = waiter.slot.bucket.load(Ordering::Acquire);
-            let mut entries = self.buckets[b].lock();
-            if waiter.is_woken() {
-                return true;
-            }
-            if waiter.slot.bucket.load(Ordering::Acquire) != b {
-                // Concurrent `requeue` moved this waiter to another bucket; retry there.
-                continue;
-            }
-            if let Some(pos) = entries.iter().position(|e| e.id == waiter.id) {
-                let e = entries.remove(pos);
-                if e.pi.is_some() {
-                    self.buckets[b].pi_count.fetch_sub(1, Ordering::Relaxed);
-                    self.pi_count.fetch_sub(1, Ordering::Release);
-                }
-                return false;
-            }
+        let Some((b, mut entries)) = self.lock_waiter_bucket(waiter) else {
             return true;
+        };
+        if let Some(pos) = entries.iter().position(|e| e.id == waiter.id) {
+            let e = entries.remove(pos);
+            if e.pi.is_some() {
+                self.dec_pi_count(b);
+            }
+            return false;
         }
+        true
     }
 }
 
@@ -490,8 +506,7 @@ fn wake_in_bucket(entries: &mut Vec<Entry>, key: Key, n: u32, bitset: u32) -> u3
     entries.retain(|e| {
         if woken < n && e.key == key && e.bitset & bitset != 0 && e.pi.is_none() {
             woken += 1;
-            e.slot.woken.store(true, Ordering::Release);
-            crate::kernel::signal_later(&e.event);
+            e.wake();
             false
         } else {
             true
@@ -500,7 +515,35 @@ fn wake_in_bucket(entries: &mut Vec<Entry>, key: Key, n: u32, bitset: u32) -> u3
     woken
 }
 
-/// Waiters registered in the queue ([`Futexes::enqueue`]); when done waiting they leave with
+/// Moves up to `limit` non-PI waiters on `from` out of `src` and into `dst` under key `to`,
+/// updating `WaiterSlot::bucket` when migrating across distinct buckets (`dst_bucket.is_some()`).
+fn move_entries(
+    src: &mut Vec<Entry>,
+    dst: &mut Vec<Entry>,
+    from: Key,
+    to: Key,
+    dst_bucket: Option<usize>,
+    limit: u32,
+) -> u32 {
+    let mut moved = 0u32;
+    let mut i = 0;
+    while i < src.len() && moved < limit {
+        if src[i].key == from && src[i].pi.is_none() {
+            let mut e = src.remove(i);
+            e.key = to;
+            if let Some(b) = dst_bucket {
+                e.slot.bucket.store(b, Ordering::Release);
+            }
+            dst.push(e);
+            moved += 1;
+        } else {
+            i += 1;
+        }
+    }
+    moved
+}
+
+/// Waiters registered in the queue ([`Futexes::enqueue_if`]); when done waiting they leave with
 /// [`Enqueued::leave`]. On a panic midway (a kernel-layer bug, [`crate::bug`]) the destructor
 /// removes those still queued: a leftover entry has nobody waiting on it, a later FUTEX_WAKE
 /// would count against it, and the real waiter would not be woken; when the key is a host
@@ -670,22 +713,12 @@ pub(crate) fn pi_owners_exited(
     if futexes.pi_count.load(Ordering::Acquire) == 0 {
         return;
     }
-    for bucket in futexes.buckets.iter() {
+    for (index, bucket) in futexes.buckets.iter().enumerate() {
         if bucket.pi_count.load(Ordering::Acquire) == 0 {
             continue;
         }
-        let mut entries = bucket.lock();
-        let mut keys: Vec<Key> = Vec::new();
-        let mut heads: Vec<(u64, PiWaiter)> = Vec::new();
-        for e in entries.iter() {
-            if let Some(w) = e.pi
-                && !keys.contains(&e.key)
-            {
-                keys.push(e.key);
-                heads.push((e.id, w));
-            }
-        }
-        for (id, w) in heads {
+        let mut guard = futexes.lock_bucket(index);
+        for (id, w) in guard.pi_heads() {
             let Some(task) = k.tasks.get(&w.tid) else {
                 continue;
             };
@@ -712,13 +745,8 @@ pub(crate) fn pi_owners_exited(
             if word
                 .compare_exchange(cur, new, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
-                && let Some(pos) = entries.iter().position(|e| e.id == id)
             {
-                let e = entries.remove(pos);
-                bucket.pi_count.fetch_sub(1, Ordering::Relaxed);
-                futexes.pi_count.fetch_sub(1, Ordering::Release);
-                e.slot.woken.store(true, Ordering::Release);
-                crate::kernel::signal_later(&e.event);
+                guard.hand_over(id);
             }
         }
     }

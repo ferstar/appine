@@ -468,7 +468,7 @@ pub(super) fn futex_waitv(
     };
     // struct futex_waitv { u64 val; u64 uaddr; u32 flags; u32 __reserved; }
     let mut keys = Vec::with_capacity(nr as usize);
-    let mut raw_keys = Vec::with_capacity(nr as usize);
+    let mut checks = Vec::with_capacity(nr as usize);
     for i in 0..nr as u64 {
         let w: [u8; 24] = get(cx, waiters + i * 24)?;
         let val = u64::from_le_bytes(w[..8].try_into().unwrap());
@@ -479,17 +479,16 @@ pub(super) fn futex_waitv(
         {
             return Err(Errno::EINVAL);
         }
-        let key = futex_key(cx, uaddr, wflags & FUTEX_PRIVATE_FLAG != 0)?;
-        raw_keys.push(key);
-        keys.push((uaddr, val));
+        keys.push(futex_key(cx, uaddr, wflags & FUTEX_PRIVATE_FLAG != 0)?);
+        checks.push((uaddr, val));
     }
     // Holding every affected bucket lock in ascending order, so nobody can wake between checking
     // the values and registering
     let shared = cx.shared;
     let Some(waiters) = shared
         .futexes()
-        .enqueue_many_if(&raw_keys, &cx.task.event, || {
-            for &(uaddr, val) in &keys {
+        .enqueue_many_if(&keys, &cx.task.event, || {
+            for &(uaddr, val) in &checks {
                 if u64::from(u32::from_le_bytes(get(cx, uaddr)?)) != val {
                     return Ok(false);
                 }

@@ -1277,12 +1277,12 @@ impl Tty {
             return n;
         }
         let before = self.output.len();
-        let mut consumed = 0;
-        if !t.o(OLCUC) {
+        let consumed = if !t.o(OLCUC) {
             // Without OLCUC, printable ASCII (0x20..=0x7e) never translates, never counts as a
             // UTF-8 continuation byte, takes 1 output byte and 1 column, and leaves canon_column
             // untouched, so contiguous runs can be bulk-extended.
             let onlcr = t.o(ONLCR);
+            let mut consumed = 0;
             while consumed < data.len() {
                 let room = OUTPUT_MAX.saturating_sub(self.output.len());
                 if room > 0 {
@@ -1309,23 +1309,32 @@ impl Tty {
                     consumed += 1;
                     continue;
                 }
+                // Even when `room == 0`, zero-output bytes (e.g. CR dropped by ONOCR at col 0)
+                // still have `processed_len(c) == 0` and must be consumed.
                 if self.processed_len(c) > room {
                     break;
                 }
                 self.output_char(c);
                 consumed += 1;
             }
+            consumed
         } else {
-            for &c in data {
-                if self.processed_len(c) > OUTPUT_MAX.saturating_sub(self.output.len()) {
-                    break;
-                }
-                self.output_char(c);
-                consumed += 1;
-            }
-        }
+            self.write_output_bytewise(data)
+        };
         if self.output.len() > before {
             self.arrivals[1] += 1;
+        }
+        consumed
+    }
+
+    fn write_output_bytewise(&mut self, data: &[u8]) -> usize {
+        let mut consumed = 0;
+        for &c in data {
+            if self.processed_len(c) > OUTPUT_MAX.saturating_sub(self.output.len()) {
+                break;
+            }
+            self.output_char(c);
+            consumed += 1;
         }
         consumed
     }
@@ -2360,14 +2369,7 @@ mod tests {
                 return 0;
             }
             let before = t.output.len();
-            let mut consumed = 0;
-            for &c in data {
-                if t.processed_len(c) > OUTPUT_MAX.saturating_sub(t.output.len()) {
-                    break;
-                }
-                t.output_char(c);
-                consumed += 1;
-            }
+            let consumed = t.write_output_bytewise(data);
             if t.output.len() > before {
                 t.arrivals[1] += 1;
             }

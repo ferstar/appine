@@ -1728,19 +1728,17 @@ pub(crate) fn block_for<'a>(
     }
     drop(k);
     let timeout = deadline.map(|d| d.saturating_duration_since(Instant::now()));
-    let (r, event_signaled) = if host.is_empty() {
-        match event.wait(timeout) {
-            Ok(signaled) => (Ok(()), signaled),
-            // A host signal interrupted the wait (a debugger, say): treat it as an ordinary wake-up
-            Err(e) if e == Errno::EINTR.0 => (Ok(()), true),
-            Err(e) => (Err(Errno(e)), true),
-        }
+    let wait_res = if host.is_empty() {
+        event.wait(timeout)
     } else {
-        match event.poll_with(host, timeout) {
-            Ok((_, signaled)) => (Ok(()), signaled),
-            Err(e) if e == Errno::EINTR.0 => (Ok(()), true),
-            Err(e) => (Err(Errno(e)), true),
-        }
+        event.poll_with(host, timeout).map(|(_, signaled)| signaled)
+    };
+    let (r, event_signaled) = match wait_res {
+        Ok(signaled) => (Ok(()), signaled),
+        // A host signal interrupted the wait (a debugger, say): treat it as an ordinary wake-up;
+        // conservatively clear the event on any error in case a signal raced with teardown.
+        Err(e) if e == Errno::EINTR.0 => (Ok(()), true),
+        Err(e) => (Err(Errno(e)), true),
     };
     let mut k = shared.lock();
     if event_signaled || event.is_signaled() {

@@ -1031,6 +1031,9 @@ const EVENT_FD_DIRTY: u32 = 1 << 4;
 /// Pure waits ([`Event::wait`]) park directly on `state` via host `SYS_futex(FUTEX_WAIT_PRIVATE)`
 /// and never write or read the eventfd. Multi-fd waits ([`Event::poll_with`]) arm `EVENT_FD_WAIT`
 /// around `ppoll`, and external callers polling [`Event::fd`] directly pin `EVENT_FD_PINNED`.
+/// Waiters publish their wait bit with `SeqCst` before checking `EVENT_SIGNALED`, while
+/// [`Event::signal`] publishes `EVENT_SIGNALED` with `SeqCst` before checking the wait bits, so a
+/// concurrent signal and wait cannot miss each other.
 /// After [`Event::signal`], [`Event::is_signaled`] is true (and its fd readable when polled) until
 /// [`Event::clear`].
 pub struct Event {
@@ -1058,15 +1061,7 @@ impl Event {
             return;
         }
         if prev & EVENT_FUTEX_WAIT != 0 {
-            // SAFETY: `self.state` is a valid aligned `u32` owned for the duration of this call.
-            unsafe {
-                libc::syscall(
-                    libc::SYS_futex,
-                    &self.state as *const AtomicU32,
-                    FUTEX_WAKE_PRIVATE,
-                    1i32,
-                );
-            }
+            self.futex_wake();
         }
         if prev & (EVENT_FD_WAIT | EVENT_FD_PINNED) != 0 {
             self.write_fd();
@@ -1081,8 +1076,7 @@ impl Event {
     /// Clears the signalled state.
     pub fn clear(&self) {
         if self.state.load(Ordering::Acquire) & (EVENT_FD_DIRTY | EVENT_FD_PINNED) != 0 {
-            self.state.fetch_and(!EVENT_FD_DIRTY, Ordering::AcqRel);
-            self.read_fd_once();
+            self.drain_fd();
         }
         self.state.fetch_and(!EVENT_SIGNALED, Ordering::SeqCst);
     }
@@ -1091,6 +1085,8 @@ impl Event {
     /// until the event is signalled (`Ok(true)`), `timeout` expires (`Ok(false)`), or a host
     /// signal interrupts the wait (`Err(EINTR)`). Does not clear the signalled state.
     pub fn wait(&self, timeout: Option<Duration>) -> Result<bool, i32> {
+        // Lazily computed on the first blocking iteration so pre-signaled or zero-timeout calls
+        // avoid `Instant::now()`. The inner `Option` is `None` only on overflow (treat as huge).
         let mut deadline: Option<Option<std::time::Instant>> = None;
         loop {
             let s = self.state.load(Ordering::Acquire);
@@ -1123,10 +1119,7 @@ impl Event {
             {
                 continue;
             }
-            let ts = rem.map(|t| libc::timespec {
-                tv_sec: t.as_secs().min(i32::MAX as u64) as libc::time_t,
-                tv_nsec: t.subsec_nanos() as _,
-            });
+            let ts = rem.map(duration_to_timespec);
             let ts_ptr = ts
                 .as_ref()
                 .map_or(std::ptr::null(), |t| t as *const libc::timespec);
@@ -1179,56 +1172,33 @@ impl Event {
         }
 
         let n = fds.len();
-        let total = n + 1;
-        let mut stack = [libc::pollfd {
-            fd: 0,
-            events: 0,
-            revents: 0,
-        }; 9];
-        let mut heap;
-        let raw = if total <= stack.len() {
-            &mut stack[..total]
-        } else {
-            heap = vec![
-                libc::pollfd {
-                    fd: 0,
-                    events: 0,
-                    revents: 0,
-                };
-                total
-            ];
-            &mut heap[..]
-        };
-        for (dst, slot) in raw[..n].iter_mut().zip(fds.iter_mut()) {
-            dst.fd = slot.0;
-            dst.events = slot.1;
-            dst.revents = 0;
-            slot.2 = 0;
-        }
-        raw[n] = libc::pollfd {
-            fd: self.fd,
-            events: POLLIN,
-            revents: 0,
-        };
+        with_pollfds::<9, _>(n + 1, |raw| {
+            fill_pollfds(&mut raw[..n], fds);
+            raw[n] = libc::pollfd {
+                fd: self.fd,
+                events: POLLIN,
+                revents: 0,
+            };
 
-        let rc = poll_raw(raw, timeout);
-        self.state.fetch_and(!EVENT_FD_WAIT, Ordering::SeqCst);
-        if rc < 0 {
-            return Err(last_errno());
-        }
-        let mut ready = 0;
-        for (slot, r) in fds.iter_mut().zip(&raw[..n]) {
-            slot.2 = r.revents;
-            if r.revents != 0 {
-                ready += 1;
+            let rc = poll_raw(raw, timeout);
+            let err = if rc < 0 { Some(last_errno()) } else { None };
+            self.state.fetch_and(!EVENT_FD_WAIT, Ordering::SeqCst);
+            if let Some(e) = err {
+                return Err(e);
             }
-        }
-        let fd_signaled = raw[n].revents & POLLIN != 0;
-        if fd_signaled {
-            self.state.fetch_and(!EVENT_FD_DIRTY, Ordering::AcqRel);
-            self.read_fd_once();
-        }
-        Ok((ready, fd_signaled || self.is_signaled()))
+            let mut ready = 0;
+            for (slot, r) in fds.iter_mut().zip(&raw[..n]) {
+                slot.2 = r.revents;
+                if r.revents != 0 {
+                    ready += 1;
+                }
+            }
+            let fd_signaled = raw[n].revents & POLLIN != 0;
+            if fd_signaled {
+                self.drain_fd();
+            }
+            Ok((ready, fd_signaled || self.is_signaled()))
+        })
     }
 
     /// The fd to poll directly (waiting for `POLLIN`). Pins eventfd mirroring for this `Event`.
@@ -1240,6 +1210,18 @@ impl Event {
         self.fd
     }
 
+    fn futex_wake(&self) {
+        // SAFETY: `self.state` is a valid aligned `u32` owned for the duration of this call.
+        unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                &self.state as *const AtomicU32,
+                FUTEX_WAKE_PRIVATE,
+                1i32,
+            );
+        }
+    }
+
     fn write_fd(&self) {
         self.state.fetch_or(EVENT_FD_DIRTY, Ordering::SeqCst);
         let one = 1u64.to_ne_bytes();
@@ -1247,8 +1229,11 @@ impl Event {
         unsafe { libc::write(self.fd, one.as_ptr().cast(), one.len()) };
     }
 
-    /// Non-semaphore eventfd drains its entire counter on a single 8-byte read.
-    fn read_fd_once(&self) {
+    /// Clears `EVENT_FD_DIRTY` and drains the eventfd counter with a single 8-byte read
+    /// (sufficient for a non-semaphore eventfd). Clearing the dirty bit before reading ensures a
+    /// concurrent [`Event::write_fd`] re-marks it if it races with the drain.
+    fn drain_fd(&self) {
+        self.state.fetch_and(!EVENT_FD_DIRTY, Ordering::AcqRel);
         let mut buf = [0u8; 8];
         unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
     }
@@ -1426,50 +1411,62 @@ impl HostEpoll {
     }
 }
 
+const ZERO_POLLFD: libc::pollfd = libc::pollfd {
+    fd: 0,
+    events: 0,
+    revents: 0,
+};
+
+#[inline]
+fn with_pollfds<const N: usize, R>(total: usize, f: impl FnOnce(&mut [libc::pollfd]) -> R) -> R {
+    let mut stack = [ZERO_POLLFD; N];
+    let mut heap;
+    let raw = if total <= N {
+        &mut stack[..total]
+    } else {
+        heap = vec![ZERO_POLLFD; total];
+        &mut heap[..]
+    };
+    f(raw)
+}
+
+#[inline]
+fn fill_pollfds(dst: &mut [libc::pollfd], fds: &mut [(i32, i16, i16)]) {
+    for (raw, slot) in dst.iter_mut().zip(fds.iter_mut()) {
+        raw.fd = slot.0;
+        raw.events = slot.1;
+        raw.revents = 0;
+        slot.2 = 0;
+    }
+}
+
+#[inline]
+fn duration_to_timespec(t: Duration) -> libc::timespec {
+    libc::timespec {
+        tv_sec: t.as_secs().min(i32::MAX as u64) as libc::time_t,
+        tv_nsec: t.subsec_nanos() as _,
+    }
+}
+
 /// Waits for events on host fds: each item of `fds` is (fd, events, revents), and a `timeout` of
 /// None waits forever. Returns the number of ready fds; returns `EINTR` when interrupted by a host
 /// signal.
 pub fn poll(fds: &mut [(i32, i16, i16)], timeout: Option<Duration>) -> Result<usize, i32> {
-    let mut stack = [libc::pollfd {
-        fd: 0,
-        events: 0,
-        revents: 0,
-    }; 16];
-    let mut heap;
-    let raw = if fds.len() <= stack.len() {
-        &mut stack[..fds.len()]
-    } else {
-        heap = vec![
-            libc::pollfd {
-                fd: 0,
-                events: 0,
-                revents: 0,
-            };
-            fds.len()
-        ];
-        &mut heap[..]
-    };
-    for (dst, slot) in raw.iter_mut().zip(fds.iter_mut()) {
-        dst.fd = slot.0;
-        dst.events = slot.1;
-        dst.revents = 0;
-        slot.2 = 0;
-    }
-    let rc = poll_raw(raw, timeout);
-    if rc < 0 {
-        return Err(last_errno());
-    }
-    for (slot, r) in fds.iter_mut().zip(raw.iter()) {
-        slot.2 = r.revents;
-    }
-    Ok(rc as usize)
+    with_pollfds::<16, _>(fds.len(), |raw| {
+        fill_pollfds(raw, fds);
+        let rc = poll_raw(raw, timeout);
+        if rc < 0 {
+            return Err(last_errno());
+        }
+        for (slot, r) in fds.iter_mut().zip(raw.iter()) {
+            slot.2 = r.revents;
+        }
+        Ok(rc as usize)
+    })
 }
 
 fn poll_raw(raw: &mut [libc::pollfd], timeout: Option<Duration>) -> i32 {
-    let ts = timeout.map(|t| libc::timespec {
-        tv_sec: t.as_secs().min(i32::MAX as u64) as libc::time_t,
-        tv_nsec: t.subsec_nanos() as _,
-    });
+    let ts = timeout.map(duration_to_timespec);
     let ts_ptr = ts
         .as_ref()
         .map_or(std::ptr::null(), |t| t as *const libc::timespec);
@@ -2175,15 +2172,33 @@ mod tests {
         peer.join().unwrap();
     }
 
+    struct TestPipe(i32, i32);
+
+    impl TestPipe {
+        fn new() -> Self {
+            let mut pipe = [0i32; 2];
+            assert_eq!(
+                unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+                0
+            );
+            Self(pipe[0], pipe[1])
+        }
+    }
+
+    impl Drop for TestPipe {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.0);
+                libc::close(self.1);
+            }
+        }
+    }
+
     #[test]
     fn event_poll_with_wakes_on_host_fd_and_event() {
         use std::sync::Arc;
-        let mut pipe = [0i32; 2];
-        assert_eq!(
-            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
-            0
-        );
-        let (rfd, wfd) = (pipe[0], pipe[1]);
+        let pipe = TestPipe::new();
+        let (rfd, wfd) = (pipe.0, pipe.1);
         let ev = Arc::new(Event::new().unwrap());
 
         // 1. Timeout when neither host fd nor event is ready.
@@ -2230,11 +2245,6 @@ mod tests {
         );
         assert_ne!(fds[0].2 & 1, 0);
         ev.clear();
-
-        unsafe {
-            libc::close(rfd);
-            libc::close(wfd);
-        }
     }
 
     #[test]
@@ -2251,14 +2261,7 @@ mod tests {
         let poker = std::thread::spawn(move || {
             while !stop2.load(Ordering::Relaxed) {
                 ev2.state.fetch_xor(EVENT_FD_DIRTY, Ordering::Relaxed);
-                unsafe {
-                    libc::syscall(
-                        libc::SYS_futex,
-                        &ev2.state as *const AtomicU32,
-                        FUTEX_WAKE_PRIVATE,
-                        1i32,
-                    );
-                }
+                ev2.futex_wake();
                 std::thread::sleep(Duration::from_millis(2));
             }
         });
@@ -2278,12 +2281,8 @@ mod tests {
 
     #[test]
     fn event_poll_with_clears_stale_revents_on_timeout_and_error() {
-        let mut pipe = [0i32; 2];
-        assert_eq!(
-            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
-            0
-        );
-        let (rfd, wfd) = (pipe[0], pipe[1]);
+        let pipe = TestPipe::new();
+        let rfd = pipe.0;
         let ev = Event::new().unwrap();
 
         // Stale revents must be cleared on timeout.
@@ -2291,18 +2290,17 @@ mod tests {
         assert_eq!(ev.poll_with(&mut fds, Some(Duration::ZERO)), Ok((0, false)));
         assert_eq!(fds[0].2, 0);
 
-        // Stale revents must also be cleared when poll_with fails (e.g., EINVAL from huge nfds
-        // is not practical, so test poll() directly and verify poll_with clears before ppoll).
+        // Stale revents must also be cleared on the pre-signaled fast path (via `poll`) and
+        // direct `poll` calls before `ppoll`.
         let mut fds = [(rfd, 1i16, 0x77i16)];
         ev.signal();
         assert_eq!(ev.poll_with(&mut fds, Some(Duration::ZERO)), Ok((0, true)));
         assert_eq!(fds[0].2, 0);
         ev.clear();
 
-        unsafe {
-            libc::close(rfd);
-            libc::close(wfd);
-        }
+        let mut fds = [(rfd, 1i16, 0x33i16)];
+        assert_eq!(poll(&mut fds, Some(Duration::ZERO)), Ok(0));
+        assert_eq!(fds[0].2, 0);
     }
 
     #[test]
