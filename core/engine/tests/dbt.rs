@@ -6197,46 +6197,69 @@ fn enter_exit_fpcr_skip_and_restore() {
         let mut g_t0 = Guest::new();
         let mut dbt = Dbt::with_regs(regs).expect("tier 1");
 
-        // 1. Subnormal addition with guest_fpcr == host_fpcr and guest_fpcr != host_fpcr (FZ).
-        let f_fz = CODE + 0x100;
-        let prog_fz = [FADD_D0_D1_D2, FMOV_X0_D0, SVC];
-        g_t1.code(f_fz, &prog_fz);
-        g_t0.code(f_fz, &prog_fz);
-        for (fpcr, nzcv, label) in [
-            (orig_fpcr, 0xa000_0000u64, "equal"),
-            (orig_fpcr ^ FZ, 0x5000_0000u64, "fz_toggled"),
-        ] {
+        let (f_fz, f_rm, f_mid) = (CODE + 0x100, CODE + 0x140, CODE + 0x180);
+        for g in [&mut g_t1, &mut g_t0] {
+            g.code(f_fz, &[FADD_D0_D1_D2, FMOV_X0_D0, SVC]);
+            g.code(f_rm, &[FDIV_D0_D1_D2, FMOV_X0_D0, SVC]);
+            g.code(
+                f_mid,
+                &[
+                    FADD_D0_D1_D2,
+                    FMOV_X3_D0,
+                    MSR_FPCR_X1,
+                    FADD_D0_D1_D2,
+                    FMOV_X4_D0,
+                    MSR_FPCR_X5,
+                    FADD_D0_D1_D2,
+                    FMOV_X0_D0,
+                    SVC,
+                ],
+            );
+        }
+
+        let mut run = |pc: u64,
+                       fpcr: u64,
+                       nzcv: u64,
+                       label: &str,
+                       init: &dyn Fn(&mut appine_engine::CpuState)| {
             for g in [&mut g_t1, &mut g_t0] {
                 let s = g.cpu.state_mut();
-                s.v[1] = [1, 0]; // smallest positive subnormal f64 (5e-324)
-                s.v[2] = [0, 0]; // +0.0
                 s.fpcr = fpcr;
                 s.fpsr = 0;
                 s.nzcv = nzcv;
-                s.pc = f_fz;
+                s.pc = pc;
+                init(s);
             }
             assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
             assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
             assert_eq!(host_fpcr(), orig_fpcr, "host fpcr ({label}, {regs:?})");
+            assert_eq!(g_t1.cpu.state().nzcv, nzcv, "nzcv ({label}, {regs:?})");
             assert_eq!(
-                g_t1.cpu.state().x[0],
-                g_t0.cpu.state().x[0],
-                "fadd result ({label}, {regs:?})"
+                g_t1.cpu.state().fpcr,
+                fpcr,
+                "guest fpcr ({label}, {regs:?})"
             );
+            (g_t1.cpu.state().x, g_t0.cpu.state().x)
+        };
+
+        // 1. Subnormal addition with guest_fpcr == host_fpcr and guest_fpcr != host_fpcr (FZ).
+        for (fpcr, nzcv, label) in [
+            (orig_fpcr, 0xa000_0000u64, "equal"),
+            (orig_fpcr ^ FZ, 0x5000_0000u64, "fz_toggled"),
+        ] {
+            let (x1, x0) = run(f_fz, fpcr, nzcv, label, &|s| {
+                s.v[1] = [1, 0]; // smallest positive subnormal f64 (5e-324)
+                s.v[2] = [0, 0]; // +0.0
+            });
+            assert_eq!(x1[0], x0[0], "fadd result ({label}, {regs:?})");
             assert_eq!(
-                g_t1.cpu.state().x[0],
-                if fpcr & FZ != 0 { 0 } else { 1 },
+                x1[0],
+                u64::from(fpcr & FZ == 0),
                 "fz effect ({label}, {regs:?})"
             );
-            assert_eq!(g_t1.cpu.state().nzcv, nzcv, "nzcv ({label}, {regs:?})");
-            assert_eq!(g_t1.cpu.state().fpcr, fpcr, "guest fpcr ({label}, {regs:?})");
         }
 
         // 2. Rounding modes (RN, RP, RM, RZ) on +1.0/3.0 and -1.0/3.0.
-        let f_rm = CODE + 0x140;
-        let prog_rm = [FDIV_D0_D1_D2, FMOV_X0_D0, SVC];
-        g_t1.code(f_rm, &prog_rm);
-        g_t0.code(f_rm, &prog_rm);
         for (num, mode, expected) in [
             (1.0_f64, 0, 0x3fd5_5555_5555_5555u64),
             (1.0_f64, RP, 0x3fd5_5555_5555_5556u64),
@@ -6248,72 +6271,28 @@ fn enter_exit_fpcr_skip_and_restore() {
             (-1.0_f64, RZ, 0xbfd5_5555_5555_5555u64),
         ] {
             let fpcr = (orig_fpcr & !RZ) | mode;
-            for g in [&mut g_t1, &mut g_t0] {
-                let s = g.cpu.state_mut();
+            let (x1, x0) = run(f_rm, fpcr, 0x6000_0000, "rmode", &|s| {
                 s.v[1] = [num.to_bits(), 0];
                 s.v[2] = [3.0_f64.to_bits(), 0];
-                s.fpcr = fpcr;
-                s.fpsr = 0;
-                s.nzcv = 0x6000_0000;
-                s.pc = f_rm;
-            }
-            assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
-            assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
-            assert_eq!(host_fpcr(), orig_fpcr, "host fpcr (mode={mode:#x}, {regs:?})");
-            assert_eq!(g_t1.cpu.state().x[0], expected);
-            assert_eq!(g_t1.cpu.state().x[0], g_t0.cpu.state().x[0]);
-            assert_eq!(g_t1.cpu.state().nzcv, 0x6000_0000);
-            assert_eq!(g_t1.cpu.state().fpcr, fpcr);
+            });
+            assert_eq!(x1[0], expected, "mode={mode:#x}, {regs:?}");
+            assert_eq!(x1[0], x0[0], "mode={mode:#x}, {regs:?}");
         }
 
         // 3. Mid-run MSR FPCR transitions: host_fpcr -> toggled FZ -> back to host_fpcr.
-        let f_mid = CODE + 0x180;
-        let prog_mid = [
-            FADD_D0_D1_D2,
-            FMOV_X3_D0,
-            MSR_FPCR_X1,
-            FADD_D0_D1_D2,
-            FMOV_X4_D0,
-            MSR_FPCR_X5,
-            FADD_D0_D1_D2,
-            FMOV_X0_D0,
-            SVC,
-        ];
-        g_t1.code(f_mid, &prog_mid);
-        g_t0.code(f_mid, &prog_mid);
-        for g in [&mut g_t1, &mut g_t0] {
-            let s = g.cpu.state_mut();
+        let (x1, x0) = run(f_mid, orig_fpcr, 0x9000_0000, "mid-run", &|s| {
             s.v[1] = [1, 0];
             s.v[2] = [0, 0];
             s.x[1] = orig_fpcr ^ FZ;
             s.x[5] = orig_fpcr;
-            s.fpcr = orig_fpcr;
-            s.fpsr = 0;
-            s.nzcv = 0x9000_0000;
-            s.pc = f_mid;
-        }
-        assert_eq!(g_t0.cpu.run(), Exit::Svc { imm: 0 });
-        assert_eq!(dbt.run(&mut g_t1.cpu), Exit::Svc { imm: 0 });
-        assert_eq!(host_fpcr(), orig_fpcr, "host fpcr after mid-run ({regs:?})");
+        });
         assert_eq!(
-            (
-                g_t1.cpu.state().x[3],
-                g_t1.cpu.state().x[4],
-                g_t1.cpu.state().x[0],
-                g_t1.cpu.state().nzcv,
-                g_t1.cpu.state().fpcr,
-            ),
-            (
-                g_t0.cpu.state().x[3],
-                g_t0.cpu.state().x[4],
-                g_t0.cpu.state().x[0],
-                0x9000_0000,
-                orig_fpcr,
-            ),
+            (x1[3], x1[4], x1[0]),
+            (x0[3], x0[4], x0[0]),
             "mid-run fpcr transitions ({regs:?})"
         );
-        assert_ne!(g_t1.cpu.state().x[3], g_t1.cpu.state().x[4]);
-        assert_eq!(g_t1.cpu.state().x[3], g_t1.cpu.state().x[0]);
+        assert_ne!(x1[3], x1[4]);
+        assert_eq!(x1[3], x1[0]);
     }
 }
 
@@ -6337,6 +6316,7 @@ fn stolen_rd_write_only_and_read_modify_write() {
         for (idx, &s) in stolen.iter().enumerate() {
             let s1 = stolen[(idx + 1) % stolen.len()];
             let s2 = stolen[(idx + 2) % stolen.len()];
+            let mov_from_s = |d: u32| 0xaa00_03e0 | (s << 16) | d;
             let pc = CODE + 0x100 + (idx as u64) * 0x100;
             let prog = [
                 // 1. Write-only Rd (ADD X_s, X0, #1)
@@ -6350,35 +6330,35 @@ fn stolen_rd_write_only_and_read_modify_write() {
                 // 5. Read-modify-write BFXIL X_s, X2, #4, #12 (immr=4, imms=15)
                 0xb344_3c00 | (2 << 5) | s,
                 // 6. Save intermediate result in X3, then test 32-bit write-only + 32-bit RMW
-                0xaa00_03e3 | (s << 16),             // mov x3, xS
-                0x1100_0400 | s,                     // add wS, w0, #1 (clears upper 32 bits)
-                0x72a0_0000 | (0x1234 << 5) | s,     // movk wS, #0x1234, lsl #16
-                0x3318_2c00 | (1 << 5) | s,          // bfi wS, w1, #8, #12 (immr=24, imms=11)
-                0xaa00_03e4 | (s << 16),             // mov x4, xS
-                // 7. Write-only MOVZ / MOVN / UBFX / SBFX
-                0xd2a0_0000 | (0x5678 << 5) | s,     // movz xS, #0x5678, lsl #16
-                0xaa00_03e5 | (s << 16),             // mov x5, xS
-                0xd348_5c00 | (1 << 5) | s,          // ubfx xS, x1, #8, #16
-                0xaa00_03e6 | (s << 16),             // mov x6, xS
+                mov_from_s(3),
+                0x1100_0400 | s, // add wS, w0, #1 (clears upper 32 bits)
+                0x72a0_0000 | (0x1234 << 5) | s, // movk wS, #0x1234, lsl #16
+                0x3318_2c00 | (1 << 5) | s, // bfi wS, w1, #8, #12 (immr=24, imms=11)
+                mov_from_s(4),
+                // 7. Write-only MOVZ / UBFX
+                0xd2a0_0000 | (0x5678 << 5) | s, // movz xS, #0x5678, lsl #16
+                mov_from_s(5),
+                0xd348_5c00 | (1 << 5) | s, // ubfx xS, x1, #8, #16
+                mov_from_s(6),
                 // 8. SIMD GPR write (UMOV X_s, V0.D[0]; UMOV W_s, V0.S[1]; SMOV X_s, V0.H[1]; FMOV X_s, D0)
                 //    and SIMD GPR read (INS V1.D[0], X_s)
-                0x4e08_3c00 | s,                     // umov xS, v0.d[0]
-                0xaa00_03e7 | (s << 16),             // mov x7, xS
-                0x0e0c_3c00 | s,                     // umov wS, v0.s[1]
-                0xaa00_03e8 | (s << 16),             // mov x8, xS
-                0x4e06_2c00 | s,                     // smov xS, v0.h[1]
-                0xaa00_03e9 | (s << 16),             // mov x9, xS
-                0x9e66_0000 | s,                     // fmov xS, d0
-                0x4e08_1c01 | (s << 5),              // ins v1.d[0], xS
+                0x4e08_3c00 | s, // umov xS, v0.d[0]
+                mov_from_s(7),
+                0x0e0c_3c00 | s, // umov wS, v0.s[1]
+                mov_from_s(8),
+                0x4e06_2c00 | s, // smov xS, v0.h[1]
+                mov_from_s(9),
+                0x9e66_0000 | s,        // fmov xS, d0
+                0x4e08_1c01 | (s << 5), // ins v1.d[0], xS
                 // 9. MRS X_s, NZCV (write-only Rd) and MSR NZCV, X_s1 (read-only Rt)
-                0xd53b_4200 | s,                     // mrs xS, nzcv
-                0xaa00_03ea | (s << 16),             // mov x10, xS
-                0xd51b_4200 | s1,                    // msr nzcv, xS1
+                0xd53b_4200 | s, // mrs xS, nzcv
+                mov_from_s(10),
+                0xd51b_4200 | s1, // msr nzcv, xS1
                 // 10. 3-stolen-register MADD (write-only Rd + 2 stolen sources) interleaved with
                 //     grouped loads on X11 to verify t2_group = -1 invalidation.
-                0xf940_016c,                                   // ldr x12, [x11, #0]
-                0x9b00_0000 | (s2 << 16) | (s1 << 5) | s,      // madd xS, xS1, xS2, x0
-                0xf940_056d,                                   // ldr x13, [x11, #8]
+                0xf940_016c,                              // ldr x12, [x11, #0]
+                0x9b00_0000 | (s2 << 16) | (s1 << 5) | s, // madd xS, xS1, xS2, x0
+                0xf940_056d,                              // ldr x13, [x11, #8]
                 // 11. 3-stolen-register MADD where Rd == Ra (Rd is also read via Ra!)
                 0x9b00_0000 | (s2 << 16) | (s << 10) | (s1 << 5) | s, // madd xS, xS1, xS2, xS
                 SVC,

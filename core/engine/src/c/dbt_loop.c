@@ -1590,29 +1590,7 @@ static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
         if (fl->kind == FL_CMP_INC && i == fl->ctrl_idx)
             continue; /* loop-closing CMP omitted in body, re-emitted once in epilogue */
         unsigned top = FIELD(insn, 28, 25);
-        if ((top & 7) == 7) {
-            struct native_desc nd;
-            appine_simd_dp_decode(insn, &nd);
-            struct operands o = {.n = 0, .writes_rd = false, .reads_rd = false};
-            for (unsigned k = 0; k < nd.n; k++) {
-                add_operand(&o, nd.gpr[k].pos, false);
-                if (nd.gpr[k].pos == 0 && nd.gpr[k].store) {
-                    o.writes_rd = true;
-                    if (nd.gpr[k].load)
-                        o.reads_rd = true;
-                }
-            }
-            if (fl->npin) {
-                uint32_t out = insn;
-                for (unsigned k = 0; k < o.n; k++) {
-                    unsigned r = (insn >> o.pos[k]) & 31;
-                    out = (out & ~(31u << o.pos[k])) | (fast_pin_host(fl, r) << o.pos[k]);
-                }
-                emit(x, out);
-            } else {
-                emit_fast_operands(x, insn, &o);
-            }
-        } else if (top == 0x4 || top == 0x6 || top == 0xc || top == 0xe) {
+        if (top == 0x4 || top == 0x6 || top == 0xc || top == 0xe) {
             struct memop m;
             uint64_t va = x->pc + 4ull * i;
             if (BIT(insn, 26))
@@ -1638,7 +1616,13 @@ static void emit_fast_loop(struct xlate *x, const struct fast_loop *fl)
             }
         } else {
             struct operands o;
-            dbt_dp_operands(insn, &o);
+            if ((top & 7) == 7) {
+                struct native_desc nd;
+                appine_simd_dp_decode(insn, &nd);
+                simd_dp_operands(&nd, &o);
+            } else {
+                dbt_dp_operands(insn, &o);
+            }
             if (fl->npin) {
                 uint32_t out = insn;
                 for (unsigned k = 0; k < o.n; k++) {

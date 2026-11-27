@@ -138,22 +138,21 @@ static bool emit_operands(struct xlate *x, uint32_t insn, const struct operands 
             renamed = true;
             continue;
         }
-        unsigned g = r;
-        if (!is_stolen(g))
+        if (!is_stolen(r))
             continue;
         unsigned k;
-        for (k = 0; k < nmap && guest[k] != g; k++)
+        for (k = 0; k < nmap && guest[k] != r; k++)
             ;
         if (k == nmap) {
             if (nmap == 3)
                 return false;
-            guest[nmap++] = g;
+            guest[nmap++] = r;
         }
         out = (out & ~(31u << o->pos[i])) | pool[k] << o->pos[i];
         if (o->pos[i] == 0 && o->writes_rd) {
             rd_stolen = true;
             rd_host = pool[k];
-            rd_guest = g;
+            rd_guest = r;
             if (o->reads_rd)
                 need_load[k] = true;
         } else {
@@ -930,7 +929,7 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
         case SYSREG_CNTFRQ_EL0:
         case SYSREG_CNTVCT_EL0:
         case SYSREG_CNTVCTSS_EL0: {
-            struct operands o = {.n = 1, .pos = {0}, .sp = {false}, .writes_rd = read, .reads_rd = !read};
+            struct operands o = {.n = 1, .pos = {0}, .sp = {false}, .writes_rd = read};
             return emit_operands(x, insn, &o) || fallback(x, pc);
         }
         case SYSREG_FPCR:
@@ -1049,15 +1048,8 @@ static bool translate_simd_dp(struct xlate *x, uint32_t insn)
     if (!appine_has(APPINE_HWCAP_FP | APPINE_HWCAP_ASIMD) || !appine_native_available() ||
         !appine_simd_dp_decode(insn, &nd))
         return false;
-    struct operands o = {.n = 0, .writes_rd = false, .reads_rd = false};
-    for (unsigned i = 0; i < nd.n; i++) {
-        add_operand(&o, nd.gpr[i].pos, false);
-        if (nd.gpr[i].pos == 0 && nd.gpr[i].store) {
-            o.writes_rd = true;
-            if (nd.gpr[i].load)
-                o.reads_rd = true;
-        }
-    }
+    struct operands o;
+    simd_dp_operands(&nd, &o);
     return emit_operands(x, insn, &o);
 }
 

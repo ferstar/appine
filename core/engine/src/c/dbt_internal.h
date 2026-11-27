@@ -790,7 +790,7 @@ struct operands {
     unsigned pos[4]; /* start bit of the field */
     bool sp[4];      /* whether 31 means SP */
     bool writes_rd;  /* the Rd field at pos[0] == 0 is written */
-    bool reads_rd;   /* the written Rd field at pos == 0 is also read (MOVK, BFM) */
+    bool reads_rd;   /* the written Rd field at pos == 0 is also read (MOVK, BFM, RMW SIMD) */
 };
 
 static inline void add_operand(struct operands *o, unsigned pos, bool sp)
@@ -798,6 +798,19 @@ static inline void add_operand(struct operands *o, unsigned pos, bool sp)
     o->pos[o->n] = pos;
     o->sp[o->n] = sp;
     o->n++;
+}
+
+static inline void simd_dp_operands(const struct native_desc *nd, struct operands *o)
+{
+    *o = (struct operands){0};
+    for (unsigned i = 0; i < nd->n; i++) {
+        add_operand(o, nd->gpr[i].pos, false);
+        if (nd->gpr[i].pos == 0 && nd->gpr[i].store) {
+            o->writes_rd = true;
+            if (nd->gpr[i].load)
+                o->reads_rd = true;
+        }
+    }
 }
 
 enum mem_mode { M_OFFSET, M_PRE, M_POST, M_REG, M_LITERAL };

@@ -884,6 +884,16 @@ static uint32_t *emit_memop_memchr(struct xlate *x, struct appine_dbt *d)
     return entry;
 }
 
+/* Write target to FPCR only when it differs from cur (clobbers cur, leaves NZCV untouched). */
+static void emit_set_fpcr_if_changed(struct xlate *x, unsigned cur, unsigned target)
+{
+    emit(x, enc_eor_lsr(cur, cur, target, 0));
+    uint32_t *same = here(x);
+    emit(x, enc_cbz_x(cur));
+    emit(x, enc_msr_fpcr(target));
+    patch_branch(x->wdelta, same, here(x));
+}
+
 /* The enter and exit routines: placed at the start of the code cache, so that every exit stub can
  * reach them with one b */
 void dbt_emit_routines(struct appine_dbt *d)
@@ -910,11 +920,7 @@ void dbt_emit_routines(struct appine_dbt *d)
     /* The guest's FP state stays in host registers throughout translated code (the engine/dbt map).
      * Skip the serializing msr fpcr when guest and host FPCR already match. */
     emit(x, enc_ldr_x(T2, CTX, offsetof(struct appine_cpu, fpcr)));
-    emit(x, enc_eor_lsr(T1, T1, T2, 0));
-    uint32_t *same_fpcr_enter = here(x);
-    emit(x, enc_cbz_x(T1));
-    emit(x, enc_msr_fpcr(T2));
-    patch_branch(x->wdelta, same_fpcr_enter, here(x));
+    emit_set_fpcr_if_changed(x, T1, T2);
     emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, fpsr)));
     emit(x, enc_msr_fpsr(T1));
     emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, nzcv)));
@@ -957,11 +963,7 @@ void dbt_emit_routines(struct appine_dbt *d)
     /* Restore host FPCR only when enter changed it (translated code never alters host FPCR). */
     emit(x, enc_ldr_x(T0, 31, 104));
     emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, fpcr)));
-    emit(x, enc_eor_lsr(T1, T0, T1, 0));
-    uint32_t *same_fpcr_exit = here(x);
-    emit(x, enc_cbz_x(T1));
-    emit(x, enc_msr_fpcr(T0));
-    patch_branch(x->wdelta, same_fpcr_exit, here(x));
+    emit_set_fpcr_if_changed(x, T1, T0);
     emit(x, enc_mov(0, T2));
     for (unsigned r = 8; r < 16; r += 2)
         emit(x, enc_ldp_d(r, r + 1, 31, (int)(112 + 8 * (r - 8))));
